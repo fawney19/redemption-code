@@ -45,6 +45,8 @@ export interface RedeemCode {
   status: string
   redemption_id?: string | null
   redeemed_at?: number | null
+  created_at: number
+  updated_at: number
 }
 
 export interface ApiState {

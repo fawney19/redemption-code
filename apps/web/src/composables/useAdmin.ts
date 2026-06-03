@@ -11,6 +11,7 @@ const adminResult = ref('')
 const adminExportFormat = ref<ExportFormat>('cpa')
 const batches = ref<RedeemBatch[]>([])
 const batchCodes = ref<RedeemCode[]>([])
+const selectedBatchId = ref('')
 const generatedCodes = ref('')
 const activeView = ref<'accounts' | 'codes'>('accounts')
 const filters = reactive({ search: '', status: '', redeemed: '' })
@@ -29,6 +30,39 @@ const redeemedCount = computed(() => accounts.value.filter((a) => a.redeemed_at 
 const attentionCount = computed(() => accounts.value.filter((a) => ['at_expired', 'refresh_failed', 'auth_invalid', 'quota_exhausted'].includes(a.status)).length)
 const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every((a) => selectedIds.value.includes(a.id)))
 const batchCodesText = computed(() => batchCodes.value.length ? JSON.stringify(batchCodes.value, null, 2) : '选择批次查看兑换码状态')
+const selectedBatch = computed(() => batches.value.find((batch) => batch.id === selectedBatchId.value) || null)
+const redeemStats = computed(() => {
+  const totalBatches = batches.value.length
+  const totalCodes = batches.value.reduce((sum, batch) => sum + Number(batch.total_count || 0), 0)
+  const redeemedCodes = batches.value.reduce((sum, batch) => sum + Number(batch.redeemed_count || 0), 0)
+  const redeemedAccounts = batches.value.reduce(
+    (sum, batch) => sum + Number(batch.redeemed_count || 0) * Number(batch.accounts_per_code || 0),
+    0,
+  )
+  const activeBatches = batches.value.filter((batch) => batch.status === 'active').length
+  const expiredBatches = batches.value.filter((batch) => batch.expires_at && batch.expires_at <= Math.floor(Date.now() / 1000)).length
+  return {
+    totalBatches,
+    activeBatches,
+    expiredBatches,
+    totalCodes,
+    redeemedCodes,
+    availableCodes: Math.max(totalCodes - redeemedCodes, 0),
+    redeemedAccounts,
+    redemptionRate: totalCodes ? Math.round((redeemedCodes / totalCodes) * 100) : 0,
+  }
+})
+const selectedBatchStats = computed(() => {
+  const totalCodes = batchCodes.value.length
+  const redeemedCodes = batchCodes.value.filter((code) => code.status === 'redeemed' || code.redeemed_at).length
+  return {
+    totalCodes,
+    redeemedCodes,
+    activeCodes: batchCodes.value.filter((code) => code.status === 'active' && !code.redeemed_at).length,
+    disabledCodes: batchCodes.value.filter((code) => code.status === 'disabled').length,
+    redemptionRate: totalCodes ? Math.round((redeemedCodes / totalCodes) * 100) : 0,
+  }
+})
 
 export function useAdmin() {
   return {
@@ -42,6 +76,7 @@ export function useAdmin() {
     adminExportFormat,
     batches,
     batchCodes,
+    selectedBatchId,
     generatedCodes,
     activeView,
     filters,
@@ -53,6 +88,9 @@ export function useAdmin() {
     attentionCount,
     allSelected,
     batchCodesText,
+    selectedBatch,
+    redeemStats,
+    selectedBatchStats,
   }
 }
 
@@ -84,6 +122,9 @@ export function logoutAdmin() {
   adminTokenDraft.value = ''
   accounts.value = []
   batches.value = []
+  batchCodes.value = []
+  selectedBatchId.value = ''
+  generatedCodes.value = ''
   selectedIds.value = []
   localStorage.removeItem('aether-pool.admin-token')
 }
@@ -101,8 +142,12 @@ export async function loadBatches() {
 
 export async function refreshAdmin() {
   await withBusy(async () => {
-    if (activeView.value === 'codes') await loadBatches()
-    else await loadAccounts()
+    if (activeView.value === 'codes') {
+      await loadBatches()
+      if (selectedBatchId.value) await fetchCodes(selectedBatchId.value)
+    } else {
+      await loadAccounts()
+    }
   })
 }
 
@@ -165,14 +210,18 @@ export async function createBatch() {
     })
     generatedCodes.value = result.codes.map((c) => c.code).join('\n')
     await loadBatches()
+    await fetchCodes(result.batch_id)
   })
 }
 
 export async function loadCodes(batchId: string) {
-  await withBusy(async () => {
-    const result = await api.listCodes(apiState.value, batchId)
-    batchCodes.value = result.items
-  })
+  await withBusy(() => fetchCodes(batchId))
+}
+
+async function fetchCodes(batchId: string) {
+  selectedBatchId.value = batchId
+  const result = await api.listCodes(apiState.value, batchId)
+  batchCodes.value = result.items
 }
 
 export function exportResultForDisplay<T extends { download?: EncodedDownload | null }>(result: T) {
@@ -202,6 +251,11 @@ export function downloadJson(fileName: string, value: unknown) {
   downloadBlob(fileName, blob)
 }
 
+export function downloadText(fileName: string, value: string, contentType = 'text/plain;charset=utf-8') {
+  const blob = new Blob([value.endsWith('\n') ? value : `${value}\n`], { type: contentType })
+  downloadBlob(fileName, blob)
+}
+
 function downloadBlob(fileName: string, blob: Blob) {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
@@ -219,12 +273,14 @@ export function timestamp() {
 
 export function statusLabel(status: string) {
   return ({
+    active: '可兑换',
     available: '可用',
     at_expired: 'AT 过期',
     refresh_failed: '刷新失败',
     auth_invalid: '账号失效',
     quota_exhausted: '额度耗尽',
     redeemed: '已兑换',
+    disabled: '已停用',
   } as Record<string, string>)[status] || status
 }
 

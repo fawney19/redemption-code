@@ -8,6 +8,7 @@ declare module 'lucide-vue-next' {
   export const Activity: IconComponent
   export const CircleAlert: IconComponent
   export const CircleCheck: IconComponent
+  export const Copy: IconComponent
   export const Database: IconComponent
   export const Download: IconComponent
   export const FileCode: IconComponent

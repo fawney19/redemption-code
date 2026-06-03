@@ -7,14 +7,14 @@
       <div class="panel-body grid">
         <div class="login-hint">
           <Lock :size="15" />
-          <span>请输入管理员令牌以继续</span>
+          <span>请输入密码继续</span>
         </div>
         <input
           v-model="adminTokenDraft"
           class="input"
           type="password"
           autocomplete="current-password"
-          placeholder="AETHER_POOL_ADMIN_TOKEN"
+          placeholder="密码"
           @keyup.enter="handleLogin"
         />
         <button class="button primary" :disabled="busy || !adminTokenDraft.trim()" @click="handleLogin">
