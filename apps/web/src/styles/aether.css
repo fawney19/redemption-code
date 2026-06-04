@@ -1285,7 +1285,7 @@ button:disabled { cursor: not-allowed; }
 
 .table {
   width: 100%;
-  min-width: 960px;
+  min-width: 1040px;
   border-collapse: collapse;
   font-size: 13px;
 }

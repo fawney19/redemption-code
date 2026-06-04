@@ -66,6 +66,7 @@
                   <th>账号</th>
                   <th>状态</th>
                   <th>绑定兑换码</th>
+                  <th>兑换时间</th>
                   <th>Token</th>
                   <th>额度</th>
                   <th>过期</th>
@@ -87,6 +88,7 @@
                     </span>
                     <div class="muted mono">{{ account.redeem_code_masked || '-' }}</div>
                   </td>
+                  <td>{{ formatTime(account.redeemed_at) }}</td>
                   <td>
                     <div class="token-stack mono">
                       <span><b>AT</b>{{ account.access_token_preview || '-' }}</span>
@@ -128,7 +130,7 @@
                   </td>
                 </tr>
                 <tr v-if="!accounts.length">
-                  <td colspan="9" class="empty-row">
+                  <td colspan="10" class="empty-row">
                     <Database :size="20" />
                     <span>暂无账号数据</span>
                   </td>
