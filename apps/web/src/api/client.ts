@@ -141,6 +141,19 @@ export interface DeleteAccountsResponse {
   }>
 }
 
+export interface RedeemRateLimitSettings {
+  enabled: boolean
+  window_seconds: number
+  max_requests: number
+  whitelist_ips: string[]
+  updated_at: number
+}
+
+export interface RedeemRateLimitSettingsResponse {
+  success: boolean
+  settings: RedeemRateLimitSettings
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 const MANAGEMENT_API_PREFIX = '/api/alalalateam'
 
@@ -162,8 +175,17 @@ async function request<T>(
 }
 
 export const api = {
-  listAccounts(state: ApiState, params: { search?: string; status?: string; redeemed?: string }) {
-    const query = new URLSearchParams({ limit: '200', offset: '0' })
+  listAccounts(state: ApiState, params: {
+    search?: string
+    status?: string
+    redeemed?: string
+    limit?: number
+    offset?: number
+  }) {
+    const query = new URLSearchParams({
+      limit: String(params.limit || 50),
+      offset: String(params.offset || 0),
+    })
     if (params.search) query.set('search', params.search)
     if (params.status) query.set('status', params.status)
     if (params.redeemed) query.set('redeemed', params.redeemed)
@@ -222,6 +244,21 @@ export const api = {
   },
   getAutoProbeSettings(state: ApiState) {
     return request<AutoProbeSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe`, state)
+  },
+  getRedeemRateLimitSettings(state: ApiState) {
+    return request<RedeemRateLimitSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/redeem-rate-limit`, state)
+  },
+  updateRedeemRateLimitSettings(state: ApiState, payload: Partial<Pick<
+    RedeemRateLimitSettings,
+    | 'enabled'
+    | 'window_seconds'
+    | 'max_requests'
+    | 'whitelist_ips'
+  >>) {
+    return request<RedeemRateLimitSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/redeem-rate-limit`, state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
   },
   updateAutoProbeSettings(state: ApiState, payload: Partial<Pick<
     AutoProbeSettings,

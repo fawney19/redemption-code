@@ -3,18 +3,18 @@
     <div class="stats">
       <div class="stat dark-stat">
         <span>总账号</span>
-        <strong>{{ accounts.length }}</strong>
+        <strong>{{ accountPagination.total }}</strong>
       </div>
       <div class="stat">
-        <span>可分配</span>
+        <span>本页可分配</span>
         <strong>{{ availableCount }}</strong>
       </div>
       <div class="stat">
-        <span>已兑换</span>
+        <span>本页已兑换</span>
         <strong>{{ redeemedCount }}</strong>
       </div>
       <div class="stat stat-attention">
-        <span>需要处理</span>
+        <span>本页需处理</span>
         <strong>{{ attentionCount }}</strong>
       </div>
     </div>
@@ -27,8 +27,8 @@
             <p>默认隐藏已兑换账号的自动刷新队列</p>
           </div>
           <div class="toolbar">
-            <input v-model="filters.search" class="input search-input" placeholder="搜索邮箱 / Account ID" @keyup.enter="loadAccounts" />
-            <select v-model="filters.status" class="select status-select" @change="loadAccounts">
+            <input v-model="filters.search" class="input search-input" placeholder="搜索邮箱 / Account ID" @keyup.enter="searchAccounts" />
+            <select v-model="filters.status" class="select status-select" @change="searchAccounts">
               <option value="">全部状态</option>
               <option value="available">可用</option>
               <option value="at_expired">AT 过期</option>
@@ -37,12 +37,12 @@
               <option value="auth_invalid">账号失效</option>
               <option value="forbidden">网络受限</option>
             </select>
-            <select v-model="filters.redeemed" class="select status-select" @change="loadAccounts">
+            <select v-model="filters.redeemed" class="select status-select" @change="searchAccounts">
               <option value="">全部兑换</option>
               <option value="false">未兑换</option>
               <option value="true">已兑换</option>
             </select>
-            <button class="button" @click="loadAccounts"><Search :size="15" />查询</button>
+            <button class="button" @click="searchAccounts"><Search :size="15" />查询</button>
           </div>
         </div>
         <div class="panel-body">
@@ -66,8 +66,7 @@
                   <th>账号</th>
                   <th>状态</th>
                   <th>绑定兑换码</th>
-                  <th>AT</th>
-                  <th>RT</th>
+                  <th>Token</th>
                   <th>过期</th>
                   <th>测活</th>
                   <th>操作</th>
@@ -87,8 +86,12 @@
                     </span>
                     <div class="muted mono">{{ account.redeem_code_masked || '-' }}</div>
                   </td>
-                  <td class="mono">{{ account.access_token_preview || '-' }}</td>
-                  <td class="mono">{{ account.refresh_token_preview || '-' }}</td>
+                  <td>
+                    <div class="token-stack mono">
+                      <span><b>AT</b>{{ account.access_token_preview || '-' }}</span>
+                      <span><b>RT</b>{{ account.refresh_token_preview || '-' }}</span>
+                    </div>
+                  </td>
                   <td>{{ formatTime(account.expires_at) }}</td>
                   <td>{{ formatTime(account.last_probe_at) }}</td>
                   <td>
@@ -105,13 +108,33 @@
                   </td>
                 </tr>
                 <tr v-if="!accounts.length">
-                  <td colspan="9" class="empty-row">
+                  <td colspan="8" class="empty-row">
                     <Database :size="20" />
                     <span>暂无账号数据</span>
                   </td>
                 </tr>
               </tbody>
             </table>
+          </div>
+          <div class="account-pagination">
+            <div class="pagination-summary">
+              <strong>{{ accountPageStart }}-{{ accountPageEnd }}</strong>
+              <span>/ {{ accountPagination.total }} 个账号</span>
+            </div>
+            <div class="pagination-controls">
+              <label>
+                <span>每页</span>
+                <select v-model.number="accountPagination.limit" class="select page-size-select" @change="changeAccountsPageSize">
+                  <option :value="25">25</option>
+                  <option :value="50">50</option>
+                  <option :value="100">100</option>
+                  <option :value="200">200</option>
+                </select>
+              </label>
+              <span class="pagination-page">第 {{ accountCurrentPage }} / {{ accountTotalPages }} 页</span>
+              <button class="button ghost tiny" :disabled="busy || !canPrevAccountsPage" @click="previousAccountsPage">上一页</button>
+              <button class="button ghost tiny" :disabled="busy || !canNextAccountsPage" @click="nextAccountsPage">下一页</button>
+            </div>
           </div>
         </div>
       </div>
@@ -261,6 +284,84 @@
           </div>
         </div>
 
+        <div class="panel redeem-rate-panel">
+          <div class="panel-header">
+            <div>
+              <h2>兑换限速</h2>
+              <p>公网兑换接口请求保护</p>
+            </div>
+            <span class="badge" :class="redeemRateLimitForm.enabled ? 'available' : 'disabled'">
+              {{ redeemRateLimitForm.enabled ? '已启用' : '已关闭' }}
+            </span>
+          </div>
+          <div class="panel-body grid">
+            <label class="setting-toggle">
+              <input v-model="redeemRateLimitForm.enabled" type="checkbox" />
+              <span>
+                <strong>启用兑换限速</strong>
+                <small>白名单 IP 不受限，其他公网请求按窗口计数</small>
+              </span>
+            </label>
+
+            <div class="settings-grid">
+              <label class="field-label">
+                <span>窗口秒数</span>
+                <input v-model.number="redeemRateLimitForm.window_seconds" class="input" type="number" min="1" max="86400" />
+              </label>
+              <label class="field-label">
+                <span>窗口请求数</span>
+                <input v-model.number="redeemRateLimitForm.max_requests" class="input" type="number" min="1" max="100000" />
+              </label>
+              <label class="field-label">
+                <span>白名单数量</span>
+                <input class="input" :value="redeemRateLimitWhitelistCount" readonly />
+              </label>
+            </div>
+
+            <label class="field-label full">
+              <span>白名单 IP</span>
+              <textarea
+                v-model="redeemRateLimitForm.whitelist_text"
+                class="textarea compact-textarea mono"
+                spellcheck="false"
+                placeholder="一行一个 IP，或用逗号分隔"
+              ></textarea>
+            </label>
+            <p class="form-note">服务端会读取 X-Forwarded-For、X-Real-IP、CF-Connecting-IP；宝塔 Nginx 反代时请保留真实 IP 请求头。</p>
+
+            <div class="probe-meta-grid rate-limit-meta">
+              <div>
+                <span>当前窗口</span>
+                <strong>{{ redeemRateLimitForm.window_seconds || 0 }} 秒</strong>
+              </div>
+              <div>
+                <span>窗口额度</span>
+                <strong>{{ redeemRateLimitForm.max_requests || 0 }} 次</strong>
+              </div>
+              <div>
+                <span>白名单</span>
+                <strong>{{ redeemRateLimitWhitelistCount }} 个</strong>
+              </div>
+              <div>
+                <span>更新时间</span>
+                <strong>{{ formatTime(redeemRateLimitSettings?.updated_at) }}</strong>
+              </div>
+            </div>
+
+            <div class="toolbar section-toolbar auto-probe-actions">
+              <button class="button primary" :disabled="busy" @click="saveRedeemRateLimitSettings">
+                <Save :size="15" />保存限速
+              </button>
+            </div>
+
+            <Transition name="fade">
+              <div v-if="redeemRateLimitResult" class="inline-success">
+                {{ redeemRateLimitResult }}
+              </div>
+            </Transition>
+          </div>
+        </div>
+
         <div class="panel import-panel">
           <div class="panel-header">
             <div>
@@ -288,7 +389,10 @@ import { computed } from 'vue'
 import { Activity, Database, Download, Globe, Play, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
 import {
   useAdmin,
-  loadAccounts,
+  searchAccounts,
+  previousAccountsPage,
+  nextAccountsPage,
+  changeAccountsPageSize,
   probeSelected,
   probeAccount,
   refreshSelected,
@@ -297,6 +401,7 @@ import {
   exportSelected,
   importAccounts,
   saveAutoProbeSettings,
+  saveRedeemRateLimitSettings,
   testProxyEgress,
   runAutoProbeNow,
   toggleAll,
@@ -314,16 +419,26 @@ const {
   autoProbeSettings,
   autoProbeNextRunAt,
   autoProbeResult,
+  redeemRateLimitSettings,
+  redeemRateLimitResult,
   proxyTestResult,
   proxyTestError,
   autoProbeForm,
   autoProbeIntervalMinutes,
+  redeemRateLimitForm,
   filters,
+  accountPagination,
   busy,
   availableCount,
   redeemedCount,
   attentionCount,
   allSelected,
+  accountPageStart,
+  accountPageEnd,
+  accountCurrentPage,
+  accountTotalPages,
+  canPrevAccountsPage,
+  canNextAccountsPage,
   proxyTestDisabled,
 } = useAdmin()
 
@@ -333,5 +448,12 @@ const autoProbeDisplayResult = computed(() => {
     return JSON.stringify(autoProbeSettings.value.last_result, null, 2)
   }
   return ''
+})
+
+const redeemRateLimitWhitelistCount = computed(() => {
+  return redeemRateLimitForm.whitelist_text
+    .split(/\r?\n|,/)
+    .map((value) => value.trim())
+    .filter(Boolean).length
 })
 </script>

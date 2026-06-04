@@ -9,6 +9,7 @@ import {
   type ProxyTestResponse,
   type RedeemBatch,
   type RedeemCode,
+  type RedeemRateLimitSettings,
 } from '../api/client'
 
 const adminTokenStorageKey = 'aether-pool.admin-token'
@@ -29,10 +30,17 @@ const generatedCodes = ref('')
 const autoProbeSettings = ref<AutoProbeSettings | null>(null)
 const autoProbeNextRunAt = ref<number | null>(null)
 const autoProbeResult = ref('')
+const redeemRateLimitSettings = ref<RedeemRateLimitSettings | null>(null)
+const redeemRateLimitResult = ref('')
 const proxyTestResult = ref<ProxyTestResponse | null>(null)
 const proxyTestError = ref('')
 const activeView = ref<'accounts' | 'codes'>('accounts')
 const filters = reactive({ search: '', status: '', redeemed: '' })
+const accountPagination = reactive({
+  total: 0,
+  limit: 50,
+  offset: 0,
+})
 const batchForm = reactive({
   name: '',
   total_count: 10,
@@ -51,6 +59,12 @@ const autoProbeForm = reactive({
   proxy_api_url: '',
   proxy_default_scheme: 'http' as 'http' | 'socks5' | 'socks5h',
 })
+const redeemRateLimitForm = reactive({
+  enabled: true,
+  window_seconds: 60,
+  max_requests: 30,
+  whitelist_text: '',
+})
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
 const apiState = computed(() => ({ token: adminToken.value }))
@@ -58,6 +72,12 @@ const availableCount = computed(() => accounts.value.filter((a) => a.status === 
 const redeemedCount = computed(() => accounts.value.filter(accountRedeemed).length)
 const attentionCount = computed(() => accounts.value.filter((a) => ['at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted'].includes(a.status)).length)
 const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every((a) => selectedIds.value.includes(a.id)))
+const accountPageStart = computed(() => accountPagination.total ? accountPagination.offset + 1 : 0)
+const accountPageEnd = computed(() => Math.min(accountPagination.offset + accounts.value.length, accountPagination.total))
+const accountCurrentPage = computed(() => accountPagination.total ? Math.floor(accountPagination.offset / accountPagination.limit) + 1 : 1)
+const accountTotalPages = computed(() => Math.max(1, Math.ceil(accountPagination.total / accountPagination.limit)))
+const canPrevAccountsPage = computed(() => accountPagination.offset > 0)
+const canNextAccountsPage = computed(() => accountPagination.offset + accountPagination.limit < accountPagination.total)
 const proxyTestDisabled = computed(() => {
   if (busy.value) return true
   if (!autoProbeForm.proxy_enabled) return false
@@ -123,12 +143,16 @@ export function useAdmin() {
     autoProbeSettings,
     autoProbeNextRunAt,
     autoProbeResult,
+    redeemRateLimitSettings,
+    redeemRateLimitResult,
     proxyTestResult,
     proxyTestError,
     autoProbeForm,
     autoProbeIntervalMinutes,
+    redeemRateLimitForm,
     activeView,
     filters,
+    accountPagination,
     batchForm,
     adminAuthenticated,
     apiState,
@@ -136,6 +160,12 @@ export function useAdmin() {
     redeemedCount,
     attentionCount,
     allSelected,
+    accountPageStart,
+    accountPageEnd,
+    accountCurrentPage,
+    accountTotalPages,
+    canPrevAccountsPage,
+    canNextAccountsPage,
     proxyTestDisabled,
     batchCodesText,
     selectedBatch,
@@ -165,6 +195,7 @@ export async function loginAdmin() {
     await loadAccounts()
     await loadBatches()
     await loadAutoProbeSettings()
+    await loadRedeemRateLimitSettings()
   })
 }
 
@@ -179,14 +210,52 @@ export function logoutAdmin() {
   autoProbeSettings.value = null
   autoProbeNextRunAt.value = null
   autoProbeResult.value = ''
+  redeemRateLimitSettings.value = null
+  redeemRateLimitResult.value = ''
+  accountPagination.total = 0
+  accountPagination.offset = 0
   selectedIds.value = []
   sessionStorage.removeItem(adminTokenStorageKey)
 }
 
 export async function loadAccounts() {
-  const page = await api.listAccounts(apiState.value, filters)
+  const page = await api.listAccounts(apiState.value, {
+    ...filters,
+    limit: accountPagination.limit,
+    offset: accountPagination.offset,
+  })
+  if (page.total > 0 && page.items.length === 0 && accountPagination.offset >= page.total) {
+    accountPagination.offset = Math.max(0, Math.floor((page.total - 1) / accountPagination.limit) * accountPagination.limit)
+    return loadAccounts()
+  }
   accounts.value = page.items
+  accountPagination.total = page.total
+  accountPagination.limit = page.limit
+  accountPagination.offset = page.offset
   selectedIds.value = selectedIds.value.filter((id) => accounts.value.some((a) => a.id === id))
+}
+
+export async function searchAccounts() {
+  accountPagination.offset = 0
+  await loadAccounts()
+}
+
+export async function previousAccountsPage() {
+  if (!canPrevAccountsPage.value) return
+  accountPagination.offset = Math.max(0, accountPagination.offset - accountPagination.limit)
+  await loadAccounts()
+}
+
+export async function nextAccountsPage() {
+  if (!canNextAccountsPage.value) return
+  accountPagination.offset += accountPagination.limit
+  await loadAccounts()
+}
+
+export async function changeAccountsPageSize() {
+  accountPagination.limit = Number(accountPagination.limit || 50)
+  accountPagination.offset = 0
+  await loadAccounts()
 }
 
 export async function loadBatches() {
@@ -199,6 +268,11 @@ export async function loadAutoProbeSettings() {
   applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
 }
 
+export async function loadRedeemRateLimitSettings() {
+  const result = await api.getRedeemRateLimitSettings(apiState.value)
+  applyRedeemRateLimitSettings(result.settings)
+}
+
 export async function refreshAdmin() {
   await withBusy(async () => {
     if (activeView.value === 'codes') {
@@ -208,6 +282,7 @@ export async function refreshAdmin() {
       await loadAccounts()
     }
     await loadAutoProbeSettings()
+    await loadRedeemRateLimitSettings()
   })
 }
 
@@ -290,6 +365,25 @@ export async function saveAutoProbeSettings() {
     })
     applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
     autoProbeResult.value = JSON.stringify({ saved: true, settings: result.settings }, null, 2)
+  })
+}
+
+export async function saveRedeemRateLimitSettings() {
+  await withBusy(async () => {
+    const whitelistIps = redeemRateLimitForm.whitelist_text
+      .split(/\r?\n|,/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    const result = await api.updateRedeemRateLimitSettings(apiState.value, {
+      enabled: redeemRateLimitForm.enabled,
+      window_seconds: Number(redeemRateLimitForm.window_seconds || 1),
+      max_requests: Number(redeemRateLimitForm.max_requests || 1),
+      whitelist_ips: whitelistIps,
+    })
+    applyRedeemRateLimitSettings(result.settings)
+    redeemRateLimitResult.value = result.settings.enabled
+      ? `已保存：每 ${result.settings.window_seconds} 秒最多 ${result.settings.max_requests} 次请求，白名单 ${result.settings.whitelist_ips.length} 个。`
+      : '已保存：兑换限速已关闭。'
   })
 }
 
@@ -385,6 +479,14 @@ function applyAutoProbeSettings(settings: AutoProbeSettings, nextRunAt: number |
   autoProbeForm.proxy_url = settings.proxy_url || ''
   autoProbeForm.proxy_api_url = settings.proxy_api_url || ''
   autoProbeForm.proxy_default_scheme = settings.proxy_default_scheme || 'http'
+}
+
+function applyRedeemRateLimitSettings(settings: RedeemRateLimitSettings) {
+  redeemRateLimitSettings.value = settings
+  redeemRateLimitForm.enabled = settings.enabled
+  redeemRateLimitForm.window_seconds = settings.window_seconds
+  redeemRateLimitForm.max_requests = settings.max_requests
+  redeemRateLimitForm.whitelist_text = (settings.whitelist_ips || []).join('\n')
 }
 
 export function exportResultForDisplay<T extends { download?: EncodedDownload | null }>(result: T) {

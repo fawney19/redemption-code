@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +10,7 @@ use account_pool_core::{
 };
 use account_pool_data::{
     AccountListQuery, AccountPoolRepository, AccountSummary, AutoProbeSettings,
-    CreateRedeemBatchInput, DataError,
+    CreateRedeemBatchInput, DataError, RedeemRateLimitSettings,
 };
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, State};
@@ -46,6 +47,7 @@ struct AppState {
     oauth_token_url: Arc<String>,
     ip_check_url: Arc<String>,
     auto_probe_lock: Arc<Mutex<()>>,
+    redeem_rate_limiter: Arc<Mutex<RedeemRateLimiter>>,
 }
 
 #[tokio::main]
@@ -96,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "https://api.ipify.org?format=json".to_string()),
         ),
         auto_probe_lock: Arc::new(Mutex::new(())),
+        redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
     };
 
     let _auto_probe_worker = spawn_auto_probe_worker(state.clone());
@@ -198,6 +201,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/alalalateam/settings/auto-probe/run",
             post(run_auto_probe_once),
+        )
+        .route(
+            "/api/alalalateam/settings/redeem-rate-limit",
+            get(get_redeem_rate_limit_settings).post(update_redeem_rate_limit_settings),
         )
         .route(
             "/api/alalalateam/settings/proxy/test",
@@ -358,6 +365,50 @@ async fn update_auto_probe_settings(
     apply_auto_probe_settings_patch(&mut settings, payload);
     let settings = state.repo.save_auto_probe_settings(&settings).await?;
     Ok(Json(auto_probe_settings_payload(settings)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RedeemRateLimitSettingsPatch {
+    enabled: Option<bool>,
+    window_seconds: Option<u64>,
+    max_requests: Option<u64>,
+    whitelist_ips: Option<Vec<String>>,
+}
+
+async fn get_redeem_rate_limit_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let settings = state.repo.get_redeem_rate_limit_settings().await?;
+    Ok(Json(redeem_rate_limit_settings_payload(settings)))
+}
+
+async fn update_redeem_rate_limit_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RedeemRateLimitSettingsPatch>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let mut settings = state.repo.get_redeem_rate_limit_settings().await?;
+    if let Some(enabled) = payload.enabled {
+        settings.enabled = enabled;
+    }
+    if let Some(window_seconds) = payload.window_seconds {
+        settings.window_seconds = window_seconds;
+    }
+    if let Some(max_requests) = payload.max_requests {
+        settings.max_requests = max_requests;
+    }
+    if let Some(whitelist_ips) = payload.whitelist_ips {
+        settings.whitelist_ips = whitelist_ips;
+    }
+    let settings = state
+        .repo
+        .save_redeem_rate_limit_settings(&settings)
+        .await?;
+    state.redeem_rate_limiter.lock().await.clear();
+    Ok(Json(redeem_rate_limit_settings_payload(settings)))
 }
 
 async fn test_proxy_egress(
@@ -572,8 +623,10 @@ struct RedeemExportRequest {
 
 async fn redeem_export(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RedeemExportRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    enforce_redeem_rate_limit(&state, &headers).await?;
     validate_redeem_export_limits(payload.codes.len(), 0)?;
     let format = payload
         .format
@@ -1151,6 +1204,123 @@ fn auto_probe_settings_payload(settings: AutoProbeSettings) -> Value {
     })
 }
 
+fn redeem_rate_limit_settings_payload(settings: RedeemRateLimitSettings) -> Value {
+    json!({
+        "success": true,
+        "settings": settings,
+    })
+}
+
+#[derive(Default)]
+struct RedeemRateLimiter {
+    buckets: HashMap<String, RateLimitBucket>,
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitBucket {
+    window_start: u64,
+    count: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RateLimitDecision {
+    Allowed,
+    Denied { retry_after_seconds: u64 },
+}
+
+impl RedeemRateLimiter {
+    fn check(
+        &mut self,
+        key: &str,
+        settings: &RedeemRateLimitSettings,
+        now: u64,
+    ) -> RateLimitDecision {
+        let settings = settings.clone().normalized();
+        if !settings.enabled || settings.max_requests == 0 {
+            return RateLimitDecision::Allowed;
+        }
+        let window_seconds = settings.window_seconds.max(1);
+        self.buckets
+            .retain(|_, bucket| now < bucket.window_start.saturating_add(window_seconds * 2));
+        let bucket = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert(RateLimitBucket {
+                window_start: now,
+                count: 0,
+            });
+        if now >= bucket.window_start.saturating_add(window_seconds) {
+            bucket.window_start = now;
+            bucket.count = 0;
+        }
+        if bucket.count >= settings.max_requests {
+            return RateLimitDecision::Denied {
+                retry_after_seconds: bucket
+                    .window_start
+                    .saturating_add(window_seconds)
+                    .saturating_sub(now)
+                    .max(1),
+            };
+        }
+        bucket.count += 1;
+        RateLimitDecision::Allowed
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+    }
+}
+
+async fn enforce_redeem_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let settings = state.repo.get_redeem_rate_limit_settings().await?;
+    if !settings.enabled {
+        return Ok(());
+    }
+    let ip = client_ip_from_headers(headers).unwrap_or_else(|| "unknown".to_string());
+    if redeem_rate_limit_ip_whitelisted(&ip, &settings.whitelist_ips) {
+        return Ok(());
+    }
+    match state
+        .redeem_rate_limiter
+        .lock()
+        .await
+        .check(&ip, &settings, unix_now_secs())
+    {
+        RateLimitDecision::Allowed => Ok(()),
+        RateLimitDecision::Denied {
+            retry_after_seconds,
+        } => Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("兑换请求过于频繁，请 {retry_after_seconds} 秒后重试"),
+        )),
+    }
+}
+
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
+    for name in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
+        let Some(raw) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        if let Some(ip) = raw.split(',').find_map(parse_header_ip) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+fn parse_header_ip(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_matches(['[', ']']);
+    trimmed.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+}
+
+fn redeem_rate_limit_ip_whitelisted(ip: &str, whitelist_ips: &[String]) -> bool {
+    whitelist_ips
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .any(|value| value == ip)
+}
+
 #[derive(Default)]
 struct RefreshOutcome {
     refreshed: usize,
@@ -1472,6 +1642,53 @@ mod tests {
             MAX_REDEEM_ACCOUNTS_PER_REQUEST
         )
         .is_ok());
+    }
+
+    #[test]
+    fn extracts_client_ip_from_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.10, 10.0.0.2"),
+        );
+        assert_eq!(
+            client_ip_from_headers(&headers).as_deref(),
+            Some("203.0.113.10")
+        );
+        assert!(redeem_rate_limit_ip_whitelisted(
+            "203.0.113.10",
+            &["203.0.113.10".to_string()]
+        ));
+    }
+
+    #[test]
+    fn redeem_rate_limiter_denies_after_window_budget() {
+        let settings = RedeemRateLimitSettings {
+            enabled: true,
+            window_seconds: 60,
+            max_requests: 2,
+            whitelist_ips: Vec::new(),
+            updated_at: 0,
+        };
+        let mut limiter = RedeemRateLimiter::default();
+        assert_eq!(
+            limiter.check("203.0.113.10", &settings, 100),
+            RateLimitDecision::Allowed
+        );
+        assert_eq!(
+            limiter.check("203.0.113.10", &settings, 101),
+            RateLimitDecision::Allowed
+        );
+        assert_eq!(
+            limiter.check("203.0.113.10", &settings, 102),
+            RateLimitDecision::Denied {
+                retry_after_seconds: 58
+            }
+        );
+        assert_eq!(
+            limiter.check("203.0.113.10", &settings, 160),
+            RateLimitDecision::Allowed
+        );
     }
 }
 

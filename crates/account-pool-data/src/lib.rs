@@ -16,13 +16,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const INIT_SQL: &str = include_str!("../migrations/sqlite/0001_init.sql");
 const AUTO_PROBE_SETTINGS_KEY: &str = "auto_probe";
+const REDEEM_RATE_LIMIT_SETTINGS_KEY: &str = "redeem_rate_limit";
 
 #[derive(Debug, Error)]
 pub enum DataError {
@@ -265,7 +266,24 @@ WHERE auth_fingerprint = ? AND lower(email) = ?
         &self,
         query: AccountListQuery,
     ) -> Result<AccountListPage, DataError> {
-        let rows = sqlx::query(
+        let limit = if query.limit == 0 {
+            50
+        } else {
+            query.limit.clamp(1, 500)
+        };
+
+        let mut count_builder =
+            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) AS count FROM accounts a");
+        push_account_filters(&mut count_builder, &query);
+        let count_row = count_builder.build().fetch_one(&self.pool).await?;
+        let total = count_row
+            .try_get::<i64, _>("count")
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_default();
+        let offset = query.offset.min(total);
+
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
@@ -273,48 +291,19 @@ SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_toke
        a.redeemed_at, a.created_at, a.updated_at
 FROM accounts a
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
-ORDER BY a.updated_at DESC, a.created_at DESC
 "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let search = query.search.map(|value| value.to_ascii_lowercase());
-        let mut items = rows
+        );
+        push_account_filters(&mut builder, &query);
+        builder
+            .push(" ORDER BY a.updated_at DESC, a.created_at DESC LIMIT ")
+            .push_bind(limit as i64)
+            .push(" OFFSET ")
+            .push_bind(offset as i64);
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        let items = rows
             .into_iter()
             .map(|row| account_summary_from_row(&row))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|item| {
-                if let Some(search) = search.as_ref() {
-                    let haystack = format!(
-                        "{} {} {} {}",
-                        item.email.as_deref().unwrap_or_default(),
-                        item.name.as_deref().unwrap_or_default(),
-                        item.account_id.as_deref().unwrap_or_default(),
-                        item.plan_type.as_deref().unwrap_or_default()
-                    )
-                    .to_ascii_lowercase();
-                    if !haystack.contains(search) {
-                        return false;
-                    }
-                }
-                if let Some(status) = query.status.as_ref() {
-                    if item.status != *status {
-                        return false;
-                    }
-                }
-                if let Some(redeemed) = query.redeemed {
-                    if item.redeemed_at.is_some() != redeemed {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect::<Vec<_>>();
-        let total = items.len();
-        let offset = query.offset.min(total);
-        let limit = query.limit.clamp(1, 500);
-        items = items.into_iter().skip(offset).take(limit).collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(AccountListPage {
             items,
             total,
@@ -1104,6 +1093,45 @@ WHERE id = ? AND redeemed_at IS NULL
         Ok(export_accounts(format, &auth_files))
     }
 
+    pub async fn get_redeem_rate_limit_settings(
+        &self,
+    ) -> Result<RedeemRateLimitSettings, DataError> {
+        let row = sqlx::query("SELECT value_json, updated_at FROM app_settings WHERE key = ?")
+            .bind(REDEEM_RATE_LIMIT_SETTINGS_KEY)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(RedeemRateLimitSettings::default());
+        };
+        let value_json: String = row.try_get("value_json")?;
+        let updated_at = optional_i64(&row, "updated_at")?.unwrap_or_default();
+        let mut settings = serde_json::from_str::<RedeemRateLimitSettings>(&value_json)
+            .unwrap_or_else(|_| RedeemRateLimitSettings::default());
+        settings.updated_at = updated_at;
+        Ok(settings.normalized())
+    }
+
+    pub async fn save_redeem_rate_limit_settings(
+        &self,
+        settings: &RedeemRateLimitSettings,
+    ) -> Result<RedeemRateLimitSettings, DataError> {
+        let mut settings = settings.clone().normalized();
+        settings.updated_at = unix_now_secs();
+        sqlx::query(
+            r#"
+INSERT INTO app_settings (key, value_json, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+"#,
+        )
+        .bind(REDEEM_RATE_LIMIT_SETTINGS_KEY)
+        .bind(serde_json::to_string(&settings).map_err(|_| DataError::Encryption)?)
+        .bind(settings.updated_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(settings)
+    }
+
     async fn load_all_auth_files(&self) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
         let rows = sqlx::query(
             r#"
@@ -1332,12 +1360,99 @@ impl AutoProbeSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedeemRateLimitSettings {
+    pub enabled: bool,
+    pub window_seconds: u64,
+    pub max_requests: u64,
+    #[serde(default)]
+    pub whitelist_ips: Vec<String>,
+    pub updated_at: u64,
+}
+
+impl Default for RedeemRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_seconds: 60,
+            max_requests: 30,
+            whitelist_ips: Vec::new(),
+            updated_at: 0,
+        }
+    }
+}
+
+impl RedeemRateLimitSettings {
+    pub fn normalized(mut self) -> Self {
+        self.window_seconds = self.window_seconds.clamp(1, 24 * 60 * 60);
+        self.max_requests = self.max_requests.clamp(1, 100_000);
+        let mut seen = std::collections::HashSet::new();
+        self.whitelist_ips = self
+            .whitelist_ips
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .filter(|value| seen.insert(value.clone()))
+            .collect();
+        self
+    }
+}
+
 fn default_probe_proxy_mode() -> String {
     "fixed".to_string()
 }
 
 fn default_probe_proxy_scheme() -> String {
     "http".to_string()
+}
+
+fn push_account_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &AccountListQuery) {
+    let mut has_where = false;
+    let mut push_and = |builder: &mut QueryBuilder<'_, Sqlite>| {
+        if has_where {
+            builder.push(" AND ");
+        } else {
+            builder.push(" WHERE ");
+            has_where = true;
+        }
+    };
+
+    if let Some(search) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let pattern = format!("%{}%", search.to_ascii_lowercase());
+        push_and(builder);
+        builder
+            .push("(lower(coalesce(a.email, '')) LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR lower(coalesce(a.name, '')) LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR lower(coalesce(a.account_id, '')) LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR lower(coalesce(a.plan_type, '')) LIKE ")
+            .push_bind(pattern)
+            .push(")");
+    }
+    if let Some(status) = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        push_and(builder);
+        builder.push("a.status = ").push_bind(status.to_string());
+    }
+    if let Some(redeemed) = query.redeemed {
+        push_and(builder);
+        if redeemed {
+            builder.push("a.redeemed_at IS NOT NULL");
+        } else {
+            builder.push("a.redeemed_at IS NULL");
+        }
+    }
 }
 
 struct RedeemAccountDemand {
@@ -1647,6 +1762,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.total, 2);
+    }
+
+    #[tokio::test]
+    async fn list_accounts_uses_database_pagination_and_filters() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("acct-a", "access-a"),
+            parsed_account("acct-b", "access-b"),
+            parsed_account("acct-c", "access-c"),
+        ])
+        .await
+        .unwrap();
+
+        let first_page = repo
+            .list_accounts(AccountListQuery {
+                limit: 2,
+                offset: 0,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_page.total, 3);
+        assert_eq!(first_page.items.len(), 2);
+
+        let second_page = repo
+            .list_accounts(AccountListQuery {
+                limit: 2,
+                offset: 2,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second_page.total, 3);
+        assert_eq!(second_page.items.len(), 1);
+
+        let filtered = repo
+            .list_accounts(AccountListQuery {
+                search: Some("acct-b@example.com".to_string()),
+                limit: 50,
+                offset: 0,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(
+            filtered.items[0].email.as_deref(),
+            Some("acct-b@example.com")
+        );
     }
 
     #[tokio::test]
@@ -2196,5 +2360,41 @@ mod tests {
         assert_eq!(loaded.last_checked_count, 12);
         assert_eq!(loaded.last_error.as_deref(), Some("previous error"));
         assert_eq!(loaded.last_result, Some(json!({ "checked": 12 })));
+    }
+
+    #[tokio::test]
+    async fn redeem_rate_limit_settings_are_persisted_and_normalized() {
+        let repo = temp_repo().await;
+        let defaults = repo.get_redeem_rate_limit_settings().await.unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.window_seconds, 60);
+        assert_eq!(defaults.max_requests, 30);
+
+        let saved = repo
+            .save_redeem_rate_limit_settings(&RedeemRateLimitSettings {
+                enabled: true,
+                window_seconds: 0,
+                max_requests: 0,
+                whitelist_ips: vec![
+                    "  203.0.113.10  ".to_string(),
+                    "203.0.113.10".to_string(),
+                    "".to_string(),
+                    "2001:db8::1".to_string(),
+                ],
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.window_seconds, 1);
+        assert_eq!(saved.max_requests, 1);
+        assert_eq!(
+            saved.whitelist_ips,
+            vec!["203.0.113.10".to_string(), "2001:db8::1".to_string()]
+        );
+
+        let loaded = repo.get_redeem_rate_limit_settings().await.unwrap();
+        assert_eq!(loaded.window_seconds, 1);
+        assert_eq!(loaded.max_requests, 1);
+        assert_eq!(loaded.whitelist_ips.len(), 2);
     }
 }

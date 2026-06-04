@@ -7,7 +7,13 @@
 
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { useAdmin, loadAccounts, loadBatches, loadAutoProbeSettings } from './composables/useAdmin'
+import {
+  useAdmin,
+  loadAccounts,
+  loadBatches,
+  loadAutoProbeSettings,
+  loadRedeemRateLimitSettings,
+} from './composables/useAdmin'
 import PublicView from './views/PublicView.vue'
 import AdminLogin from './views/AdminLogin.vue'
 import AdminDashboard from './views/AdminDashboard.vue'
@@ -35,6 +41,7 @@ onMounted(() => {
     })
     loadBatches().catch(() => undefined)
     loadAutoProbeSettings().catch(() => undefined)
+    loadRedeemRateLimitSettings().catch(() => undefined)
   }
 })
 

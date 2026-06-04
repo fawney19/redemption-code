@@ -1184,6 +1184,29 @@ button:disabled { cursor: not-allowed; }
   max-height: 260px;
 }
 
+.redeem-rate-panel .panel-header {
+  align-items: flex-start;
+}
+
+.compact-textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.rate-limit-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.inline-success {
+  padding: 10px 12px;
+  border: 1px solid rgba(93, 184, 114, 0.24);
+  border-radius: var(--rounded-md);
+  background: rgba(93, 184, 114, 0.1);
+  color: #2f7440;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 /* === Results === */
 .result {
   min-height: 120px;
@@ -1269,6 +1292,67 @@ button:disabled { cursor: not-allowed; }
 
 .table tbody tr:hover {
   background: rgba(239, 233, 222, 0.5);
+}
+
+.token-stack {
+  display: grid;
+  gap: 4px;
+  min-width: 120px;
+  line-height: 1.25;
+}
+
+.token-stack span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+}
+
+.token-stack b {
+  width: 20px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.account-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--rounded-md);
+  background: rgba(250, 249, 245, 0.44);
+}
+
+.pagination-summary,
+.pagination-controls,
+.pagination-controls label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pagination-summary strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.pagination-summary span,
+.pagination-controls label span,
+.pagination-page {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.page-size-select {
+  width: 86px;
+  min-height: 34px;
+  padding-block: 6px;
 }
 
 .empty-row {
@@ -1466,6 +1550,15 @@ button:disabled { cursor: not-allowed; }
   .section-toolbar,
   .token-box {
     align-items: stretch;
+  }
+
+  .account-pagination {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pagination-controls {
+    flex-wrap: wrap;
   }
 
   .search-input,
