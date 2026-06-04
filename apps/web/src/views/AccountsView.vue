@@ -36,7 +36,11 @@
               <option value="quota_exhausted">额度耗尽</option>
               <option value="auth_invalid">账号失效</option>
               <option value="forbidden">网络受限</option>
-              <option value="redeemed">已兑换</option>
+            </select>
+            <select v-model="filters.redeemed" class="select status-select" @change="loadAccounts">
+              <option value="">全部兑换</option>
+              <option value="false">未兑换</option>
+              <option value="true">已兑换</option>
             </select>
             <button class="button" @click="loadAccounts"><Search :size="15" />查询</button>
           </div>
@@ -45,6 +49,9 @@
           <div class="toolbar section-toolbar">
             <button class="button" :disabled="busy" @click="probeSelected"><Activity :size="15" />测活</button>
             <button class="button" :disabled="busy" @click="refreshSelected"><RotateCcw :size="15" />刷新 AT</button>
+            <button class="button danger" :disabled="busy || !selectedIds.length" @click="deleteSelectedAccounts">
+              <Trash2 :size="15" />删除
+            </button>
             <select v-model="adminExportFormat" class="select format-select">
               <option value="cpa">CPA</option>
               <option value="sub2api">Sub2API</option>
@@ -73,8 +80,13 @@
                     <strong>{{ account.email || account.name || 'Codex Account' }}</strong>
                     <div class="muted mono">{{ account.account_id || account.id }}</div>
                   </td>
-                  <td><span class="badge" :class="account.status">{{ statusLabel(account.status) }}</span></td>
-                  <td class="mono">{{ account.redeem_code_masked || '-' }}</td>
+                  <td><span class="badge" :class="statusBadgeClass(account.status)">{{ statusLabel(account.status) }}</span></td>
+                  <td>
+                    <span class="badge" :class="account.redeemed_at || account.redeem_code_id ? 'redeemed' : 'available'">
+                      {{ account.redeemed_at || account.redeem_code_id ? '已兑换' : '未兑换' }}
+                    </span>
+                    <div class="muted mono">{{ account.redeem_code_masked || '-' }}</div>
+                  </td>
                   <td class="mono">{{ account.access_token_preview || '-' }}</td>
                   <td class="mono">{{ account.refresh_token_preview || '-' }}</td>
                   <td>{{ formatTime(account.expires_at) }}</td>
@@ -82,6 +94,13 @@
                   <td>
                     <button class="button ghost tiny" :disabled="busy" @click="probeAccount(account.id)">
                       <Activity :size="14" />测活
+                    </button>
+                    <button
+                      class="button ghost danger tiny"
+                      :disabled="busy || !!(account.redeem_code_id || account.redemption_id || account.redeemed_at)"
+                      @click="deleteAccount(account.id)"
+                    >
+                      <Trash2 :size="14" />删除
                     </button>
                   </td>
                 </tr>
@@ -133,18 +152,10 @@
             </div>
 
             <label class="setting-toggle compact-toggle">
-              <input v-model="autoProbeForm.refresh_before_probe" type="checkbox" />
-              <span>
-                <strong>测活前刷新 AT</strong>
-                <small>过期或接近过期时刷新，已兑换账号跳过</small>
-              </span>
-            </label>
-
-            <label class="setting-toggle compact-toggle">
               <input v-model="autoProbeForm.proxy_enabled" type="checkbox" />
               <span>
-                <strong>测活代理</strong>
-                <small>手动测活、单账号测活、自动测活共用</small>
+                <strong>测活 / 刷新代理</strong>
+                <small>测活只请求额度接口，刷新 AT 时也使用该代理</small>
               </span>
             </label>
 
@@ -184,6 +195,32 @@
                 />
               </label>
               <p class="form-note">API 返回 ip:port 会自动补默认协议；ip:port:user:pass 会自动转为代理 URL 并脱敏显示。</p>
+              <div class="toolbar proxy-test-actions">
+                <button class="button" :disabled="proxyTestDisabled" @click="testProxyEgress">
+                  <Globe :size="15" />测试出口 IP
+                </button>
+              </div>
+              <div v-if="proxyTestResult" class="proxy-test-result">
+                <div>
+                  <span>出口 IP</span>
+                  <strong class="mono">{{ proxyTestResult.ip }}</strong>
+                </div>
+                <div>
+                  <span>模式</span>
+                  <strong>{{ proxyTestResult.mode === 'direct' ? '直连' : proxyTestResult.mode === 'api' ? 'API 拉取' : '固定代理' }}</strong>
+                </div>
+                <div>
+                  <span>代理</span>
+                  <strong class="mono">{{ proxyTestResult.proxy || '-' }}</strong>
+                </div>
+                <div>
+                  <span>耗时</span>
+                  <strong>{{ proxyTestResult.elapsed_ms }} ms</strong>
+                </div>
+              </div>
+              <div v-if="proxyTestError" class="inline-error">
+                {{ proxyTestError }}
+              </div>
             </div>
 
             <div class="probe-meta-grid">
@@ -248,19 +285,23 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Activity, Database, Download, Play, RotateCcw, Save, Search, Upload } from 'lucide-vue-next'
+import { Activity, Database, Download, Globe, Play, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
 import {
   useAdmin,
   loadAccounts,
   probeSelected,
   probeAccount,
   refreshSelected,
+  deleteSelectedAccounts,
+  deleteAccount,
   exportSelected,
   importAccounts,
   saveAutoProbeSettings,
+  testProxyEgress,
   runAutoProbeNow,
   toggleAll,
   statusLabel,
+  statusBadgeClass,
   formatTime,
 } from '../composables/useAdmin'
 
@@ -273,6 +314,8 @@ const {
   autoProbeSettings,
   autoProbeNextRunAt,
   autoProbeResult,
+  proxyTestResult,
+  proxyTestError,
   autoProbeForm,
   autoProbeIntervalMinutes,
   filters,
@@ -281,6 +324,7 @@ const {
   redeemedCount,
   attentionCount,
   allSelected,
+  proxyTestDisabled,
 } = useAdmin()
 
 const autoProbeDisplayResult = computed(() => {

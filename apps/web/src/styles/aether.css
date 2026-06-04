@@ -765,6 +765,16 @@ button:disabled { cursor: not-allowed; }
   border-color: var(--hairline);
 }
 
+.button.danger {
+  border-color: rgba(198, 69, 69, 0.24);
+  color: #8d3b2e;
+}
+
+.button.danger:hover:not(:disabled) {
+  border-color: rgba(198, 69, 69, 0.36);
+  background: rgba(198, 69, 69, 0.08);
+}
+
 .button:disabled {
   opacity: 0.5;
 }
@@ -1085,6 +1095,43 @@ button:disabled { cursor: not-allowed; }
   color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.proxy-test-actions {
+  justify-content: flex-start;
+}
+
+.proxy-test-result {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.proxy-test-result > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--rounded-md);
+  background: rgba(250, 249, 245, 0.54);
+}
+
+.proxy-test-result span,
+.proxy-test-result strong {
+  display: block;
+  min-width: 0;
+}
+
+.proxy-test-result span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.proxy-test-result strong {
+  margin-top: 4px;
+  color: var(--ink);
+  font-size: 13px;
+  word-break: break-word;
 }
 
 .probe-meta-grid {

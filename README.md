@@ -12,41 +12,43 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 ## Behavior
 
 - Imported Codex accounts start as `available`, or `at_expired` when the access token is already expired.
-- Redeem exports use exclusive allocation. Redeemed accounts stay in the database with `status = redeemed`, `redeemed_at`, `redeem_code_id`, and `redemption_id`.
-- Redeemed accounts are not returned to the allocatable pool, are skipped by refresh/probe loading paths, and keep a redemption-time auth snapshot for repeat downloads.
+- Redeem exports use exclusive allocation. Redeemed accounts stay in the database with `redeemed_at`, `redeem_code_id`, and `redemption_id`; the account `status` remains the latest health state.
+- Redeemed accounts are not returned to the allocatable pool, are skipped by automatic refresh/probe loading paths, and keep a redemption-time auth snapshot for repeat downloads.
 - Access tokens are refreshed only for unredeemed accounts. Refresh failures mark accounts as `refresh_failed`.
-- Automatic health probing can be enabled from the admin console. It uses the same unredeemed account loading path, supports interval/concurrency/batch-size settings, and can refresh unredeemed access tokens before probing.
+- Automatic health probing can be enabled from the admin console. It uses the unredeemed account loading path, supports interval/concurrency/batch-size settings, supports fixed or dynamic proxy egress, and only calls the `wham/usage` quota endpoint. It does not refresh access tokens.
+- Public redeem export pre-refreshes only the expired unredeemed accounts that may be needed by the submitted codes, then allocates only accounts whose access token expiry is outside the refresh grace window. It never refreshes redeemed accounts.
+- Public redeem export is capped at 500 codes and 1,000 exported accounts per request to keep anonymous downloads bounded.
 - Admin exports default to unredeemed accounts. CPA single-account export returns one auth JSON object; CPA multi-account export downloads a ZIP package with one auth JSON file per account. Sub2API export returns `{ exported_at, proxies, accounts }`.
-- Redeem-code batch status exports from the admin console are CSV files. Full plaintext redeem codes are only shown/exported at generation time.
+- Redeem-code batch status exports from the admin console are CSV files. Full redeem codes are encrypted at rest and can be copied/exported again from the admin console for newly generated batches; legacy batches without stored ciphertext can only show the masked fallback.
 
 ## API
 
 - `GET /health`
-- `POST /api/admin/accounts/import`
-- `GET /api/admin/accounts`
-- `POST /api/admin/accounts/probe`
-- `POST /api/admin/accounts/refresh`
-- `POST /api/admin/accounts/export`
-- `GET /api/admin/settings/auto-probe`
-- `POST /api/admin/settings/auto-probe`
-- `POST /api/admin/settings/auto-probe/run`
-- `POST /api/admin/redeem-code-batches`
-- `GET /api/admin/redeem-code-batches`
-- `GET /api/admin/redeem-code-batches/{batch_id}/codes`
+- `POST /api/alalalateam/accounts/import`
+- `GET /api/alalalateam/accounts`
+- `POST /api/alalalateam/accounts/probe`
+- `POST /api/alalalateam/accounts/refresh`
+- `POST /api/alalalateam/accounts/export`
+- `GET /api/alalalateam/settings/auto-probe`
+- `POST /api/alalalateam/settings/auto-probe`
+- `POST /api/alalalateam/settings/auto-probe/run`
+- `POST /api/alalalateam/redeem-code-batches`
+- `GET /api/alalalateam/redeem-code-batches`
+- `GET /api/alalalateam/redeem-code-batches/{batch_id}/codes`
 - `POST /api/redeem/export`
 
 Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-admin-token`.
-By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
+By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. The API refuses known example admin tokens and empty/example encryption secrets unless `AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1` is explicitly set for isolated local development. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
 Cross-origin browser access is restricted by `AETHER_POOL_CORS_ORIGINS`, defaulting to local Vite origins.
 
-The public web entry is `/` and only shows the redeem/export page. The management console is available at `/admin` and is not linked from the public page.
+The public web entry is `/` and only shows the redeem/export page. The management console is available at `/alalalateam` and is not linked from the public page.
 
 ## Development
 
 ```bash
 cd aether-pool
 export AETHER_POOL_ADMIN_TOKEN=dev-admin-token
-export AETHER_POOL_SECRET_KEY=change-me-before-production
+export AETHER_POOL_SECRET_KEY=dev-only-secret-key
 cargo run -p aether-pool-api
 ```
 
@@ -75,6 +77,7 @@ Baota Nginx only needs to reverse proxy the public domain to the Docker `web` po
 cd aether-pool
 cp .env.example .env
 vim .env
+# Replace AETHER_POOL_ADMIN_TOKEN and AETHER_POOL_SECRET_KEY before starting.
 
 # Build and start both frontend and backend.
 docker compose up -d --build api web

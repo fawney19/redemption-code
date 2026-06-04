@@ -40,7 +40,7 @@
               <div class="generated-codes-toolbar">
                 <div>
                   <strong>本次生成 {{ generatedCodeCount }} 个完整兑换码</strong>
-                  <span>历史批次仅保留脱敏码和兑换状态</span>
+                  <span>完整兑换码会加密存储，可在批次中再次复制或导出</span>
                 </div>
                 <div class="toolbar compact-toolbar">
                   <button class="button ghost" @click="copyGeneratedCodes">
@@ -172,7 +172,10 @@
                 </thead>
                 <tbody>
                   <tr v-for="code in batchCodes" :key="code.id">
-                    <td class="mono">{{ code.masked_code }}</td>
+                    <td>
+                      <strong class="mono">{{ displayCode(code) }}</strong>
+                      <div v-if="!code.code" class="muted">历史脱敏</div>
+                    </td>
                     <td><span class="badge" :class="code.status">{{ statusLabel(code.status) }}</span></td>
                     <td>{{ formatTime(code.redeemed_at) }}</td>
                     <td class="mono">{{ code.redemption_id || '-' }}</td>
@@ -214,7 +217,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { Copy, Download, Plus, RefreshCw, Ticket } from 'lucide-vue-next'
-import type { RedeemBatch } from '../api/client'
+import type { RedeemBatch, RedeemCode } from '../api/client'
 import {
   useAdmin,
   createBatch,
@@ -243,7 +246,7 @@ const manualCopyTitle = ref('')
 const manualCopyText = ref('')
 
 const generatedCodeCount = computed(() => generatedCodes.value.split(/\r?\n/).filter(Boolean).length)
-const selectedMaskedCodes = computed(() => batchCodes.value.map((code) => code.masked_code).join('\n'))
+const selectedCodes = computed(() => batchCodes.value.map(displayCode).join('\n'))
 
 function batchRate(batch: RedeemBatch) {
   return batch.total_count ? Math.round((batch.redeemed_count / batch.total_count) * 100) : 0
@@ -283,7 +286,7 @@ async function copySelectedBatchCodes() {
     toast.info('请先选择一个批次')
     return
   }
-  await copyText(selectedMaskedCodes.value, '已复制该批次的脱敏兑换码')
+  await copyText(selectedCodes.value, '已复制该批次兑换码')
 }
 
 function exportSelectedBatchCodes() {
@@ -326,7 +329,8 @@ function buildBatchCsv(batch: RedeemBatch) {
       batch.accounts_per_code,
       formatCsvTime(batch.expires_at),
       code.id,
-      code.masked_code,
+      displayCode(code),
+      code.code ? '' : code.masked_code,
       code.status,
       formatCsvTime(code.redeemed_at),
       code.redemption_id || '',
@@ -349,6 +353,7 @@ function buildBatchCsv(batch: RedeemBatch) {
       '',
       '',
       '',
+      '',
     ]]
   const header = [
     'exported_at',
@@ -360,7 +365,8 @@ function buildBatchCsv(batch: RedeemBatch) {
     'accounts_per_code',
     'batch_expires_at',
     'code_id',
-    'masked_code',
+    'code',
+    'masked_code_fallback',
     'code_status',
     'code_redeemed_at',
     'redemption_id',
@@ -368,6 +374,10 @@ function buildBatchCsv(batch: RedeemBatch) {
     'code_updated_at',
   ]
   return `\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(',')).join('\n')}`
+}
+
+function displayCode(code: RedeemCode) {
+  return code.code || code.masked_code
 }
 
 function csvCell(value: unknown) {

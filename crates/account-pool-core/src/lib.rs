@@ -807,8 +807,18 @@ pub fn normalize_wham_usage_response(status_code: u16, body: Option<Value>) -> H
         };
     }
 
-    let plan_type = body.as_ref().and_then(extract_plan_type);
-    let quota_exhausted = body.as_ref().is_some_and(quota_snapshot_exhausted);
+    let now = unix_now_secs();
+    let parsed_quota = body
+        .as_ref()
+        .and_then(|value| parse_codex_wham_usage_response(value, now));
+    let plan_type = parsed_quota
+        .as_ref()
+        .and_then(extract_plan_type)
+        .or_else(|| body.as_ref().and_then(extract_plan_type));
+    let quota_exhausted = parsed_quota
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(codex_quota_bucket_exhausted);
     HealthCheckResult {
         status: if quota_exhausted {
             AccountStatus::QuotaExhausted
@@ -816,7 +826,7 @@ pub fn normalize_wham_usage_response(status_code: u16, body: Option<Value>) -> H
             AccountStatus::Available
         },
         plan_type,
-        quota_snapshot: body,
+        quota_snapshot: parsed_quota.or(body),
         error: None,
     }
 }
@@ -886,13 +896,158 @@ fn extract_plan_type(value: &Value) -> Option<String> {
     }
 }
 
-fn quota_snapshot_exhausted(value: &Value) -> bool {
-    let text = value.to_string().to_ascii_lowercase();
-    text.contains("\"has_credits\":false")
-        || text.contains("\"credits_unlimited\":false")
-        || text.contains("\"used_percent\":100")
-        || text.contains("\"primary_used_percent\":100")
-        || text.contains("\"secondary_used_percent\":100")
+fn parse_codex_wham_usage_response(value: &Value, updated_at_unix_secs: u64) -> Option<Value> {
+    let root = value.as_object()?;
+    if root.is_empty() {
+        return None;
+    }
+
+    let mut result = Map::new();
+    if let Some(plan_type) = root
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+    {
+        result.insert("plan_type".to_string(), json!(plan_type));
+    }
+
+    let rate_limit = root
+        .get("rate_limit")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let primary_window = rate_limit
+        .get("primary_window")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let secondary_window = rate_limit
+        .get("secondary_window")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let use_paid_windows = !secondary_window.is_empty()
+        && result.get("plan_type").and_then(Value::as_str) != Some("free");
+    if use_paid_windows {
+        codex_write_window(&mut result, &secondary_window, "primary");
+        codex_write_window(&mut result, &primary_window, "secondary");
+    } else {
+        codex_write_window(&mut result, &primary_window, "primary");
+    }
+
+    if let Some(credits) = root.get("credits").and_then(Value::as_object) {
+        if let Some(value) = credits.get("has_credits").and_then(coerce_json_bool) {
+            result.insert("has_credits".to_string(), json!(value));
+        }
+        if let Some(value) = credits.get("balance").and_then(coerce_json_f64) {
+            result.insert("credits_balance".to_string(), json!(value));
+        }
+        if let Some(value) = credits.get("unlimited").and_then(coerce_json_bool) {
+            result.insert("credits_unlimited".to_string(), json!(value));
+        }
+    }
+
+    if result.is_empty() {
+        return None;
+    }
+    result.insert("updated_at".to_string(), json!(updated_at_unix_secs));
+    Some(Value::Object(result))
+}
+
+fn codex_write_window(target: &mut Map<String, Value>, source: &Map<String, Value>, prefix: &str) {
+    if let Some(value) = source.get("used_percent").and_then(coerce_json_f64) {
+        target.insert(format!("{prefix}_used_percent"), json!(value));
+    }
+    if let Some(value) = source.get("reset_after_seconds").and_then(coerce_json_u64) {
+        target.insert(format!("{prefix}_reset_after_seconds"), json!(value));
+    }
+    if let Some(value) = source.get("reset_at").and_then(coerce_json_u64) {
+        target.insert(format!("{prefix}_reset_at"), json!(value));
+    }
+    if let Some(value) = source.get("window_minutes").and_then(coerce_json_u64) {
+        target.insert(format!("{prefix}_window_minutes"), json!(value));
+    }
+    if let Some(value) = source
+        .get("limit_window_seconds")
+        .and_then(coerce_json_u64)
+        .map(|seconds| seconds / 60)
+    {
+        target.insert(format!("{prefix}_window_minutes"), json!(value));
+    }
+}
+
+fn codex_quota_bucket_exhausted(bucket: &Map<String, Value>) -> bool {
+    if bucket.get("credits_unlimited").and_then(coerce_json_bool) == Some(true) {
+        return false;
+    }
+    let has_window_data = bucket
+        .get("primary_used_percent")
+        .and_then(coerce_json_f64)
+        .is_some()
+        || bucket
+            .get("secondary_used_percent")
+            .and_then(coerce_json_f64)
+            .is_some();
+    if !has_window_data && bucket.get("has_credits").and_then(coerce_json_bool) == Some(false) {
+        return true;
+    }
+    codex_window_used_percent_exhausted(bucket, "primary")
+        || codex_window_used_percent_exhausted(bucket, "secondary")
+}
+
+fn codex_window_used_percent_exhausted(bucket: &Map<String, Value>, prefix: &str) -> bool {
+    let used_percent_key = format!("{prefix}_used_percent");
+    bucket
+        .get(used_percent_key.as_str())
+        .and_then(coerce_json_f64)
+        .is_some_and(|value| value >= 100.0 && !codex_window_reset_elapsed(bucket, prefix))
+}
+
+fn codex_window_reset_elapsed(bucket: &Map<String, Value>, prefix: &str) -> bool {
+    let Some(updated_at) = bucket.get("updated_at").and_then(coerce_json_u64) else {
+        return false;
+    };
+    let now = unix_now_secs();
+    let reset_at_key = format!("{prefix}_reset_at");
+    if let Some(reset_at) = bucket.get(reset_at_key.as_str()).and_then(coerce_json_u64) {
+        return reset_at <= now;
+    }
+    let reset_after_key = format!("{prefix}_reset_after_seconds");
+    bucket
+        .get(reset_after_key.as_str())
+        .and_then(coerce_json_u64)
+        .is_some_and(|seconds| updated_at.saturating_add(seconds) <= now)
+}
+
+fn coerce_json_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(number) => number.as_u64().map(|value| value != 0),
+        Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn coerce_json_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn coerce_json_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().map(normalize_epoch_seconds),
+        Value::String(raw) => raw.trim().parse::<u64>().ok().map(normalize_epoch_seconds),
+        _ => None,
+    }
 }
 
 pub fn normalize_redeem_code(value: &str) -> Option<String> {
@@ -901,7 +1056,7 @@ pub fn normalize_redeem_code(value: &str) -> Option<String> {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_uppercase())
         .collect::<String>();
-    (clean.len() >= 12).then_some(clean)
+    (12..=64).contains(&clean.len()).then_some(clean)
 }
 
 pub fn format_redeem_code(normalized: &str) -> String {
@@ -1144,6 +1299,91 @@ mod tests {
     }
 
     #[test]
+    fn wham_usage_credits_not_unlimited_does_not_mean_exhausted() {
+        let result = normalize_wham_usage_response(
+            200,
+            Some(json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 25.0,
+                        "reset_after_seconds": 604800
+                    },
+                    "secondary_window": {
+                        "used_percent": 10.0,
+                        "reset_after_seconds": 18000
+                    }
+                },
+                "credits": {
+                    "has_credits": true,
+                    "balance": 12.5,
+                    "unlimited": false
+                }
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::Available);
+        assert_eq!(result.plan_type.as_deref(), Some("plus"));
+        let snapshot = result.quota_snapshot.unwrap();
+        assert_eq!(snapshot.get("primary_used_percent"), Some(&json!(10.0)));
+        assert_eq!(snapshot.get("secondary_used_percent"), Some(&json!(25.0)));
+        assert_eq!(snapshot.get("credits_unlimited"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn wham_usage_window_at_one_hundred_is_exhausted_until_reset() {
+        let future_reset = unix_now_secs().saturating_add(3600);
+        let result = normalize_wham_usage_response(
+            200,
+            Some(json!({
+                "plan_type": "free",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 100.0,
+                        "reset_at": future_reset
+                    }
+                }
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::QuotaExhausted);
+    }
+
+    #[test]
+    fn wham_usage_elapsed_reset_window_is_available() {
+        let result = normalize_wham_usage_response(
+            200,
+            Some(json!({
+                "plan_type": "free",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 100.0,
+                        "reset_at": 1
+                    }
+                }
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::Available);
+    }
+
+    #[test]
+    fn wham_usage_no_windows_without_credits_is_exhausted() {
+        let result = normalize_wham_usage_response(
+            200,
+            Some(json!({
+                "plan_type": "plus",
+                "credits": {
+                    "has_credits": false,
+                    "unlimited": false
+                }
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::QuotaExhausted);
+    }
+
+    #[test]
     fn wham_usage_plain_403_is_forbidden_not_auth_invalid() {
         let result = normalize_wham_usage_response(
             403,
@@ -1173,5 +1413,6 @@ mod tests {
         let normalized = normalize_redeem_code(&code).unwrap();
         assert_eq!(normalized.len(), 16);
         assert!(mask_redeem_code(&normalized).contains("****"));
+        assert!(normalize_redeem_code(&"A".repeat(65)).is_none());
     }
 }

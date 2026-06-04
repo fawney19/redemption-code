@@ -14,10 +14,15 @@ import AdminDashboard from './views/AdminDashboard.vue'
 import AppToast from './components/AppToast.vue'
 
 const { adminAuthenticated, adminTokenDraft, adminToken, adminResult } = useAdmin()
-const isAdminRoute = ref(window.location.pathname === '/admin')
+const MANAGEMENT_ENTRY_PATH = '/alalalateam'
+const isAdminRoute = ref(isManagementEntryPath())
 
 function syncRoute() {
-  isAdminRoute.value = window.location.pathname === '/admin'
+  isAdminRoute.value = isManagementEntryPath()
+}
+
+function isManagementEntryPath() {
+  return window.location.pathname.replace(/\/+$/, '') === MANAGEMENT_ENTRY_PATH
 }
 
 onMounted(() => {

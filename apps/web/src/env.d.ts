@@ -13,6 +13,7 @@ declare module 'lucide-vue-next' {
   export const Download: IconComponent
   export const FileCode: IconComponent
   export const FileJson: IconComponent
+  export const Globe: IconComponent
   export const Info: IconComponent
   export const Lock: IconComponent
   export const LogIn: IconComponent
@@ -25,5 +26,6 @@ declare module 'lucide-vue-next' {
   export const Search: IconComponent
   export const ShieldCheck: IconComponent
   export const Ticket: IconComponent
+  export const Trash2: IconComponent
   export const Upload: IconComponent
 }

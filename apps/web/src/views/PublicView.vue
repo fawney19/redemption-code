@@ -132,6 +132,7 @@ const redeemDownload = ref<EncodedDownload | null>(null)
 const redeemFileName = ref('')
 const redeemSuccesses = ref<RedeemSuccess[]>([])
 const redeemFailures = ref<RedeemFailure[]>([])
+const maxRedeemCodes = 500
 
 const formatLabel = computed(() => redeemFormat.value === 'cpa' ? 'CPA JSON / ZIP' : 'Sub2API JSON')
 const previewText = computed(() => redeemFormat.value === 'cpa'
@@ -143,6 +144,9 @@ async function handleRedeem() {
   busy.value = true
   try {
     const codes = redeemText.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    if (codes.length > maxRedeemCodes) {
+      throw new Error(`单次最多提交 ${maxRedeemCodes} 个兑换码`)
+    }
     const result = await api.redeemExport({ codes, format: redeemFormat.value })
     const fallbackFileName = `account-pool-redeem-${result.format}-${timestamp()}.json`
     redeemDocument.value = result.document

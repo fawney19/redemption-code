@@ -3,13 +3,18 @@ import {
   api,
   type AccountSummary,
   type AutoProbeSettings,
+  type DeleteAccountsResponse,
   type EncodedDownload,
   type ExportFormat,
+  type ProxyTestResponse,
   type RedeemBatch,
   type RedeemCode,
 } from '../api/client'
 
-const adminToken = ref(localStorage.getItem('aether-pool.admin-token') || '')
+const adminTokenStorageKey = 'aether-pool.admin-token'
+localStorage.removeItem(adminTokenStorageKey)
+
+const adminToken = ref(sessionStorage.getItem(adminTokenStorageKey) || '')
 const adminTokenDraft = ref('')
 const busy = ref(false)
 const accounts = ref<AccountSummary[]>([])
@@ -24,6 +29,8 @@ const generatedCodes = ref('')
 const autoProbeSettings = ref<AutoProbeSettings | null>(null)
 const autoProbeNextRunAt = ref<number | null>(null)
 const autoProbeResult = ref('')
+const proxyTestResult = ref<ProxyTestResponse | null>(null)
+const proxyTestError = ref('')
 const activeView = ref<'accounts' | 'codes'>('accounts')
 const filters = reactive({ search: '', status: '', redeemed: '' })
 const batchForm = reactive({
@@ -37,7 +44,7 @@ const autoProbeForm = reactive({
   interval_seconds: 60 * 60,
   max_accounts_per_run: 100,
   concurrency: 4,
-  refresh_before_probe: true,
+  refresh_before_probe: false,
   proxy_enabled: false,
   proxy_mode: 'fixed' as 'fixed' | 'api',
   proxy_url: '',
@@ -47,10 +54,16 @@ const autoProbeForm = reactive({
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
 const apiState = computed(() => ({ token: adminToken.value }))
-const availableCount = computed(() => accounts.value.filter((a) => a.status === 'available' && !a.redeemed_at).length)
-const redeemedCount = computed(() => accounts.value.filter((a) => a.redeemed_at || a.status === 'redeemed').length)
+const availableCount = computed(() => accounts.value.filter((a) => a.status === 'available' && !accountRedeemed(a)).length)
+const redeemedCount = computed(() => accounts.value.filter(accountRedeemed).length)
 const attentionCount = computed(() => accounts.value.filter((a) => ['at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted'].includes(a.status)).length)
 const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every((a) => selectedIds.value.includes(a.id)))
+const proxyTestDisabled = computed(() => {
+  if (busy.value) return true
+  if (!autoProbeForm.proxy_enabled) return false
+  if (autoProbeForm.proxy_mode === 'api') return !autoProbeForm.proxy_api_url.trim()
+  return !autoProbeForm.proxy_url.trim()
+})
 const batchCodesText = computed(() => batchCodes.value.length ? JSON.stringify(batchCodes.value, null, 2) : '选择批次查看兑换码状态')
 const selectedBatch = computed(() => batches.value.find((batch) => batch.id === selectedBatchId.value) || null)
 const redeemStats = computed(() => {
@@ -110,6 +123,8 @@ export function useAdmin() {
     autoProbeSettings,
     autoProbeNextRunAt,
     autoProbeResult,
+    proxyTestResult,
+    proxyTestError,
     autoProbeForm,
     autoProbeIntervalMinutes,
     activeView,
@@ -121,6 +136,7 @@ export function useAdmin() {
     redeemedCount,
     attentionCount,
     allSelected,
+    proxyTestDisabled,
     batchCodesText,
     selectedBatch,
     redeemStats,
@@ -145,7 +161,7 @@ export async function loginAdmin() {
   await withBusy(async () => {
     adminResult.value = ''
     adminToken.value = adminTokenDraft.value.trim()
-    localStorage.setItem('aether-pool.admin-token', adminToken.value)
+    sessionStorage.setItem(adminTokenStorageKey, adminToken.value)
     await loadAccounts()
     await loadBatches()
     await loadAutoProbeSettings()
@@ -164,7 +180,7 @@ export function logoutAdmin() {
   autoProbeNextRunAt.value = null
   autoProbeResult.value = ''
   selectedIds.value = []
-  localStorage.removeItem('aether-pool.admin-token')
+  sessionStorage.removeItem(adminTokenStorageKey)
 }
 
 export async function loadAccounts() {
@@ -230,6 +246,34 @@ export async function refreshSelected() {
   })
 }
 
+export async function deleteSelectedAccounts() {
+  const ids = selectedIds.value.slice()
+  if (!ids.length) {
+    adminResult.value = '请选择要删除的账号'
+    return
+  }
+  if (!window.confirm(`确认删除选中的 ${ids.length} 个未绑定兑换码账号？已绑定兑换码的账号会被跳过。`)) {
+    return
+  }
+  await deleteAccountsByIds(ids)
+}
+
+export async function deleteAccount(accountId: string) {
+  if (!window.confirm('确认删除这个未绑定兑换码账号？')) return
+  await deleteAccountsByIds([accountId])
+}
+
+async function deleteAccountsByIds(ids: string[]) {
+  await withBusy(async () => {
+    const result = await api.deleteAccounts(apiState.value, ids)
+    adminResult.value = formatDeleteAccountsResult(result)
+    selectedIds.value = selectedIds.value.filter(
+      (id) => !result.results.some((item) => item.account_id === id && item.status === 'deleted'),
+    )
+    await loadAccounts()
+  })
+}
+
 export async function saveAutoProbeSettings() {
   await withBusy(async () => {
     const result = await api.updateAutoProbeSettings(apiState.value, {
@@ -237,7 +281,7 @@ export async function saveAutoProbeSettings() {
       interval_seconds: Number(autoProbeForm.interval_seconds || 60),
       max_accounts_per_run: Number(autoProbeForm.max_accounts_per_run || 1),
       concurrency: Number(autoProbeForm.concurrency || 1),
-      refresh_before_probe: autoProbeForm.refresh_before_probe,
+      refresh_before_probe: false,
       proxy_enabled: autoProbeForm.proxy_enabled,
       proxy_mode: autoProbeForm.proxy_mode,
       proxy_url: autoProbeForm.proxy_url.trim() || null,
@@ -247,6 +291,30 @@ export async function saveAutoProbeSettings() {
     applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
     autoProbeResult.value = JSON.stringify({ saved: true, settings: result.settings }, null, 2)
   })
+}
+
+export async function testProxyEgress() {
+  await withBusy(
+    async () => {
+      proxyTestResult.value = null
+      proxyTestError.value = ''
+      proxyTestResult.value = await api.testProxyEgress(apiState.value, {
+        enabled: autoProbeForm.enabled,
+        interval_seconds: Number(autoProbeForm.interval_seconds || 60),
+        max_accounts_per_run: Number(autoProbeForm.max_accounts_per_run || 1),
+        concurrency: Number(autoProbeForm.concurrency || 1),
+        refresh_before_probe: false,
+        proxy_enabled: autoProbeForm.proxy_enabled,
+        proxy_mode: autoProbeForm.proxy_mode,
+        proxy_url: autoProbeForm.proxy_url.trim() || null,
+        proxy_api_url: autoProbeForm.proxy_api_url.trim() || null,
+        proxy_default_scheme: autoProbeForm.proxy_default_scheme,
+      })
+    },
+    (message) => {
+      proxyTestError.value = message
+    },
+  )
 }
 
 export async function runAutoProbeNow() {
@@ -311,7 +379,7 @@ function applyAutoProbeSettings(settings: AutoProbeSettings, nextRunAt: number |
   autoProbeForm.interval_seconds = settings.interval_seconds
   autoProbeForm.max_accounts_per_run = settings.max_accounts_per_run
   autoProbeForm.concurrency = settings.concurrency
-  autoProbeForm.refresh_before_probe = settings.refresh_before_probe
+  autoProbeForm.refresh_before_probe = false
   autoProbeForm.proxy_enabled = Boolean(settings.proxy_enabled)
   autoProbeForm.proxy_mode = settings.proxy_mode || 'fixed'
   autoProbeForm.proxy_url = settings.proxy_url || ''
@@ -330,6 +398,23 @@ export function exportResultForDisplay<T extends { download?: EncodedDownload | 
       data: `<base64 ${result.download.data.length} chars>`,
     },
   }
+}
+
+function formatDeleteAccountsResult(result: DeleteAccountsResponse) {
+  const lines = [
+    `删除完成：已删除 ${result.deleted} 个，跳过 ${result.skipped} 个，不存在 ${result.not_found} 个。`,
+  ]
+  const skipped = result.results.filter((item) => item.status !== 'deleted')
+  if (skipped.length) {
+    lines.push('明细：')
+    lines.push(
+      ...skipped.map((item) => {
+        const reason = item.reason ? `，${item.reason}` : ''
+        return `- ${item.account_id}：${item.status}${reason}`
+      }),
+    )
+  }
+  return lines.join('\n')
 }
 
 export function downloadEncodedFile(download: EncodedDownload) {
@@ -379,9 +464,17 @@ export function statusLabel(status: string) {
     auth_invalid: '账号失效',
     forbidden: '网络受限',
     quota_exhausted: '额度耗尽',
-    redeemed: '已兑换',
+    redeemed: '待测活',
     disabled: '已停用',
   } as Record<string, string>)[status] || status
+}
+
+export function statusBadgeClass(status: string) {
+  return status === 'redeemed' ? 'disabled' : status
+}
+
+function accountRedeemed(account: AccountSummary) {
+  return Boolean(account.redeemed_at || account.redeem_code_id || account.redemption_id)
 }
 
 export function formatTime(value?: number | null) {

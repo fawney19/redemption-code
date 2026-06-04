@@ -42,6 +42,7 @@ export interface RedeemBatch {
 export interface RedeemCode {
   id: string
   batch_id: string
+  code?: string | null
   masked_code: string
   status: string
   redemption_id?: string | null
@@ -119,7 +120,29 @@ export interface AutoProbeRunResponse {
   }
 }
 
+export interface ProxyTestResponse {
+  success: boolean
+  ip: string
+  proxy?: string | null
+  mode: 'direct' | 'fixed' | 'api' | string
+  url: string
+  elapsed_ms: number
+}
+
+export interface DeleteAccountsResponse {
+  success: boolean
+  deleted: number
+  skipped: number
+  not_found: number
+  results: Array<{
+    account_id: string
+    status: 'deleted' | 'skipped' | 'not_found' | string
+    reason?: string | null
+  }>
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE || ''
+const MANAGEMENT_API_PREFIX = '/api/alalalateam'
 
 async function request<T>(
   path: string,
@@ -144,36 +167,42 @@ export const api = {
     if (params.search) query.set('search', params.search)
     if (params.status) query.set('status', params.status)
     if (params.redeemed) query.set('redeemed', params.redeemed)
-    return request<AccountListPage>(`/api/admin/accounts?${query}`, state)
+    return request<AccountListPage>(`${MANAGEMENT_API_PREFIX}/accounts?${query}`, state)
   },
   importAccounts(state: ApiState, credentials: string) {
     return request<{ imported: number; updated: number; parse_errors: string[] }>(
-      '/api/admin/accounts/import',
+      `${MANAGEMENT_API_PREFIX}/accounts/import`,
       state,
       { method: 'POST', body: JSON.stringify({ credentials }) },
     )
   },
   probeAccounts(state: ApiState, accountIds?: string[]) {
-    return request<{ results: unknown[] }>('/api/admin/accounts/probe', state, {
+    return request<{ results: unknown[] }>(`${MANAGEMENT_API_PREFIX}/accounts/probe`, state, {
       method: 'POST',
       body: JSON.stringify({ account_ids: accountIds }),
     })
   },
   refreshAccounts(state: ApiState, accountIds?: string[]) {
     return request<{ refreshed: number; skipped: number; failed: number; results: unknown[] }>(
-      '/api/admin/accounts/refresh',
+      `${MANAGEMENT_API_PREFIX}/accounts/refresh`,
       state,
       { method: 'POST', body: JSON.stringify({ account_ids: accountIds }) },
     )
   },
+  deleteAccounts(state: ApiState, accountIds: string[]) {
+    return request<DeleteAccountsResponse>(`${MANAGEMENT_API_PREFIX}/accounts/delete`, state, {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: accountIds }),
+    })
+  },
   exportAccounts(state: ApiState, payload: { account_ids?: string[]; include_redeemed?: boolean; format: ExportFormat }) {
-    return request<ExportResponse>('/api/admin/accounts/export', state, {
+    return request<ExportResponse>(`${MANAGEMENT_API_PREFIX}/accounts/export`, state, {
       method: 'POST',
       body: JSON.stringify(payload),
     })
   },
   listBatches(state: ApiState) {
-    return request<{ items: RedeemBatch[] }>('/api/admin/redeem-code-batches', state)
+    return request<{ items: RedeemBatch[] }>(`${MANAGEMENT_API_PREFIX}/redeem-code-batches`, state)
   },
   createBatch(state: ApiState, payload: {
     name: string
@@ -183,16 +212,16 @@ export const api = {
     plan_filter?: string[] | null
   }) {
     return request<{ batch_id: string; codes: Array<{ id: string; code: string; masked_code: string }> }>(
-      '/api/admin/redeem-code-batches',
+      `${MANAGEMENT_API_PREFIX}/redeem-code-batches`,
       state,
       { method: 'POST', body: JSON.stringify(payload) },
     )
   },
   listCodes(state: ApiState, batchId: string) {
-    return request<{ items: RedeemCode[] }>(`/api/admin/redeem-code-batches/${batchId}/codes`, state)
+    return request<{ items: RedeemCode[] }>(`${MANAGEMENT_API_PREFIX}/redeem-code-batches/${batchId}/codes`, state)
   },
   getAutoProbeSettings(state: ApiState) {
-    return request<AutoProbeSettingsResponse>('/api/admin/settings/auto-probe', state)
+    return request<AutoProbeSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe`, state)
   },
   updateAutoProbeSettings(state: ApiState, payload: Partial<Pick<
     AutoProbeSettings,
@@ -207,13 +236,31 @@ export const api = {
     | 'proxy_api_url'
     | 'proxy_default_scheme'
   >>) {
-    return request<AutoProbeSettingsResponse>('/api/admin/settings/auto-probe', state, {
+    return request<AutoProbeSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe`, state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  testProxyEgress(state: ApiState, payload: Partial<Pick<
+    AutoProbeSettings,
+    | 'enabled'
+    | 'interval_seconds'
+    | 'max_accounts_per_run'
+    | 'concurrency'
+    | 'refresh_before_probe'
+    | 'proxy_enabled'
+    | 'proxy_mode'
+    | 'proxy_url'
+    | 'proxy_api_url'
+    | 'proxy_default_scheme'
+  >>) {
+    return request<ProxyTestResponse>(`${MANAGEMENT_API_PREFIX}/settings/proxy/test`, state, {
       method: 'POST',
       body: JSON.stringify(payload),
     })
   },
   runAutoProbeNow(state: ApiState) {
-    return request<AutoProbeRunResponse>('/api/admin/settings/auto-probe/run', state, {
+    return request<AutoProbeRunResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe/run`, state, {
       method: 'POST',
       body: JSON.stringify({}),
     })

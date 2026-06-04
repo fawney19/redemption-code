@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS redeem_codes (
   code_prefix TEXT NOT NULL,
   code_suffix TEXT NOT NULL,
   masked_code TEXT NOT NULL,
+  code_ciphertext TEXT,
   status TEXT NOT NULL DEFAULT 'active',
   redemption_id TEXT,
   redeemed_at INTEGER,

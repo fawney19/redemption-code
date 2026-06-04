@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use account_pool_data::{
     AccountListQuery, AccountPoolRepository, AccountSummary, AutoProbeSettings,
     CreateRedeemBatchInput, DataError,
 };
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -25,6 +26,16 @@ use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+const MAX_JSON_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_REDEEM_CODES_PER_REQUEST: usize = 500;
+const MAX_REDEEM_ACCOUNTS_PER_REQUEST: usize = 1_000;
+const ADMIN_TOKEN_PLACEHOLDERS: &[&str] = &["change-this-admin-password"];
+const SECRET_KEY_PLACEHOLDERS: &[&str] = &[
+    "change-this-long-random-secret",
+    "change-me-before-production",
+    "aether-pool-local-development-secret",
+];
+
 #[derive(Clone)]
 struct AppState {
     repo: AccountPoolRepository,
@@ -33,6 +44,7 @@ struct AppState {
     allow_open_admin: bool,
     oauth_client_id: Arc<String>,
     oauth_token_url: Arc<String>,
+    ip_check_url: Arc<String>,
     auto_probe_lock: Arc<Mutex<()>>,
 }
 
@@ -50,6 +62,13 @@ async fn main() -> anyhow::Result<()> {
     let secret_key = std::env::var("AETHER_POOL_SECRET_KEY").unwrap_or_default();
     let admin_token = std::env::var("AETHER_POOL_ADMIN_TOKEN").unwrap_or_default();
     let allow_open_admin = env_flag("AETHER_POOL_ALLOW_OPEN_ADMIN");
+    let allow_insecure_dev_config = env_flag("AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG");
+    validate_startup_secrets(
+        &admin_token,
+        &secret_key,
+        allow_open_admin,
+        allow_insecure_dev_config,
+    )?;
     if admin_token.trim().is_empty() && !allow_open_admin {
         tracing::warn!(
             "AETHER_POOL_ADMIN_TOKEN is empty; admin endpoints are locked until a token is configured"
@@ -72,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("AETHER_POOL_OAUTH_TOKEN_URL")
                 .unwrap_or_else(|_| "https://auth.openai.com/oauth/token".to_string()),
         ),
+        ip_check_url: Arc::new(
+            std::env::var("AETHER_POOL_IP_CHECK_URL")
+                .unwrap_or_else(|_| "https://api.ipify.org?format=json".to_string()),
+        ),
         auto_probe_lock: Arc::new(Mutex::new(())),
     };
 
@@ -79,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = router(state)
         .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(cors_layer());
 
     let addr: SocketAddr = std::env::var("AETHER_POOL_ADDR")
@@ -95,6 +119,33 @@ fn env_flag(name: &str) -> bool {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn validate_startup_secrets(
+    admin_token: &str,
+    secret_key: &str,
+    allow_open_admin: bool,
+    allow_insecure_dev_config: bool,
+) -> anyhow::Result<()> {
+    let admin_token = admin_token.trim();
+    let secret_key = secret_key.trim();
+    if secret_key.is_empty() || SECRET_KEY_PLACEHOLDERS.contains(&secret_key) {
+        if !allow_insecure_dev_config {
+            anyhow::bail!(
+                "AETHER_POOL_SECRET_KEY must be set to a non-placeholder value; set AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1 only for isolated local development"
+            );
+        }
+        tracing::warn!("using insecure development secret key");
+    }
+    if !allow_open_admin
+        && ADMIN_TOKEN_PLACEHOLDERS.contains(&admin_token)
+        && !allow_insecure_dev_config
+    {
+        anyhow::bail!(
+            "AETHER_POOL_ADMIN_TOKEN is still the example placeholder; set a private admin password before starting"
+        );
+    }
+    Ok(())
 }
 
 fn cors_layer() -> CorsLayer {
@@ -131,25 +182,33 @@ fn cors_layer() -> CorsLayer {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/api/admin/accounts/import", post(import_accounts))
-        .route("/api/admin/accounts", get(list_accounts))
-        .route("/api/admin/accounts/probe", post(probe_accounts))
-        .route("/api/admin/accounts/refresh", post(refresh_accounts))
-        .route("/api/admin/accounts/export", post(export_admin_accounts))
+        .route("/api/alalalateam/accounts/import", post(import_accounts))
+        .route("/api/alalalateam/accounts", get(list_accounts))
+        .route("/api/alalalateam/accounts/probe", post(probe_accounts))
+        .route("/api/alalalateam/accounts/refresh", post(refresh_accounts))
         .route(
-            "/api/admin/settings/auto-probe",
+            "/api/alalalateam/accounts/export",
+            post(export_admin_accounts),
+        )
+        .route("/api/alalalateam/accounts/delete", post(delete_accounts))
+        .route(
+            "/api/alalalateam/settings/auto-probe",
             get(get_auto_probe_settings).post(update_auto_probe_settings),
         )
         .route(
-            "/api/admin/settings/auto-probe/run",
+            "/api/alalalateam/settings/auto-probe/run",
             post(run_auto_probe_once),
         )
         .route(
-            "/api/admin/redeem-code-batches",
+            "/api/alalalateam/settings/proxy/test",
+            post(test_proxy_egress),
+        )
+        .route(
+            "/api/alalalateam/redeem-code-batches",
             post(create_redeem_batch).get(list_redeem_batches),
         )
         .route(
-            "/api/admin/redeem-code-batches/{batch_id}/codes",
+            "/api/alalalateam/redeem-code-batches/{batch_id}/codes",
             get(list_redeem_codes),
         )
         .route("/api/redeem/export", post(redeem_export))
@@ -215,6 +274,32 @@ async fn refresh_accounts(
     })))
 }
 
+async fn delete_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AccountIdRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let account_ids = payload
+        .account_ids
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if account_ids.is_empty() {
+        return Err(ApiError::bad_request("account_ids is required"));
+    }
+    let outcome = state.repo.delete_unbound_accounts(&account_ids).await?;
+    Ok(Json(json!({
+        "success": true,
+        "deleted": outcome.deleted,
+        "skipped": outcome.skipped,
+        "not_found": outcome.not_found,
+        "results": outcome.results,
+    })))
+}
+
 async fn probe_accounts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -228,7 +313,6 @@ async fn probe_accounts(
         ProbeRunOptions {
             max_accounts: None,
             concurrency: settings.concurrency as usize,
-            refresh_before_probe: true,
             include_redeemed: payload.account_ids.is_some(),
         },
     )
@@ -271,6 +355,55 @@ async fn update_auto_probe_settings(
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
     let mut settings = state.repo.get_auto_probe_settings().await?;
+    apply_auto_probe_settings_patch(&mut settings, payload);
+    let settings = state.repo.save_auto_probe_settings(&settings).await?;
+    Ok(Json(auto_probe_settings_payload(settings)))
+}
+
+async fn test_proxy_egress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AutoProbeSettingsPatch>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let mut settings = state.repo.get_auto_probe_settings().await?;
+    apply_auto_probe_settings_patch(&mut settings, payload);
+    let settings = settings.normalized();
+    let started = Instant::now();
+    let (http, proxy) = resolve_probe_http_client(&state, &settings).await?;
+    let response = http
+        .get(state.ip_check_url.as_str())
+        .header("accept", "application/json,text/plain,*/*")
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("IP 出口查询失败: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("IP 出口响应读取失败: {error}")))?;
+    if !status.is_success() {
+        return Err(ApiError::bad_request(format!(
+            "IP 出口查询返回 {status}: {}",
+            body.chars().take(200).collect::<String>()
+        )));
+    }
+    let ip = extract_ip_from_body(&body)
+        .ok_or_else(|| ApiError::bad_request("IP 出口响应中没有可识别的 IP"))?;
+    Ok(Json(json!({
+        "success": true,
+        "ip": ip,
+        "proxy": proxy,
+        "mode": if settings.proxy_enabled { settings.proxy_mode } else { "direct".to_string() },
+        "url": state.ip_check_url.as_str(),
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    })))
+}
+
+fn apply_auto_probe_settings_patch(
+    settings: &mut AutoProbeSettings,
+    payload: AutoProbeSettingsPatch,
+) {
     if let Some(enabled) = payload.enabled {
         settings.enabled = enabled;
     }
@@ -301,8 +434,6 @@ async fn update_auto_probe_settings(
     if let Some(proxy_default_scheme) = payload.proxy_default_scheme {
         settings.proxy_default_scheme = proxy_default_scheme;
     }
-    let settings = state.repo.save_auto_probe_settings(&settings).await?;
-    Ok(Json(auto_probe_settings_payload(settings)))
 }
 
 async fn run_auto_probe_once(
@@ -320,7 +451,6 @@ async fn run_auto_probe_once(
         ProbeRunOptions {
             max_accounts: Some(settings.max_accounts_per_run as usize),
             concurrency: settings.concurrency as usize,
-            refresh_before_probe: settings.refresh_before_probe,
             include_redeemed: false,
         },
     )
@@ -444,14 +574,17 @@ async fn redeem_export(
     State(state): State<AppState>,
     Json(payload): Json<RedeemExportRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if payload.codes.is_empty() {
-        return Err(ApiError::bad_request("codes is required"));
-    }
+    validate_redeem_export_limits(payload.codes.len(), 0)?;
     let format = payload
         .format
         .parse::<ExportFormat>()
         .map_err(|_| ApiError::bad_request("unsupported export format"))?;
-    let _ = refresh_expired_accounts(&state, None, false).await?;
+    let preparation = state.repo.prepare_redeem_export(&payload.codes).await?;
+    validate_redeem_export_limits(payload.codes.len(), preparation.estimated_account_count)?;
+    if !preparation.refresh_account_ids.is_empty() {
+        let _ =
+            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), true).await?;
+    }
     let outcome = state
         .repo
         .redeem_codes_for_export(&payload.codes, format)
@@ -464,6 +597,26 @@ async fn redeem_export(
         "successes": outcome.successes,
         "failures": outcome.failures,
     })))
+}
+
+fn validate_redeem_export_limits(
+    code_count: usize,
+    estimated_account_count: usize,
+) -> Result<(), ApiError> {
+    if code_count == 0 {
+        return Err(ApiError::bad_request("codes is required"));
+    }
+    if code_count > MAX_REDEEM_CODES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "codes must contain at most {MAX_REDEEM_CODES_PER_REQUEST} items"
+        )));
+    }
+    if estimated_account_count > MAX_REDEEM_ACCOUNTS_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "single redeem export can contain at most {MAX_REDEEM_ACCOUNTS_PER_REQUEST} accounts"
+        )));
+    }
+    Ok(())
 }
 
 fn export_download(format: ExportFormat, document: &Value, prefix: &str) -> Option<Value> {
@@ -518,7 +671,6 @@ async fn auto_probe_worker_tick(state: &AppState) -> Result<(), ApiError> {
         ProbeRunOptions {
             max_accounts: Some(settings.max_accounts_per_run as usize),
             concurrency: settings.concurrency as usize,
-            refresh_before_probe: settings.refresh_before_probe,
             include_redeemed: false,
         },
     )
@@ -552,7 +704,6 @@ async fn auto_probe_worker_tick(state: &AppState) -> Result<(), ApiError> {
 struct ProbeRunOptions {
     max_accounts: Option<usize>,
     concurrency: usize,
-    refresh_before_probe: bool,
     include_redeemed: bool,
 }
 
@@ -596,15 +747,7 @@ async fn run_probe_accounts(
         let probe_http = probe_http.clone();
         let probe_proxy = probe_proxy.clone();
         join_set.spawn(async move {
-            probe_one_account(
-                state,
-                account,
-                auth_file,
-                options.refresh_before_probe,
-                probe_http,
-                probe_proxy,
-            )
-            .await
+            probe_one_account(state, account, auth_file, probe_http, probe_proxy).await
         });
     }
     while !join_set.is_empty() {
@@ -643,52 +786,10 @@ async fn collect_probe_result(
 async fn probe_one_account(
     state: AppState,
     summary: AccountSummary,
-    mut auth_file: CodexAuthFile,
-    refresh_before_probe: bool,
+    auth_file: CodexAuthFile,
     probe_http: Client,
     probe_proxy: Option<String>,
 ) -> Result<Value, ApiError> {
-    let mut refresh_status = "skipped";
-    if refresh_before_probe
-        && summary.redeemed_at.is_none()
-        && access_token_needs_refresh(
-            auth_file.expires_at_epoch(),
-            unix_now_secs(),
-            ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
-        )
-    {
-        match refresh_codex_auth_file_with_client(&state, &probe_http, &auth_file).await {
-            Ok(refreshed) => {
-                state
-                    .repo
-                    .update_account_auth(
-                        &summary.id,
-                        &refreshed,
-                        AccountStatus::Available,
-                        Some(unix_now_secs()),
-                    )
-                    .await?;
-                auth_file = refreshed;
-                refresh_status = "refreshed";
-            }
-            Err(error) => {
-                state
-                    .repo
-                    .mark_account_status(&summary.id, AccountStatus::RefreshFailed)
-                    .await?;
-                return Ok(json!({
-                    "account_id": summary.id,
-                    "status": AccountStatus::RefreshFailed.as_str(),
-                    "refresh": "failed",
-                    "proxy": probe_proxy,
-                    "error": error,
-                }));
-            }
-        }
-    } else if refresh_before_probe && summary.redeemed_at.is_some() {
-        refresh_status = "skipped_redeemed";
-    }
-
     let started = Instant::now();
     let Some(access_token) = auth_file
         .access_token
@@ -702,7 +803,7 @@ async fn probe_one_account(
         return Ok(json!({
             "account_id": summary.id,
             "status": AccountStatus::AuthInvalid.as_str(),
-            "refresh": refresh_status,
+            "refresh": "not_attempted",
             "proxy": probe_proxy,
             "error": "missing access_token"
         }));
@@ -754,7 +855,7 @@ async fn probe_one_account(
         "status": result.status.as_str(),
         "plan_type": result.plan_type,
         "http_status": status_code,
-        "refresh": refresh_status,
+        "refresh": "not_attempted",
         "proxy": probe_proxy,
         "error": result.error,
     }))
@@ -907,6 +1008,68 @@ fn extract_proxy_token(text: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn extract_ip_from_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(ip) = extract_ip_from_json(&value) {
+            return Some(ip);
+        }
+    }
+    extract_ip_token(trimmed)
+}
+
+fn extract_ip_from_json(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => extract_ip_token(value),
+        Value::Array(items) => items.iter().find_map(extract_ip_from_json),
+        Value::Object(object) => {
+            for key in [
+                "ip",
+                "origin",
+                "query",
+                "client_ip",
+                "remote_addr",
+                "address",
+            ] {
+                if let Some(ip) = object.get(key).and_then(extract_ip_from_json) {
+                    return Some(ip);
+                }
+            }
+            object.values().find_map(extract_ip_from_json)
+        }
+        _ => None,
+    }
+}
+
+fn extract_ip_token(text: &str) -> Option<String> {
+    text.split(|character: char| {
+        character.is_whitespace()
+            || character == ','
+            || character == ';'
+            || character == '"'
+            || character == '\''
+    })
+    .map(clean_ip_candidate)
+    .find_map(|candidate| {
+        candidate.parse::<IpAddr>().ok().or_else(|| {
+            candidate
+                .trim_matches(|character| matches!(character, '.' | ':'))
+                .parse::<IpAddr>()
+                .ok()
+        })
+    })
+    .map(|ip| ip.to_string())
+}
+
+fn clean_ip_candidate(value: &str) -> &str {
+    value.trim_matches(|character| {
+        matches!(character, '[' | ']' | '{' | '}' | '(' | ')' | '<' | '>')
+    })
+}
+
 fn looks_like_proxy(value: &str) -> bool {
     if value.is_empty() {
         return false;
@@ -1003,6 +1166,8 @@ async fn refresh_expired_accounts(
 ) -> Result<RefreshOutcome, ApiError> {
     let now = unix_now_secs();
     let accounts = state.repo.load_unredeemed_auth_files(account_ids).await?;
+    let settings = state.repo.get_auto_probe_settings().await?;
+    let (refresh_http, refresh_proxy) = resolve_probe_http_client(state, &settings).await?;
     let mut outcome = RefreshOutcome::default();
     for (summary, auth_file) in accounts {
         let should_refresh = force
@@ -1015,7 +1180,7 @@ async fn refresh_expired_accounts(
             outcome.skipped += 1;
             continue;
         }
-        match refresh_codex_auth_file(state, &auth_file).await {
+        match refresh_codex_auth_file_with_client(state, &refresh_http, &auth_file).await {
             Ok(refreshed) => {
                 state
                     .repo
@@ -1029,7 +1194,8 @@ async fn refresh_expired_accounts(
                 outcome.refreshed += 1;
                 outcome.results.push(json!({
                     "account_id": summary.id,
-                    "status": "refreshed"
+                    "status": "refreshed",
+                    "proxy": refresh_proxy.clone()
                 }));
             }
             Err(error) => {
@@ -1041,19 +1207,13 @@ async fn refresh_expired_accounts(
                 outcome.results.push(json!({
                     "account_id": summary.id,
                     "status": "refresh_failed",
+                    "proxy": refresh_proxy.clone(),
                     "error": error
                 }));
             }
         }
     }
     Ok(outcome)
-}
-
-async fn refresh_codex_auth_file(
-    state: &AppState,
-    auth_file: &CodexAuthFile,
-) -> Result<CodexAuthFile, String> {
-    refresh_codex_auth_file_with_client(state, &state.http, auth_file).await
 }
 
 async fn refresh_codex_auth_file_with_client(
@@ -1152,11 +1312,21 @@ fn admin_request_authorized(
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
     });
-    if token == Some(expected) {
+    if token.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes())) {
         Ok(())
     } else {
         Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"))
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 #[cfg(test)]
@@ -1185,6 +1355,7 @@ mod tests {
             HeaderValue::from_static("Bearer secret"),
         );
         assert!(admin_request_authorized("secret", false, &headers).is_ok());
+        assert!(admin_request_authorized("secret2", false, &headers).is_err());
     }
 
     #[test]
@@ -1228,6 +1399,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_ip_from_common_check_responses() {
+        assert_eq!(
+            extract_ip_from_body(r#"{"ip":"203.0.113.10"}"#).as_deref(),
+            Some("203.0.113.10")
+        );
+        assert_eq!(
+            extract_ip_from_body(r#"{"origin":"198.51.100.3, 198.51.100.4"}"#).as_deref(),
+            Some("198.51.100.3")
+        );
+        assert_eq!(
+            extract_ip_from_body("2001:db8::1").as_deref(),
+            Some("2001:db8::1")
+        );
+    }
+
+    #[test]
     fn redacts_proxy_credentials() {
         assert_eq!(
             redact_proxy_url("http://user:pass@example.com:10000"),
@@ -1237,6 +1424,54 @@ mod tests {
             redact_proxy_url("socks5://127.0.0.1:1080"),
             "socks5://127.0.0.1:1080"
         );
+    }
+
+    #[test]
+    fn startup_rejects_placeholder_secret_without_dev_override() {
+        assert!(validate_startup_secrets(
+            "real-admin-token",
+            "change-this-long-random-secret",
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_startup_secrets(
+            "real-admin-token",
+            "change-this-long-random-secret",
+            false,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_placeholder_admin_token_without_dev_override() {
+        assert!(validate_startup_secrets(
+            "change-this-admin-password",
+            "real-secret-key",
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_startup_secrets(
+            "change-this-admin-password",
+            "real-secret-key",
+            false,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn redeem_export_limits_reject_empty_or_too_large_requests() {
+        assert!(validate_redeem_export_limits(0, 0).is_err());
+        assert!(validate_redeem_export_limits(MAX_REDEEM_CODES_PER_REQUEST + 1, 0).is_err());
+        assert!(validate_redeem_export_limits(1, MAX_REDEEM_ACCOUNTS_PER_REQUEST + 1).is_err());
+        assert!(validate_redeem_export_limits(
+            MAX_REDEEM_CODES_PER_REQUEST,
+            MAX_REDEEM_ACCOUNTS_PER_REQUEST
+        )
+        .is_ok());
     }
 }
 

@@ -1,12 +1,13 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use account_pool_core::{
-    export_accounts, fingerprint_auth_file, format_redeem_code, generate_redeem_code,
-    legacy_fingerprint_auth_file, mask_redeem_code, normalize_redeem_code, redeem_code_hash,
-    secret_preview, unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat, HealthCheckResult,
-    ParsedAccount,
+    access_token_needs_refresh, export_accounts, fingerprint_auth_file, format_redeem_code,
+    generate_redeem_code, legacy_fingerprint_auth_file, mask_redeem_code, normalize_redeem_code,
+    redeem_code_hash, secret_preview, unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat,
+    HealthCheckResult, ParsedAccount, ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
 };
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -118,6 +119,7 @@ impl AccountPoolRepository {
         for statement in INIT_SQL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             sqlx::query(statement).execute(&pool).await?;
         }
+        ensure_schema_upgrades(&pool).await?;
         Ok(Self {
             pool,
             secrets: SecretBox::new(secret_key),
@@ -321,6 +323,82 @@ ORDER BY a.updated_at DESC, a.created_at DESC
         })
     }
 
+    pub async fn delete_unbound_accounts(
+        &self,
+        ids: &[String],
+    ) -> Result<DeleteAccountsOutcome, DataError> {
+        let mut outcome = DeleteAccountsOutcome::default();
+        let mut tx = self.pool.begin().await?;
+
+        for account_id in ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|id| !id.is_empty())
+        {
+            let Some(row) = sqlx::query(
+                r#"
+SELECT redeem_code_id, redemption_id, redeemed_at
+FROM accounts
+WHERE id = ?
+"#,
+            )
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                outcome.not_found += 1;
+                outcome.results.push(DeleteAccountResult {
+                    account_id: account_id.to_string(),
+                    status: "not_found".to_string(),
+                    reason: Some("账号不存在".to_string()),
+                });
+                continue;
+            };
+
+            let redeem_code_id: Option<String> = row.try_get("redeem_code_id")?;
+            let redemption_id: Option<String> = row.try_get("redemption_id")?;
+            let redeemed_at: Option<i64> = row.try_get("redeemed_at")?;
+            if redeem_code_id.is_some() || redemption_id.is_some() || redeemed_at.is_some() {
+                outcome.skipped += 1;
+                outcome.results.push(DeleteAccountResult {
+                    account_id: account_id.to_string(),
+                    status: "skipped".to_string(),
+                    reason: Some("账号已绑定兑换码或已兑换".to_string()),
+                });
+                continue;
+            }
+
+            let deleted = sqlx::query(
+                r#"
+DELETE FROM accounts
+WHERE id = ? AND redeem_code_id IS NULL AND redemption_id IS NULL AND redeemed_at IS NULL
+"#,
+            )
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if deleted == 1 {
+                outcome.deleted += 1;
+                outcome.results.push(DeleteAccountResult {
+                    account_id: account_id.to_string(),
+                    status: "deleted".to_string(),
+                    reason: None,
+                });
+            } else {
+                outcome.skipped += 1;
+                outcome.results.push(DeleteAccountResult {
+                    account_id: account_id.to_string(),
+                    status: "skipped".to_string(),
+                    reason: Some("账号状态已变化，未删除".to_string()),
+                });
+            }
+        }
+
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
     pub async fn load_auth_files_for_ids(
         &self,
         ids: &[String],
@@ -412,14 +490,12 @@ WHERE id = ? AND redeemed_at IS NULL
         account_id: &str,
         status: AccountStatus,
     ) -> Result<(), DataError> {
-        sqlx::query(
-            "UPDATE accounts SET status = CASE WHEN redeemed_at IS NULL THEN ? ELSE status END, updated_at = ? WHERE id = ?",
-        )
-        .bind(status.as_str())
-        .bind(unix_now_secs() as i64)
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(unix_now_secs() as i64)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -451,7 +527,7 @@ INSERT INTO account_health_checks (
         sqlx::query(
             r#"
 UPDATE accounts
-SET status = CASE WHEN redeemed_at IS NULL THEN ? ELSE status END,
+SET status = ?,
     plan_type = COALESCE(?, plan_type),
     quota_snapshot = ?,
     last_probe_at = ?,
@@ -540,6 +616,7 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = ex
             .plan_filter
             .as_ref()
             .map(|value| json!(value).to_string());
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
 INSERT INTO redeem_code_batches (
@@ -556,7 +633,7 @@ INSERT INTO redeem_code_batches (
         .bind(input.expires_at.map(|value| value as i64))
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         let mut codes = Vec::new();
@@ -566,6 +643,8 @@ INSERT INTO redeem_code_batches (
                 continue;
             };
             let hash = redeem_code_hash(&normalized);
+            let code = format_redeem_code(&normalized);
+            let code_ciphertext = self.secrets.encrypt_json(&code)?;
             let code_id = Uuid::new_v4().to_string();
             let prefix = normalized.chars().take(4).collect::<String>();
             let suffix = normalized
@@ -580,9 +659,9 @@ INSERT INTO redeem_code_batches (
             let inserted = sqlx::query(
                 r#"
 INSERT OR IGNORE INTO redeem_codes (
-  id, batch_id, code_hash, code_prefix, code_suffix, masked_code,
+  id, batch_id, code_hash, code_prefix, code_suffix, masked_code, code_ciphertext,
   status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
 "#,
             )
             .bind(&code_id)
@@ -591,18 +670,20 @@ INSERT OR IGNORE INTO redeem_codes (
             .bind(prefix)
             .bind(suffix)
             .bind(&masked_code)
+            .bind(code_ciphertext)
             .bind(now)
             .bind(now)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             if inserted.rows_affected() == 1 {
                 codes.push(RedeemCodeCreated {
                     id: code_id,
-                    code: format_redeem_code(&normalized),
+                    code,
                     masked_code,
                 });
             }
         }
+        tx.commit().await?;
         Ok(CreateRedeemBatchOutcome { batch_id, codes })
     }
 
@@ -626,7 +707,7 @@ ORDER BY created_at DESC
     ) -> Result<Vec<RedeemCodeSummary>, DataError> {
         let rows = sqlx::query(
             r#"
-SELECT id, batch_id, masked_code, status, redemption_id, redeemed_at, created_at, updated_at
+SELECT id, batch_id, masked_code, code_ciphertext, status, redemption_id, redeemed_at, created_at, updated_at
 FROM redeem_codes
 WHERE batch_id = ?
 ORDER BY created_at ASC
@@ -635,7 +716,147 @@ ORDER BY created_at ASC
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(code_summary_from_row).collect()
+        rows.into_iter()
+            .map(|row| code_summary_from_row(row, &self.secrets))
+            .collect()
+    }
+
+    pub async fn prepare_redeem_export(
+        &self,
+        raw_codes: &[String],
+    ) -> Result<RedeemExportPreparation, DataError> {
+        let now = unix_now_secs();
+        let mut demands = Vec::new();
+        let mut seen_hashes = HashSet::new();
+        let mut estimated_account_count = 0_usize;
+        for raw_code in raw_codes {
+            let Some(normalized) = normalize_redeem_code(raw_code) else {
+                continue;
+            };
+            let hash = redeem_code_hash(&normalized);
+            if !seen_hashes.insert(hash.clone()) {
+                continue;
+            }
+            let Some(row) = sqlx::query(
+                r#"
+SELECT codes.status AS code_status, codes.redemption_id,
+       batches.status AS batch_status, batches.accounts_per_code,
+       batches.plan_filter_json, batches.expires_at
+FROM redeem_codes AS codes
+JOIN redeem_code_batches AS batches ON batches.id = codes.batch_id
+WHERE codes.code_hash = ?
+"#,
+            )
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await?
+            else {
+                continue;
+            };
+
+            let code_status: String = row.try_get("code_status")?;
+            let batch_status: String = row.try_get("batch_status")?;
+            let redemption_id: Option<String> = row.try_get("redemption_id")?;
+            let expires_at: Option<i64> = row.try_get("expires_at")?;
+            if code_status != "active"
+                || batch_status != "active"
+                || expires_at.is_some_and(|value| value <= now as i64)
+            {
+                continue;
+            }
+            if let Some(redemption_id) = redemption_id {
+                if let Some(row) =
+                    sqlx::query("SELECT account_ids_json FROM redeem_redemptions WHERE id = ?")
+                        .bind(redemption_id)
+                        .fetch_optional(&self.pool)
+                        .await?
+                {
+                    let account_ids = serde_json::from_str::<Vec<String>>(
+                        row.try_get::<String, _>("account_ids_json")?.as_str(),
+                    )
+                    .unwrap_or_default();
+                    estimated_account_count =
+                        estimated_account_count.saturating_add(account_ids.len());
+                }
+                continue;
+            }
+            let plan_filter = row
+                .try_get::<Option<String>, _>("plan_filter_json")?
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                .unwrap_or_default();
+            let accounts_per_code: i64 = row.try_get("accounts_per_code")?;
+            if accounts_per_code > 0 {
+                estimated_account_count =
+                    estimated_account_count.saturating_add(accounts_per_code as usize);
+                demands.push(RedeemAccountDemand {
+                    count: accounts_per_code as usize,
+                    plan_filter,
+                });
+            }
+        }
+        if demands.is_empty() {
+            return Ok(RedeemExportPreparation {
+                estimated_account_count,
+                refresh_account_ids: Vec::new(),
+            });
+        }
+
+        let rows = sqlx::query(
+            r#"
+SELECT id, plan_type, status, expires_at
+FROM accounts
+WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
+ORDER BY created_at ASC
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                Ok(RedeemCandidateAccount {
+                    id: row.try_get("id")?,
+                    plan_type: row.try_get("plan_type")?,
+                    status: row.try_get("status")?,
+                    expires_at: optional_i64(&row, "expires_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, DataError>>()?;
+
+        let mut selected_ids = HashSet::new();
+        let mut refresh_ids = Vec::new();
+        for demand in demands {
+            let mut remaining = demand.count;
+            for candidate in &candidates {
+                if remaining == 0 {
+                    break;
+                }
+                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
+                    continue;
+                }
+                if candidate.is_usable(now) {
+                    selected_ids.insert(candidate.id.clone());
+                    remaining -= 1;
+                }
+            }
+            for candidate in &candidates {
+                if remaining == 0 {
+                    break;
+                }
+                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
+                    continue;
+                }
+                if candidate.needs_refresh(now) {
+                    selected_ids.insert(candidate.id.clone());
+                    refresh_ids.push(candidate.id.clone());
+                    remaining -= 1;
+                }
+            }
+        }
+        Ok(RedeemExportPreparation {
+            estimated_account_count,
+            refresh_account_ids: refresh_ids,
+        })
     }
 
     pub async fn redeem_codes_for_export(
@@ -649,6 +870,8 @@ ORDER BY created_at ASC
         let mut all_auth_files = Vec::new();
         let mut all_account_ids = Vec::new();
         let now = unix_now_secs() as i64;
+        let usable_after = now.saturating_add(ACCESS_TOKEN_REFRESH_GRACE_SECONDS as i64);
+        let mut seen_hashes = HashSet::new();
         let mut tx = self.pool.begin().await?;
 
         for raw_code in raw_codes {
@@ -660,6 +883,13 @@ ORDER BY created_at ASC
                 continue;
             };
             let hash = redeem_code_hash(&normalized);
+            if !seen_hashes.insert(hash.clone()) {
+                failures.push(RedeemFailure {
+                    code: format_redeem_code(&normalized),
+                    reason: "兑换码重复提交".to_string(),
+                });
+                continue;
+            }
             let Some(code_row) = sqlx::query(
                 r#"
 SELECT codes.id AS code_id, codes.batch_id, codes.status AS code_status,
@@ -729,10 +959,11 @@ WHERE codes.code_hash = ?
                     r#"
 SELECT id, plan_type
 FROM accounts
-WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
+WHERE redeemed_at IS NULL AND status = 'available' AND expires_at IS NOT NULL AND expires_at > ?
 ORDER BY created_at ASC
 "#,
                 )
+                .bind(usable_after)
                 .fetch_all(&mut *tx)
                 .await?;
                 let account_ids = rows
@@ -786,7 +1017,7 @@ INSERT INTO redeem_redemptions (
                     let updated = sqlx::query(
                         r#"
 UPDATE accounts
-SET status = 'redeemed', redeemed_at = ?, redeem_code_id = ?, redemption_id = ?, updated_at = ?
+SET redeemed_at = ?, redeem_code_id = ?, redemption_id = ?, updated_at = ?
 WHERE id = ? AND redeemed_at IS NULL
 "#,
                     )
@@ -934,6 +1165,34 @@ WHERE a.id = ?
     }
 }
 
+async fn ensure_schema_upgrades(pool: &SqlitePool) -> Result<(), DataError> {
+    ensure_sqlite_column(
+        pool,
+        "redeem_codes",
+        "code_ciphertext",
+        "ALTER TABLE redeem_codes ADD COLUMN code_ciphertext TEXT",
+    )
+    .await
+}
+
+async fn ensure_sqlite_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<(), DataError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(&pragma).fetch_all(pool).await?;
+    let exists = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == column)
+    });
+    if !exists {
+        sqlx::query(alter_sql).execute(pool).await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportAccountsOutcome {
     pub imported: usize,
@@ -955,6 +1214,21 @@ pub struct AccountListPage {
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeleteAccountsOutcome {
+    pub deleted: usize,
+    pub skipped: usize,
+    pub not_found: usize,
+    pub results: Vec<DeleteAccountResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteAccountResult {
+    pub account_id: String,
+    pub status: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1010,7 +1284,7 @@ impl Default for AutoProbeSettings {
             interval_seconds: 60 * 60,
             max_accounts_per_run: 100,
             concurrency: 4,
-            refresh_before_probe: true,
+            refresh_before_probe: false,
             proxy_enabled: false,
             proxy_mode: default_probe_proxy_mode(),
             proxy_url: None,
@@ -1031,6 +1305,7 @@ impl AutoProbeSettings {
         self.interval_seconds = self.interval_seconds.clamp(60, 24 * 60 * 60);
         self.max_accounts_per_run = self.max_accounts_per_run.clamp(1, 5_000);
         self.concurrency = self.concurrency.clamp(1, 32);
+        self.refresh_before_probe = false;
         self.proxy_mode = match self.proxy_mode.trim().to_ascii_lowercase().as_str() {
             "api" | "dynamic_api" | "711" => "api".to_string(),
             _ => "fixed".to_string(),
@@ -1063,6 +1338,46 @@ fn default_probe_proxy_mode() -> String {
 
 fn default_probe_proxy_scheme() -> String {
     "http".to_string()
+}
+
+struct RedeemAccountDemand {
+    count: usize,
+    plan_filter: Vec<String>,
+}
+
+struct RedeemCandidateAccount {
+    id: String,
+    plan_type: Option<String>,
+    status: String,
+    expires_at: Option<u64>,
+}
+
+impl RedeemCandidateAccount {
+    fn matches(&self, plan_filter: &[String]) -> bool {
+        plan_filter.is_empty()
+            || self.plan_type.as_ref().is_some_and(|value| {
+                plan_filter
+                    .iter()
+                    .any(|plan| plan.eq_ignore_ascii_case(value))
+            })
+    }
+
+    fn is_usable(&self, now: u64) -> bool {
+        self.status == AccountStatus::Available.as_str()
+            && self.expires_at.is_some_and(|expires_at| {
+                !access_token_needs_refresh(
+                    Some(expires_at),
+                    now,
+                    ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
+                )
+            })
+    }
+
+    fn needs_refresh(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|expires_at| {
+            access_token_needs_refresh(Some(expires_at), now, ACCESS_TOKEN_REFRESH_GRACE_SECONDS)
+        })
+    }
 }
 
 fn account_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountSummary, DataError> {
@@ -1152,6 +1467,7 @@ fn batch_summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RedeemBatchSum
 pub struct RedeemCodeSummary {
     pub id: String,
     pub batch_id: String,
+    pub code: Option<String>,
     pub masked_code: String,
     pub status: String,
     pub redemption_id: Option<String>,
@@ -1160,10 +1476,18 @@ pub struct RedeemCodeSummary {
     pub updated_at: u64,
 }
 
-fn code_summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RedeemCodeSummary, DataError> {
+fn code_summary_from_row(
+    row: sqlx::sqlite::SqliteRow,
+    secrets: &SecretBox,
+) -> Result<RedeemCodeSummary, DataError> {
+    let code = row
+        .try_get::<Option<String>, _>("code_ciphertext")?
+        .as_deref()
+        .and_then(|ciphertext| secrets.decrypt_json::<String>(ciphertext).ok());
     Ok(RedeemCodeSummary {
         id: row.try_get("id")?,
         batch_id: row.try_get("batch_id")?,
+        code,
         masked_code: row.try_get("masked_code")?,
         status: row.try_get("status")?,
         redemption_id: row.try_get("redemption_id")?,
@@ -1179,6 +1503,12 @@ pub struct RedeemExportOutcome {
     pub document: Value,
     pub successes: Vec<RedeemSuccess>,
     pub failures: Vec<RedeemFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RedeemExportPreparation {
+    pub estimated_account_count: usize,
+    pub refresh_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1219,6 +1549,25 @@ mod tests {
                 access_token: Some(access_token.to_string()),
                 refresh_token: Some(format!("refresh-{account_id}")),
                 expires_at: Some(json!(2_000_000_000_u64)),
+                ..CodexAuthFile::default()
+            },
+        }
+    }
+
+    fn parsed_expired_account(account_id: &str, access_token: &str) -> ParsedAccount {
+        ParsedAccount {
+            source: "test".to_string(),
+            auth_file: CodexAuthFile {
+                kind: Some("codex".to_string()),
+                account_id: Some(account_id.to_string()),
+                chatgpt_account_id: Some(account_id.to_string()),
+                email: Some(format!("{account_id}@example.com")),
+                name: Some(account_id.to_string()),
+                plan_type: Some("plus".to_string()),
+                chatgpt_plan_type: Some("plus".to_string()),
+                access_token: Some(access_token.to_string()),
+                refresh_token: Some(format!("refresh-{account_id}")),
+                expires_at: Some(json!(1_u64)),
                 ..CodexAuthFile::default()
             },
         }
@@ -1336,6 +1685,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletes_only_unbound_accounts_and_cascades_health_checks() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("acct-1", "access-1")])
+            .await
+            .unwrap();
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let account_id = page.items[0].id.clone();
+        repo.record_health_check(
+            &account_id,
+            &HealthCheckResult {
+                status: AccountStatus::Available,
+                plan_type: Some("plus".to_string()),
+                quota_snapshot: Some(json!({ "primary_used_percent": 5.0 })),
+                error: None,
+            },
+            Some(200),
+            Some(42),
+        )
+        .await
+        .unwrap();
+
+        let outcome = repo
+            .delete_unbound_accounts(&[account_id.clone(), "missing-account".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.not_found, 1);
+        assert_eq!(outcome.results[0].status, "deleted");
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 0);
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM account_health_checks")
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        let health_count: i64 = row.try_get("count").unwrap();
+        assert_eq!(health_count, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_skips_redeemed_accounts() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("acct-1", "access-1"),
+            parsed_account("acct-2", "access-2"),
+        ])
+        .await
+        .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "delete guard".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        repo.redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let redeemed = page
+            .items
+            .iter()
+            .find(|account| account.redeemed_at.is_some())
+            .unwrap()
+            .id
+            .clone();
+        let available = page
+            .items
+            .iter()
+            .find(|account| account.redeemed_at.is_none())
+            .unwrap()
+            .id
+            .clone();
+
+        let outcome = repo
+            .delete_unbound_accounts(&[redeemed.clone(), available])
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.skipped, 1);
+
+        let remaining = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining.total, 1);
+        assert_eq!(remaining.items[0].id, redeemed);
+        assert!(remaining.items[0].redeem_code_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_redeem_codes_returns_full_codes_for_new_batches() {
+        let repo = temp_repo().await;
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "full code export".to_string(),
+                total_count: 3,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let codes = repo.list_redeem_codes(&batch.batch_id).await.unwrap();
+        assert_eq!(codes.len(), 3);
+        assert_eq!(
+            codes
+                .iter()
+                .map(|code| code.code.as_deref())
+                .collect::<Vec<_>>(),
+            batch
+                .codes
+                .iter()
+                .map(|code| Some(code.code.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(codes
+            .iter()
+            .zip(batch.codes.iter())
+            .all(|(listed, created)| listed.masked_code == created.masked_code));
+    }
+
+    #[tokio::test]
     async fn redeemed_accounts_are_retained_and_skipped_by_unredeemed_loads() {
         let repo = temp_repo().await;
         repo.import_accounts(&[
@@ -1373,15 +1870,16 @@ mod tests {
         assert_eq!(
             page.items
                 .iter()
-                .filter(|account| account.status == AccountStatus::Redeemed.as_str())
+                .filter(|account| account.redeemed_at.is_some())
                 .count(),
             1
         );
         let redeemed_account = page
             .items
             .iter()
-            .find(|account| account.status == AccountStatus::Redeemed.as_str())
+            .find(|account| account.redeemed_at.is_some())
             .unwrap();
+        assert_eq!(redeemed_account.status, AccountStatus::Available.as_str());
         assert_eq!(
             redeemed_account.redeem_code_masked.as_deref(),
             Some(batch.codes[0].masked_code.as_str())
@@ -1395,6 +1893,36 @@ mod tests {
             repo.load_unredeemed_auth_files(None).await.unwrap().len(),
             1
         );
+        repo.record_health_check(
+            &redeemed_account.id,
+            &HealthCheckResult {
+                status: AccountStatus::QuotaExhausted,
+                plan_type: Some("plus".to_string()),
+                quota_snapshot: Some(json!({ "primary_used_percent": 100.0 })),
+                error: None,
+            },
+            Some(200),
+            Some(50),
+        )
+        .await
+        .unwrap();
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let measured_redeemed_account = page
+            .items
+            .iter()
+            .find(|account| account.id == redeemed_account.id)
+            .unwrap();
+        assert_eq!(
+            measured_redeemed_account.status,
+            AccountStatus::QuotaExhausted.as_str()
+        );
+        assert!(measured_redeemed_account.redeem_code_id.is_some());
         sqlx::query("UPDATE accounts SET auth_file_ciphertext = 'bad-ciphertext' WHERE id = ?")
             .bind(&redeemed_account.id)
             .execute(repo.pool())
@@ -1440,6 +1968,116 @@ mod tests {
             repo.load_unredeemed_auth_files(None).await.unwrap().len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn redeem_does_not_export_expired_accounts_without_refresh() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_expired_account("expired-1", "expired-access")])
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "expired guard".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = repo
+            .redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        assert!(outcome.successes.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].reason, "可兑换账号库存不足");
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.items[0].redeemed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn redeem_refresh_candidates_are_only_selected_when_usable_stock_is_short() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("usable-1", "usable-access"),
+            parsed_expired_account("expired-1", "expired-access-1"),
+            parsed_expired_account("expired-2", "expired-access-2"),
+        ])
+        .await
+        .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "refresh demand".to_string(),
+                total_count: 2,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let first_only = repo
+            .prepare_redeem_export(&[batch.codes[0].code.clone()])
+            .await
+            .unwrap();
+        assert_eq!(first_only.estimated_account_count, 1);
+        assert!(first_only.refresh_account_ids.is_empty());
+
+        let both = repo
+            .prepare_redeem_export(&[batch.codes[0].code.clone(), batch.codes[1].code.clone()])
+            .await
+            .unwrap();
+        assert_eq!(both.estimated_account_count, 2);
+        assert_eq!(both.refresh_account_ids.len(), 1);
+        let refreshed = repo
+            .load_auth_files_for_ids(&both.refresh_account_ids, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(summary, _)| summary.email.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(refreshed[0].starts_with("expired-"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_code_in_same_redeem_request_is_not_exported_twice() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("acct-1", "access-1")])
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "duplicate guard".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = repo
+            .redeem_codes_for_export(
+                &[batch.codes[0].code.clone(), batch.codes[0].code.clone()],
+                ExportFormat::Cpa,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.successes.len(), 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].reason, "兑换码重复提交");
+        assert_eq!(document_access_token(&outcome.document), "access-1");
     }
 
     #[tokio::test]
@@ -1493,7 +2131,7 @@ mod tests {
         assert_eq!(
             page.items
                 .iter()
-                .filter(|account| account.status == AccountStatus::Redeemed.as_str())
+                .filter(|account| account.redeemed_at.is_some())
                 .count(),
             2
         );
@@ -1507,7 +2145,7 @@ mod tests {
         assert_eq!(default_settings.interval_seconds, 60 * 60);
         assert_eq!(default_settings.max_accounts_per_run, 100);
         assert_eq!(default_settings.concurrency, 4);
-        assert!(default_settings.refresh_before_probe);
+        assert!(!default_settings.refresh_before_probe);
         assert!(!default_settings.proxy_enabled);
         assert_eq!(default_settings.proxy_mode, "fixed");
         assert_eq!(default_settings.proxy_default_scheme, "http");
