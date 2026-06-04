@@ -19,6 +19,19 @@ services:
       - "${AETHER_POOL_API_BIND:-127.0.0.1}:${AETHER_POOL_API_PORT:-8318}:8318"
     restart: unless-stopped
 
+  web:
+    image: aether-pool-web:local
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-}
+    depends_on:
+      - api
+    ports:
+      - "${AETHER_POOL_WEB_BIND:-127.0.0.1}:${AETHER_POOL_WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
   web-build:
     image: node:22-alpine
     working_dir: /src/apps/web
