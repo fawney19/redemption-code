@@ -17,9 +17,11 @@ declare module 'lucide-vue-next' {
   export const Lock: IconComponent
   export const LogIn: IconComponent
   export const LogOut: IconComponent
+  export const Play: IconComponent
   export const Plus: IconComponent
   export const RefreshCw: IconComponent
   export const RotateCcw: IconComponent
+  export const Save: IconComponent
   export const Search: IconComponent
   export const ShieldCheck: IconComponent
   export const Ticket: IconComponent

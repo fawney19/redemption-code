@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use account_pool_core::{
     access_token_needs_refresh, export_cpa_zip_from_document, normalize_wham_usage_response,
@@ -8,7 +8,8 @@ use account_pool_core::{
     ACCESS_TOKEN_REFRESH_GRACE_SECONDS, CODEX_WHAM_USAGE_URL,
 };
 use account_pool_data::{
-    AccountListQuery, AccountPoolRepository, CreateRedeemBatchInput, DataError,
+    AccountListQuery, AccountPoolRepository, AccountSummary, AutoProbeSettings,
+    CreateRedeemBatchInput, DataError,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -19,6 +20,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -30,6 +33,7 @@ struct AppState {
     allow_open_admin: bool,
     oauth_client_id: Arc<String>,
     oauth_token_url: Arc<String>,
+    auto_probe_lock: Arc<Mutex<()>>,
 }
 
 #[tokio::main]
@@ -68,7 +72,10 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("AETHER_POOL_OAUTH_TOKEN_URL")
                 .unwrap_or_else(|_| "https://auth.openai.com/oauth/token".to_string()),
         ),
+        auto_probe_lock: Arc::new(Mutex::new(())),
     };
+
+    let _auto_probe_worker = spawn_auto_probe_worker(state.clone());
 
     let app = router(state)
         .layer(TraceLayer::new_for_http())
@@ -129,6 +136,14 @@ fn router(state: AppState) -> Router {
         .route("/api/admin/accounts/probe", post(probe_accounts))
         .route("/api/admin/accounts/refresh", post(refresh_accounts))
         .route("/api/admin/accounts/export", post(export_admin_accounts))
+        .route(
+            "/api/admin/settings/auto-probe",
+            get(get_auto_probe_settings).post(update_auto_probe_settings),
+        )
+        .route(
+            "/api/admin/settings/auto-probe/run",
+            post(run_auto_probe_once),
+        )
         .route(
             "/api/admin/redeem-code-batches",
             post(create_redeem_batch).get(list_redeem_batches),
@@ -206,84 +221,118 @@ async fn probe_accounts(
     Json(payload): Json<AccountIdRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
-    let _ = refresh_expired_accounts(&state, payload.account_ids.as_deref(), false).await?;
-    let accounts = state
-        .repo
-        .load_unredeemed_auth_files(payload.account_ids.as_deref())
-        .await?;
-    let mut results = Vec::new();
-    for (summary, auth_file) in accounts {
-        let started = Instant::now();
-        let Some(access_token) = auth_file
-            .access_token
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        else {
-            state
-                .repo
-                .mark_account_status(&summary.id, AccountStatus::AuthInvalid)
-                .await?;
-            results.push(json!({
-                "account_id": summary.id,
-                "status": AccountStatus::AuthInvalid.as_str(),
-                "error": "missing access_token"
-            }));
-            continue;
-        };
-        let mut request = state
-            .http
-            .get(CODEX_WHAM_USAGE_URL)
-            .header("accept", "application/json")
-            .bearer_auth(access_token);
-        if let Some(account_id) = auth_file
-            .account_id
-            .as_ref()
-            .or(auth_file.chatgpt_account_id.as_ref())
-            .filter(|_| auth_file.plan_type.as_deref() != Some("free"))
-        {
-            request = request.header("chatgpt-account-id", account_id);
-        }
-        let (status_code, body, error) = match request.send().await {
-            Ok(response) => {
-                let status_code = response.status().as_u16();
-                let body = response.json::<Value>().await.ok();
-                (Some(status_code), body, None)
-            }
-            Err(error) => (None, None, Some(error.to_string())),
-        };
-        let mut result = if let Some(status_code) = status_code {
-            normalize_wham_usage_response(status_code, body)
-        } else {
-            account_pool_core::HealthCheckResult {
-                status: AccountStatus::RefreshFailed,
-                plan_type: None,
-                quota_snapshot: None,
-                error,
-            }
-        };
-        if result.plan_type.is_none() {
-            result.plan_type = auth_file.plan_type.clone();
-        }
-        state
-            .repo
-            .record_health_check(
-                &summary.id,
-                &result,
-                status_code,
-                Some(started.elapsed().as_millis() as u64),
-            )
-            .await?;
-        results.push(json!({
-            "account_id": summary.id,
-            "status": result.status.as_str(),
-            "plan_type": result.plan_type,
-            "http_status": status_code,
-            "error": result.error,
-        }));
-    }
+    let settings = state.repo.get_auto_probe_settings().await?;
+    let summary = run_probe_accounts(
+        &state,
+        payload.account_ids.as_deref(),
+        ProbeRunOptions {
+            max_accounts: None,
+            concurrency: settings.concurrency as usize,
+            refresh_before_probe: true,
+        },
+    )
+    .await?;
     Ok(Json(json!({
         "success": true,
-        "results": results,
+        "checked": summary.checked,
+        "failed": summary.failed,
+        "results": summary.results,
+    })))
+}
+
+async fn get_auto_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let settings = state.repo.get_auto_probe_settings().await?;
+    Ok(Json(auto_probe_settings_payload(settings)))
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoProbeSettingsPatch {
+    enabled: Option<bool>,
+    interval_seconds: Option<u64>,
+    max_accounts_per_run: Option<u64>,
+    concurrency: Option<u64>,
+    refresh_before_probe: Option<bool>,
+}
+
+async fn update_auto_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AutoProbeSettingsPatch>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let mut settings = state.repo.get_auto_probe_settings().await?;
+    if let Some(enabled) = payload.enabled {
+        settings.enabled = enabled;
+    }
+    if let Some(interval_seconds) = payload.interval_seconds {
+        settings.interval_seconds = interval_seconds;
+    }
+    if let Some(max_accounts_per_run) = payload.max_accounts_per_run {
+        settings.max_accounts_per_run = max_accounts_per_run;
+    }
+    if let Some(concurrency) = payload.concurrency {
+        settings.concurrency = concurrency;
+    }
+    if let Some(refresh_before_probe) = payload.refresh_before_probe {
+        settings.refresh_before_probe = refresh_before_probe;
+    }
+    let settings = state.repo.save_auto_probe_settings(&settings).await?;
+    Ok(Json(auto_probe_settings_payload(settings)))
+}
+
+async fn run_auto_probe_once(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let _guard = state.auto_probe_lock.lock().await;
+    let settings = state.repo.get_auto_probe_settings().await?;
+    let started_at = unix_now_secs();
+    state.repo.mark_auto_probe_started(started_at).await?;
+    let summary = match run_probe_accounts(
+        &state,
+        None,
+        ProbeRunOptions {
+            max_accounts: Some(settings.max_accounts_per_run as usize),
+            concurrency: settings.concurrency as usize,
+            refresh_before_probe: settings.refresh_before_probe,
+        },
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let message = error.message.clone();
+            let _ = state
+                .repo
+                .mark_auto_probe_finished(
+                    unix_now_secs(),
+                    0,
+                    json!({ "success": false, "error": message }),
+                    Some(message),
+                )
+                .await;
+            return Err(error);
+        }
+    };
+    let result = probe_run_payload(&summary, 200);
+    let settings = state
+        .repo
+        .mark_auto_probe_finished(
+            unix_now_secs(),
+            summary.checked as u64,
+            result.clone(),
+            None,
+        )
+        .await?;
+    Ok(Json(json!({
+        "success": true,
+        "settings": auto_probe_settings_payload(settings),
+        "run": result,
     })))
 }
 
@@ -407,6 +456,285 @@ fn export_download(format: ExportFormat, document: &Value, prefix: &str) -> Opti
         }),
         ExportFormat::Sub2api => None,
     }
+}
+
+fn spawn_auto_probe_worker(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = auto_probe_worker_tick(&state).await {
+                tracing::warn!(error = ?error, "auto probe worker tick failed");
+            }
+        }
+    })
+}
+
+async fn auto_probe_worker_tick(state: &AppState) -> Result<(), ApiError> {
+    let settings = state.repo.get_auto_probe_settings().await?;
+    if !settings.enabled {
+        return Ok(());
+    }
+    let now = unix_now_secs();
+    let last_run_at = settings
+        .last_finished_at
+        .or(settings.last_started_at)
+        .unwrap_or_default();
+    if last_run_at > 0 && now < last_run_at.saturating_add(settings.interval_seconds) {
+        return Ok(());
+    }
+    let _guard = match state.auto_probe_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => return Ok(()),
+    };
+    state.repo.mark_auto_probe_started(now).await?;
+    match run_probe_accounts(
+        state,
+        None,
+        ProbeRunOptions {
+            max_accounts: Some(settings.max_accounts_per_run as usize),
+            concurrency: settings.concurrency as usize,
+            refresh_before_probe: settings.refresh_before_probe,
+        },
+    )
+    .await
+    {
+        Ok(summary) => {
+            let result = probe_run_payload(&summary, 50);
+            state
+                .repo
+                .mark_auto_probe_finished(unix_now_secs(), summary.checked as u64, result, None)
+                .await?;
+        }
+        Err(error) => {
+            let message = error.message.clone();
+            let _ = state
+                .repo
+                .mark_auto_probe_finished(
+                    unix_now_secs(),
+                    0,
+                    json!({ "success": false, "error": message }),
+                    Some(message),
+                )
+                .await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ProbeRunOptions {
+    max_accounts: Option<usize>,
+    concurrency: usize,
+    refresh_before_probe: bool,
+}
+
+#[derive(Default)]
+struct ProbeRunSummary {
+    checked: usize,
+    failed: usize,
+    results: Vec<Value>,
+}
+
+async fn run_probe_accounts(
+    state: &AppState,
+    account_ids: Option<&[String]>,
+    options: ProbeRunOptions,
+) -> Result<ProbeRunSummary, ApiError> {
+    let mut accounts = state.repo.load_unredeemed_auth_files(account_ids).await?;
+    if let Some(max_accounts) = options.max_accounts {
+        accounts.truncate(max_accounts);
+    }
+    let concurrency = options.concurrency.clamp(1, 32);
+    let mut join_set = JoinSet::new();
+    let mut summary = ProbeRunSummary::default();
+    for (account, auth_file) in accounts {
+        while join_set.len() >= concurrency {
+            collect_probe_result(&mut join_set, &mut summary).await;
+        }
+        let state = state.clone();
+        join_set.spawn(async move {
+            probe_one_account(state, account, auth_file, options.refresh_before_probe).await
+        });
+    }
+    while !join_set.is_empty() {
+        collect_probe_result(&mut join_set, &mut summary).await;
+    }
+    Ok(summary)
+}
+
+async fn collect_probe_result(
+    join_set: &mut JoinSet<Result<Value, ApiError>>,
+    summary: &mut ProbeRunSummary,
+) {
+    let Some(result) = join_set.join_next().await else {
+        return;
+    };
+    summary.checked += 1;
+    match result {
+        Ok(Ok(value)) => summary.results.push(value),
+        Ok(Err(error)) => {
+            summary.failed += 1;
+            summary.results.push(json!({
+                "status": "probe_failed",
+                "error": error.message,
+            }));
+        }
+        Err(error) => {
+            summary.failed += 1;
+            summary.results.push(json!({
+                "status": "probe_failed",
+                "error": error.to_string(),
+            }));
+        }
+    }
+}
+
+async fn probe_one_account(
+    state: AppState,
+    summary: AccountSummary,
+    mut auth_file: CodexAuthFile,
+    refresh_before_probe: bool,
+) -> Result<Value, ApiError> {
+    let mut refresh_status = "skipped";
+    if refresh_before_probe
+        && access_token_needs_refresh(
+            auth_file.expires_at_epoch(),
+            unix_now_secs(),
+            ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
+        )
+    {
+        match refresh_codex_auth_file(&state, &auth_file).await {
+            Ok(refreshed) => {
+                state
+                    .repo
+                    .update_account_auth(
+                        &summary.id,
+                        &refreshed,
+                        AccountStatus::Available,
+                        Some(unix_now_secs()),
+                    )
+                    .await?;
+                auth_file = refreshed;
+                refresh_status = "refreshed";
+            }
+            Err(error) => {
+                state
+                    .repo
+                    .mark_account_status(&summary.id, AccountStatus::RefreshFailed)
+                    .await?;
+                return Ok(json!({
+                    "account_id": summary.id,
+                    "status": AccountStatus::RefreshFailed.as_str(),
+                    "refresh": "failed",
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let Some(access_token) = auth_file
+        .access_token
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        state
+            .repo
+            .mark_account_status(&summary.id, AccountStatus::AuthInvalid)
+            .await?;
+        return Ok(json!({
+            "account_id": summary.id,
+            "status": AccountStatus::AuthInvalid.as_str(),
+            "refresh": refresh_status,
+            "error": "missing access_token"
+        }));
+    };
+    let mut request = state
+        .http
+        .get(CODEX_WHAM_USAGE_URL)
+        .header("accept", "application/json")
+        .bearer_auth(access_token);
+    if let Some(account_id) = auth_file
+        .account_id
+        .as_ref()
+        .or(auth_file.chatgpt_account_id.as_ref())
+        .filter(|_| auth_file.plan_type.as_deref() != Some("free"))
+    {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    let (status_code, body, error) = match request.send().await {
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            let body = response.json::<Value>().await.ok();
+            (Some(status_code), body, None)
+        }
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    let mut result = if let Some(status_code) = status_code {
+        normalize_wham_usage_response(status_code, body)
+    } else {
+        account_pool_core::HealthCheckResult {
+            status: AccountStatus::RefreshFailed,
+            plan_type: None,
+            quota_snapshot: None,
+            error,
+        }
+    };
+    if result.plan_type.is_none() {
+        result.plan_type = auth_file.plan_type.clone();
+    }
+    state
+        .repo
+        .record_health_check(
+            &summary.id,
+            &result,
+            status_code,
+            Some(started.elapsed().as_millis() as u64),
+        )
+        .await?;
+    Ok(json!({
+        "account_id": summary.id,
+        "status": result.status.as_str(),
+        "plan_type": result.plan_type,
+        "http_status": status_code,
+        "refresh": refresh_status,
+        "error": result.error,
+    }))
+}
+
+fn probe_run_payload(summary: &ProbeRunSummary, result_limit: usize) -> Value {
+    json!({
+        "success": summary.failed == 0,
+        "checked": summary.checked,
+        "failed": summary.failed,
+        "results": summary.results.iter().take(result_limit).cloned().collect::<Vec<_>>(),
+        "truncated": summary.results.len() > result_limit,
+    })
+}
+
+fn auto_probe_settings_payload(settings: AutoProbeSettings) -> Value {
+    let next_run_at = if settings.enabled {
+        let base = settings
+            .last_finished_at
+            .or(settings.last_started_at)
+            .unwrap_or_default();
+        Some(if base == 0 {
+            unix_now_secs()
+        } else {
+            base.saturating_add(settings.interval_seconds)
+        })
+    } else {
+        None
+    };
+    json!({
+        "success": true,
+        "settings": settings,
+        "next_run_at": next_run_at,
+    })
 }
 
 #[derive(Default)]

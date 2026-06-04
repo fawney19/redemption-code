@@ -7,7 +7,7 @@
 
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { useAdmin, loadAccounts, loadBatches } from './composables/useAdmin'
+import { useAdmin, loadAccounts, loadBatches, loadAutoProbeSettings } from './composables/useAdmin'
 import PublicView from './views/PublicView.vue'
 import AdminLogin from './views/AdminLogin.vue'
 import AdminDashboard from './views/AdminDashboard.vue'
@@ -29,6 +29,7 @@ onMounted(() => {
       adminResult.value = e instanceof Error ? e.message : String(e)
     })
     loadBatches().catch(() => undefined)
+    loadAutoProbeSettings().catch(() => undefined)
   }
 })
 

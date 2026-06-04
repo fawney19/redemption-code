@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const INIT_SQL: &str = include_str!("../migrations/sqlite/0001_init.sql");
+const AUTO_PROBE_SETTINGS_KEY: &str = "auto_probe";
 
 #[derive(Debug, Error)]
 pub enum DataError {
@@ -409,6 +410,66 @@ WHERE id = ?
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn get_auto_probe_settings(&self) -> Result<AutoProbeSettings, DataError> {
+        let row = sqlx::query("SELECT value_json, updated_at FROM app_settings WHERE key = ?")
+            .bind(AUTO_PROBE_SETTINGS_KEY)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(AutoProbeSettings::default());
+        };
+        let value_json: String = row.try_get("value_json")?;
+        let updated_at = optional_i64(&row, "updated_at")?.unwrap_or_default();
+        let mut settings = serde_json::from_str::<AutoProbeSettings>(&value_json)
+            .unwrap_or_else(|_| AutoProbeSettings::default());
+        settings.updated_at = updated_at;
+        Ok(settings.normalized())
+    }
+
+    pub async fn save_auto_probe_settings(
+        &self,
+        settings: &AutoProbeSettings,
+    ) -> Result<AutoProbeSettings, DataError> {
+        let mut settings = settings.clone().normalized();
+        settings.updated_at = unix_now_secs();
+        sqlx::query(
+            r#"
+INSERT INTO app_settings (key, value_json, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+"#,
+        )
+        .bind(AUTO_PROBE_SETTINGS_KEY)
+        .bind(serde_json::to_string(&settings).map_err(|_| DataError::Encryption)?)
+        .bind(settings.updated_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(settings)
+    }
+
+    pub async fn mark_auto_probe_started(&self, started_at: u64) -> Result<(), DataError> {
+        let mut settings = self.get_auto_probe_settings().await?;
+        settings.last_started_at = Some(started_at);
+        settings.last_error = None;
+        self.save_auto_probe_settings(&settings).await?;
+        Ok(())
+    }
+
+    pub async fn mark_auto_probe_finished(
+        &self,
+        finished_at: u64,
+        checked_count: u64,
+        result: Value,
+        error: Option<String>,
+    ) -> Result<AutoProbeSettings, DataError> {
+        let mut settings = self.get_auto_probe_settings().await?;
+        settings.last_finished_at = Some(finished_at);
+        settings.last_checked_count = checked_count;
+        settings.last_result = Some(result);
+        settings.last_error = error;
+        self.save_auto_probe_settings(&settings).await
     }
 
     pub async fn create_redeem_batch(
@@ -850,6 +911,48 @@ pub struct AccountSummary {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoProbeSettings {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub max_accounts_per_run: u64,
+    pub concurrency: u64,
+    pub refresh_before_probe: bool,
+    pub last_started_at: Option<u64>,
+    pub last_finished_at: Option<u64>,
+    pub last_checked_count: u64,
+    pub last_error: Option<String>,
+    pub last_result: Option<Value>,
+    pub updated_at: u64,
+}
+
+impl Default for AutoProbeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 60 * 60,
+            max_accounts_per_run: 100,
+            concurrency: 4,
+            refresh_before_probe: true,
+            last_started_at: None,
+            last_finished_at: None,
+            last_checked_count: 0,
+            last_error: None,
+            last_result: None,
+            updated_at: 0,
+        }
+    }
+}
+
+impl AutoProbeSettings {
+    pub fn normalized(mut self) -> Self {
+        self.interval_seconds = self.interval_seconds.clamp(60, 24 * 60 * 60);
+        self.max_accounts_per_run = self.max_accounts_per_run.clamp(1, 5_000);
+        self.concurrency = self.concurrency.clamp(1, 32);
+        self
+    }
+}
+
 fn account_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountSummary, DataError> {
     Ok(AccountSummary {
         id: row.try_get("id")?,
@@ -1141,5 +1244,47 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn auto_probe_settings_are_persisted_and_normalized() {
+        let repo = temp_repo().await;
+        let default_settings = repo.get_auto_probe_settings().await.unwrap();
+        assert!(!default_settings.enabled);
+        assert_eq!(default_settings.interval_seconds, 60 * 60);
+        assert_eq!(default_settings.max_accounts_per_run, 100);
+        assert_eq!(default_settings.concurrency, 4);
+        assert!(default_settings.refresh_before_probe);
+
+        let saved = repo
+            .save_auto_probe_settings(&AutoProbeSettings {
+                enabled: true,
+                interval_seconds: 1,
+                max_accounts_per_run: 50_000,
+                concurrency: 0,
+                refresh_before_probe: false,
+                last_started_at: Some(100),
+                last_finished_at: Some(200),
+                last_checked_count: 12,
+                last_error: Some("previous error".to_string()),
+                last_result: Some(json!({ "checked": 12 })),
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(saved.enabled);
+        assert_eq!(saved.interval_seconds, 60);
+        assert_eq!(saved.max_accounts_per_run, 5_000);
+        assert_eq!(saved.concurrency, 1);
+        assert!(!saved.refresh_before_probe);
+
+        let loaded = repo.get_auto_probe_settings().await.unwrap();
+        assert_eq!(loaded.interval_seconds, 60);
+        assert_eq!(loaded.max_accounts_per_run, 5_000);
+        assert_eq!(loaded.concurrency, 1);
+        assert_eq!(loaded.last_checked_count, 12);
+        assert_eq!(loaded.last_error.as_deref(), Some("previous error"));
+        assert_eq!(loaded.last_result, Some(json!({ "checked": 12 })));
     }
 }

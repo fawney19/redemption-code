@@ -1,5 +1,13 @@
 import { computed, reactive, ref } from 'vue'
-import { api, type AccountSummary, type EncodedDownload, type ExportFormat, type RedeemBatch, type RedeemCode } from '../api/client'
+import {
+  api,
+  type AccountSummary,
+  type AutoProbeSettings,
+  type EncodedDownload,
+  type ExportFormat,
+  type RedeemBatch,
+  type RedeemCode,
+} from '../api/client'
 
 const adminToken = ref(localStorage.getItem('aether-pool.admin-token') || '')
 const adminTokenDraft = ref('')
@@ -13,6 +21,9 @@ const batches = ref<RedeemBatch[]>([])
 const batchCodes = ref<RedeemCode[]>([])
 const selectedBatchId = ref('')
 const generatedCodes = ref('')
+const autoProbeSettings = ref<AutoProbeSettings | null>(null)
+const autoProbeNextRunAt = ref<number | null>(null)
+const autoProbeResult = ref('')
 const activeView = ref<'accounts' | 'codes'>('accounts')
 const filters = reactive({ search: '', status: '', redeemed: '' })
 const batchForm = reactive({
@@ -21,6 +32,13 @@ const batchForm = reactive({
   accounts_per_code: 1,
   plan_filter_text: '',
   expires_at_text: '',
+})
+const autoProbeForm = reactive({
+  enabled: false,
+  interval_seconds: 60 * 60,
+  max_accounts_per_run: 100,
+  concurrency: 4,
+  refresh_before_probe: true,
 })
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
@@ -63,6 +81,13 @@ const selectedBatchStats = computed(() => {
     redemptionRate: totalCodes ? Math.round((redeemedCodes / totalCodes) * 100) : 0,
   }
 })
+const autoProbeIntervalMinutes = computed({
+  get: () => Math.max(1, Math.round(Number(autoProbeForm.interval_seconds || 60) / 60)),
+  set: (value: number) => {
+    const minutes = Number.isFinite(Number(value)) ? Number(value) : 1
+    autoProbeForm.interval_seconds = Math.max(60, Math.round(minutes) * 60)
+  },
+})
 
 export function useAdmin() {
   return {
@@ -78,6 +103,11 @@ export function useAdmin() {
     batchCodes,
     selectedBatchId,
     generatedCodes,
+    autoProbeSettings,
+    autoProbeNextRunAt,
+    autoProbeResult,
+    autoProbeForm,
+    autoProbeIntervalMinutes,
     activeView,
     filters,
     batchForm,
@@ -114,6 +144,7 @@ export async function loginAdmin() {
     localStorage.setItem('aether-pool.admin-token', adminToken.value)
     await loadAccounts()
     await loadBatches()
+    await loadAutoProbeSettings()
   })
 }
 
@@ -125,6 +156,9 @@ export function logoutAdmin() {
   batchCodes.value = []
   selectedBatchId.value = ''
   generatedCodes.value = ''
+  autoProbeSettings.value = null
+  autoProbeNextRunAt.value = null
+  autoProbeResult.value = ''
   selectedIds.value = []
   localStorage.removeItem('aether-pool.admin-token')
 }
@@ -140,6 +174,11 @@ export async function loadBatches() {
   batches.value = result.items
 }
 
+export async function loadAutoProbeSettings() {
+  const result = await api.getAutoProbeSettings(apiState.value)
+  applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
+}
+
 export async function refreshAdmin() {
   await withBusy(async () => {
     if (activeView.value === 'codes') {
@@ -148,6 +187,7 @@ export async function refreshAdmin() {
     } else {
       await loadAccounts()
     }
+    await loadAutoProbeSettings()
   })
 }
 
@@ -174,6 +214,29 @@ export async function refreshSelected() {
     const ids = selectedIds.value.length ? selectedIds.value : undefined
     const result = await api.refreshAccounts(apiState.value, ids)
     adminResult.value = JSON.stringify(result, null, 2)
+    await loadAccounts()
+  })
+}
+
+export async function saveAutoProbeSettings() {
+  await withBusy(async () => {
+    const result = await api.updateAutoProbeSettings(apiState.value, {
+      enabled: autoProbeForm.enabled,
+      interval_seconds: Number(autoProbeForm.interval_seconds || 60),
+      max_accounts_per_run: Number(autoProbeForm.max_accounts_per_run || 1),
+      concurrency: Number(autoProbeForm.concurrency || 1),
+      refresh_before_probe: autoProbeForm.refresh_before_probe,
+    })
+    applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
+    autoProbeResult.value = JSON.stringify({ saved: true, settings: result.settings }, null, 2)
+  })
+}
+
+export async function runAutoProbeNow() {
+  await withBusy(async () => {
+    const result = await api.runAutoProbeNow(apiState.value)
+    applyAutoProbeSettings(result.settings.settings, result.settings.next_run_at ?? null)
+    autoProbeResult.value = JSON.stringify(result.run, null, 2)
     await loadAccounts()
   })
 }
@@ -222,6 +285,16 @@ async function fetchCodes(batchId: string) {
   selectedBatchId.value = batchId
   const result = await api.listCodes(apiState.value, batchId)
   batchCodes.value = result.items
+}
+
+function applyAutoProbeSettings(settings: AutoProbeSettings, nextRunAt: number | null) {
+  autoProbeSettings.value = settings
+  autoProbeNextRunAt.value = nextRunAt
+  autoProbeForm.enabled = settings.enabled
+  autoProbeForm.interval_seconds = settings.interval_seconds
+  autoProbeForm.max_accounts_per_run = settings.max_accounts_per_run
+  autoProbeForm.concurrency = settings.concurrency
+  autoProbeForm.refresh_before_probe = settings.refresh_before_probe
 }
 
 export function exportResultForDisplay<T extends { download?: EncodedDownload | null }>(result: T) {

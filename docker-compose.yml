@@ -1,0 +1,40 @@
+services:
+  api:
+    image: aether-pool-api:local
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      AETHER_POOL_ADDR: 0.0.0.0:8318
+      AETHER_POOL_DATABASE_URL: sqlite:///data/aether-pool.sqlite3
+      AETHER_POOL_ADMIN_TOKEN: ${AETHER_POOL_ADMIN_TOKEN:?set AETHER_POOL_ADMIN_TOKEN in .env}
+      AETHER_POOL_SECRET_KEY: ${AETHER_POOL_SECRET_KEY:?set AETHER_POOL_SECRET_KEY in .env}
+      AETHER_POOL_CORS_ORIGINS: ${AETHER_POOL_CORS_ORIGINS:-}
+      AETHER_POOL_OAUTH_CLIENT_ID: ${AETHER_POOL_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}
+      AETHER_POOL_OAUTH_TOKEN_URL: ${AETHER_POOL_OAUTH_TOKEN_URL:-https://auth.openai.com/oauth/token}
+      RUST_LOG: ${RUST_LOG:-aether_pool_api=info,tower_http=info}
+    volumes:
+      - ./data:/data
+    ports:
+      - "${AETHER_POOL_API_BIND:-127.0.0.1}:${AETHER_POOL_API_PORT:-8318}:8318"
+    restart: unless-stopped
+
+  web-build:
+    image: node:22-alpine
+    working_dir: /src/apps/web
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE:-}
+    volumes:
+      - .:/src
+      - web_node_modules:/src/apps/web/node_modules
+      - ./deploy/web:/dist
+    command: >
+      sh -lc "npm ci &&
+      npm run build &&
+      rm -rf /dist/* &&
+      cp -a dist/. /dist/"
+    profiles:
+      - build
+
+volumes:
+  web_node_modules:

@@ -90,21 +90,103 @@
         </div>
       </div>
 
-      <div class="panel import-panel">
-        <div class="panel-header">
-          <div>
-            <h2>批量导入</h2>
-            <p>CPA / Sub2API / JSONL</p>
+      <div class="admin-side-stack">
+        <div class="panel auto-probe-panel">
+          <div class="panel-header">
+            <div>
+              <h2>自动测活</h2>
+              <p>后台定时检测未兑换账号</p>
+            </div>
+            <span class="badge" :class="autoProbeSettings?.enabled ? 'available' : 'disabled'">
+              {{ autoProbeSettings?.enabled ? '运行中' : '已关闭' }}
+            </span>
           </div>
-          <button class="button primary" :disabled="busy || !importText.trim()" @click="importAccounts">
-            <Upload :size="15" />导入
-          </button>
+          <div class="panel-body grid">
+            <label class="setting-toggle">
+              <input v-model="autoProbeForm.enabled" type="checkbox" />
+              <span>
+                <strong>启用自动测活</strong>
+                <small>仅处理未兑换账号</small>
+              </span>
+            </label>
+
+            <div class="settings-grid">
+              <label class="field-label">
+                <span>间隔（分钟）</span>
+                <input v-model.number="autoProbeIntervalMinutes" class="input" type="number" min="1" max="1440" />
+              </label>
+              <label class="field-label">
+                <span>单次账号数</span>
+                <input v-model.number="autoProbeForm.max_accounts_per_run" class="input" type="number" min="1" max="5000" />
+              </label>
+              <label class="field-label">
+                <span>并发</span>
+                <input v-model.number="autoProbeForm.concurrency" class="input" type="number" min="1" max="32" />
+              </label>
+            </div>
+
+            <label class="setting-toggle compact-toggle">
+              <input v-model="autoProbeForm.refresh_before_probe" type="checkbox" />
+              <span>
+                <strong>测活前刷新 AT</strong>
+                <small>过期或接近过期时刷新，已兑换账号跳过</small>
+              </span>
+            </label>
+
+            <div class="probe-meta-grid">
+              <div>
+                <span>下次运行</span>
+                <strong>{{ formatTime(autoProbeNextRunAt) }}</strong>
+              </div>
+              <div>
+                <span>上次开始</span>
+                <strong>{{ formatTime(autoProbeSettings?.last_started_at) }}</strong>
+              </div>
+              <div>
+                <span>上次完成</span>
+                <strong>{{ formatTime(autoProbeSettings?.last_finished_at) }}</strong>
+              </div>
+              <div>
+                <span>上次检测</span>
+                <strong>{{ autoProbeSettings?.last_checked_count ?? 0 }} 个</strong>
+              </div>
+            </div>
+
+            <div v-if="autoProbeSettings?.last_error" class="inline-error">
+              {{ autoProbeSettings.last_error }}
+            </div>
+
+            <div class="toolbar section-toolbar auto-probe-actions">
+              <button class="button primary" :disabled="busy" @click="saveAutoProbeSettings">
+                <Save :size="15" />保存设置
+              </button>
+              <button class="button" :disabled="busy" @click="runAutoProbeNow">
+                <Play :size="15" />立即测活
+              </button>
+            </div>
+
+            <Transition name="fade">
+              <pre v-if="autoProbeDisplayResult" class="result mono auto-probe-result">{{ autoProbeDisplayResult }}</pre>
+            </Transition>
+          </div>
         </div>
-        <div class="panel-body">
-          <textarea v-model="importText" class="textarea" spellcheck="false" placeholder="粘贴 CPA auth JSON / auth 数组 / Sub2API accounts JSON / Codex token JSONL"></textarea>
-          <Transition name="fade">
-            <pre v-if="adminResult" class="result mono admin-result">{{ adminResult }}</pre>
-          </Transition>
+
+        <div class="panel import-panel">
+          <div class="panel-header">
+            <div>
+              <h2>批量导入</h2>
+              <p>CPA / Sub2API / JSONL</p>
+            </div>
+            <button class="button primary" :disabled="busy || !importText.trim()" @click="importAccounts">
+              <Upload :size="15" />导入
+            </button>
+          </div>
+          <div class="panel-body">
+            <textarea v-model="importText" class="textarea" spellcheck="false" placeholder="粘贴 CPA auth JSON / auth 数组 / Sub2API accounts JSON / Codex token JSONL"></textarea>
+            <Transition name="fade">
+              <pre v-if="adminResult" class="result mono admin-result">{{ adminResult }}</pre>
+            </Transition>
+          </div>
         </div>
       </div>
     </div>
@@ -112,7 +194,8 @@
 </template>
 
 <script setup lang="ts">
-import { Activity, Database, Download, RotateCcw, Search, Upload } from 'lucide-vue-next'
+import { computed } from 'vue'
+import { Activity, Database, Download, Play, RotateCcw, Save, Search, Upload } from 'lucide-vue-next'
 import {
   useAdmin,
   loadAccounts,
@@ -120,6 +203,8 @@ import {
   refreshSelected,
   exportSelected,
   importAccounts,
+  saveAutoProbeSettings,
+  runAutoProbeNow,
   toggleAll,
   statusLabel,
   formatTime,
@@ -131,6 +216,11 @@ const {
   importText,
   adminResult,
   adminExportFormat,
+  autoProbeSettings,
+  autoProbeNextRunAt,
+  autoProbeResult,
+  autoProbeForm,
+  autoProbeIntervalMinutes,
   filters,
   busy,
   availableCount,
@@ -138,4 +228,12 @@ const {
   attentionCount,
   allSelected,
 } = useAdmin()
+
+const autoProbeDisplayResult = computed(() => {
+  if (autoProbeResult.value) return autoProbeResult.value
+  if (autoProbeSettings.value?.last_result) {
+    return JSON.stringify(autoProbeSettings.value.last_result, null, 2)
+  }
+  return ''
+})
 </script>

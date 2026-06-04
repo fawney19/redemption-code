@@ -71,6 +71,38 @@ export interface RedeemExportResponse extends ExportResponse {
   failures: unknown[]
 }
 
+export interface AutoProbeSettings {
+  enabled: boolean
+  interval_seconds: number
+  max_accounts_per_run: number
+  concurrency: number
+  refresh_before_probe: boolean
+  last_started_at?: number | null
+  last_finished_at?: number | null
+  last_checked_count: number
+  last_error?: string | null
+  last_result?: unknown | null
+  updated_at: number
+}
+
+export interface AutoProbeSettingsResponse {
+  success: boolean
+  settings: AutoProbeSettings
+  next_run_at?: number | null
+}
+
+export interface AutoProbeRunResponse {
+  success: boolean
+  settings: AutoProbeSettingsResponse
+  run: {
+    success: boolean
+    checked: number
+    failed: number
+    results: unknown[]
+    truncated: boolean
+  }
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
 async function request<T>(
@@ -142,6 +174,24 @@ export const api = {
   },
   listCodes(state: ApiState, batchId: string) {
     return request<{ items: RedeemCode[] }>(`/api/admin/redeem-code-batches/${batchId}/codes`, state)
+  },
+  getAutoProbeSettings(state: ApiState) {
+    return request<AutoProbeSettingsResponse>('/api/admin/settings/auto-probe', state)
+  },
+  updateAutoProbeSettings(state: ApiState, payload: Partial<Pick<
+    AutoProbeSettings,
+    'enabled' | 'interval_seconds' | 'max_accounts_per_run' | 'concurrency' | 'refresh_before_probe'
+  >>) {
+    return request<AutoProbeSettingsResponse>('/api/admin/settings/auto-probe', state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  runAutoProbeNow(state: ApiState) {
+    return request<AutoProbeRunResponse>('/api/admin/settings/auto-probe/run', state, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
   },
   redeemExport(payload: { codes: string[]; format: ExportFormat }) {
     return request<RedeemExportResponse>(

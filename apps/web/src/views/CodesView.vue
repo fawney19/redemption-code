@@ -70,7 +70,7 @@
               <Copy :size="15" />复制
             </button>
             <button class="button" :disabled="!selectedBatch" @click="exportSelectedBatchCodes">
-              <Download :size="15" />导出
+              <Download :size="15" />导出 CSV
             </button>
             <button class="button" @click="loadBatches">
               <RefreshCw :size="15" />刷新
@@ -134,7 +134,7 @@
                     <div class="row-actions">
                       <button class="button ghost tiny" @click="selectBatch(batch.id)">查看</button>
                       <button class="button ghost tiny" @click="copyBatchCodes(batch)">复制</button>
-                      <button class="button ghost tiny" @click="exportBatchCodes(batch)">导出</button>
+                      <button class="button ghost tiny" @click="exportBatchCodes(batch)">导出 CSV</button>
                     </div>
                   </td>
                 </tr>
@@ -221,7 +221,6 @@ import {
   createBatch,
   loadBatches,
   loadCodes,
-  downloadJson,
   downloadText,
   formatTime,
   statusLabel,
@@ -307,14 +306,82 @@ async function exportBatchCodes(batch: RedeemBatch) {
 }
 
 function exportBatchSnapshot(batch: RedeemBatch) {
-  downloadJson(`aether-pool-redeem-codes-${safeFileName(batch.name)}-${timestamp()}.json`, {
-    exported_at: new Date().toISOString(),
-    note: '历史批次只导出脱敏兑换码和兑换状态；完整兑换码仅在生成后可复制或导出。',
-    batch,
-    stats: selectedBatchStats.value,
-    codes: batchCodes.value,
-  })
-  toast.success('已导出批次兑换状态')
+  downloadText(
+    `aether-pool-redeem-codes-${safeFileName(batch.name)}-${timestamp()}.csv`,
+    buildBatchCsv(batch),
+    'text/csv;charset=utf-8',
+  )
+  toast.success('已导出批次兑换状态 CSV')
+}
+
+function buildBatchCsv(batch: RedeemBatch) {
+  const exportedAt = new Date().toISOString()
+  const planFilter = batch.plan_filter.join('|')
+  const rows = batchCodes.value.length
+    ? batchCodes.value.map((code) => [
+      exportedAt,
+      batch.id,
+      batch.name,
+      batch.status,
+      batch.total_count,
+      batch.redeemed_count,
+      batch.accounts_per_code,
+      planFilter,
+      formatCsvTime(batch.expires_at),
+      code.id,
+      code.masked_code,
+      code.status,
+      formatCsvTime(code.redeemed_at),
+      code.redemption_id || '',
+      formatCsvTime(code.created_at),
+      formatCsvTime(code.updated_at),
+    ])
+    : [[
+      exportedAt,
+      batch.id,
+      batch.name,
+      batch.status,
+      batch.total_count,
+      batch.redeemed_count,
+      batch.accounts_per_code,
+      planFilter,
+      formatCsvTime(batch.expires_at),
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+    ]]
+  const header = [
+    'exported_at',
+    'batch_id',
+    'batch_name',
+    'batch_status',
+    'total_count',
+    'redeemed_count',
+    'accounts_per_code',
+    'plan_filter',
+    'batch_expires_at',
+    'code_id',
+    'masked_code',
+    'code_status',
+    'code_redeemed_at',
+    'redemption_id',
+    'code_created_at',
+    'code_updated_at',
+  ]
+  return `\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(',')).join('\n')}`
+}
+
+function csvCell(value: unknown) {
+  const text = value == null ? '' : String(value)
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function formatCsvTime(value?: number | null) {
+  return value ? new Date(value * 1000).toISOString() : ''
 }
 
 async function copyText(value: string, successMessage: string) {
