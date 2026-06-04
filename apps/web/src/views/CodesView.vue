@@ -31,7 +31,6 @@
           <input v-model="batchForm.name" class="input" placeholder="批次名称" />
           <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="5000" placeholder="兑换码数量" />
           <input v-model.number="batchForm.accounts_per_code" class="input" type="number" min="1" max="100" placeholder="每码账号数" />
-          <input v-model="batchForm.plan_filter_text" class="input" placeholder="套餐筛选，可选：plus,team" />
           <input v-model="batchForm.expires_at_text" class="input" placeholder="过期时间，可选：2026-07-01T00:00:00+08:00" />
           <button class="button primary" :disabled="busy" @click="createBatch">
             <Plus :size="15" />生成
@@ -275,7 +274,7 @@ function exportGeneratedCodes() {
     toast.info('暂无可导出的完整兑换码')
     return
   }
-  downloadText(`aether-pool-generated-codes-${timestamp()}.txt`, generatedCodes.value)
+  downloadText(`account-pool-generated-codes-${timestamp()}.txt`, generatedCodes.value)
   toast.success('已导出本次生成的完整兑换码')
 }
 
@@ -307,7 +306,7 @@ async function exportBatchCodes(batch: RedeemBatch) {
 
 function exportBatchSnapshot(batch: RedeemBatch) {
   downloadText(
-    `aether-pool-redeem-codes-${safeFileName(batch.name)}-${timestamp()}.csv`,
+    `account-pool-redeem-codes-${safeFileName(batch.name)}-${timestamp()}.csv`,
     buildBatchCsv(batch),
     'text/csv;charset=utf-8',
   )
@@ -316,7 +315,6 @@ function exportBatchSnapshot(batch: RedeemBatch) {
 
 function buildBatchCsv(batch: RedeemBatch) {
   const exportedAt = new Date().toISOString()
-  const planFilter = batch.plan_filter.join('|')
   const rows = batchCodes.value.length
     ? batchCodes.value.map((code) => [
       exportedAt,
@@ -326,7 +324,6 @@ function buildBatchCsv(batch: RedeemBatch) {
       batch.total_count,
       batch.redeemed_count,
       batch.accounts_per_code,
-      planFilter,
       formatCsvTime(batch.expires_at),
       code.id,
       code.masked_code,
@@ -344,7 +341,6 @@ function buildBatchCsv(batch: RedeemBatch) {
       batch.total_count,
       batch.redeemed_count,
       batch.accounts_per_code,
-      planFilter,
       formatCsvTime(batch.expires_at),
       '',
       '',
@@ -362,7 +358,6 @@ function buildBatchCsv(batch: RedeemBatch) {
     'total_count',
     'redeemed_count',
     'accounts_per_code',
-    'plan_filter',
     'batch_expires_at',
     'code_id',
     'masked_code',

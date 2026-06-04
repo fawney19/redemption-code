@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -229,6 +229,7 @@ async fn probe_accounts(
             max_accounts: None,
             concurrency: settings.concurrency as usize,
             refresh_before_probe: true,
+            include_redeemed: payload.account_ids.is_some(),
         },
     )
     .await?;
@@ -256,6 +257,11 @@ struct AutoProbeSettingsPatch {
     max_accounts_per_run: Option<u64>,
     concurrency: Option<u64>,
     refresh_before_probe: Option<bool>,
+    proxy_enabled: Option<bool>,
+    proxy_mode: Option<String>,
+    proxy_url: Option<Option<String>>,
+    proxy_api_url: Option<Option<String>>,
+    proxy_default_scheme: Option<String>,
 }
 
 async fn update_auto_probe_settings(
@@ -280,6 +286,21 @@ async fn update_auto_probe_settings(
     if let Some(refresh_before_probe) = payload.refresh_before_probe {
         settings.refresh_before_probe = refresh_before_probe;
     }
+    if let Some(proxy_enabled) = payload.proxy_enabled {
+        settings.proxy_enabled = proxy_enabled;
+    }
+    if let Some(proxy_mode) = payload.proxy_mode {
+        settings.proxy_mode = proxy_mode;
+    }
+    if let Some(proxy_url) = payload.proxy_url {
+        settings.proxy_url = proxy_url;
+    }
+    if let Some(proxy_api_url) = payload.proxy_api_url {
+        settings.proxy_api_url = proxy_api_url;
+    }
+    if let Some(proxy_default_scheme) = payload.proxy_default_scheme {
+        settings.proxy_default_scheme = proxy_default_scheme;
+    }
     let settings = state.repo.save_auto_probe_settings(&settings).await?;
     Ok(Json(auto_probe_settings_payload(settings)))
 }
@@ -300,6 +321,7 @@ async fn run_auto_probe_once(
             max_accounts: Some(settings.max_accounts_per_run as usize),
             concurrency: settings.concurrency as usize,
             refresh_before_probe: settings.refresh_before_probe,
+            include_redeemed: false,
         },
     )
     .await
@@ -497,6 +519,7 @@ async fn auto_probe_worker_tick(state: &AppState) -> Result<(), ApiError> {
             max_accounts: Some(settings.max_accounts_per_run as usize),
             concurrency: settings.concurrency as usize,
             refresh_before_probe: settings.refresh_before_probe,
+            include_redeemed: false,
         },
     )
     .await
@@ -530,6 +553,7 @@ struct ProbeRunOptions {
     max_accounts: Option<usize>,
     concurrency: usize,
     refresh_before_probe: bool,
+    include_redeemed: bool,
 }
 
 #[derive(Default)]
@@ -544,10 +568,23 @@ async fn run_probe_accounts(
     account_ids: Option<&[String]>,
     options: ProbeRunOptions,
 ) -> Result<ProbeRunSummary, ApiError> {
-    let mut accounts = state.repo.load_unredeemed_auth_files(account_ids).await?;
+    let mut accounts = if options.include_redeemed {
+        if let Some(account_ids) = account_ids {
+            state
+                .repo
+                .load_auth_files_for_ids(account_ids, true)
+                .await?
+        } else {
+            state.repo.load_unredeemed_auth_files(None).await?
+        }
+    } else {
+        state.repo.load_unredeemed_auth_files(account_ids).await?
+    };
     if let Some(max_accounts) = options.max_accounts {
         accounts.truncate(max_accounts);
     }
+    let probe_settings = state.repo.get_auto_probe_settings().await?;
+    let (probe_http, probe_proxy) = resolve_probe_http_client(state, &probe_settings).await?;
     let concurrency = options.concurrency.clamp(1, 32);
     let mut join_set = JoinSet::new();
     let mut summary = ProbeRunSummary::default();
@@ -556,8 +593,18 @@ async fn run_probe_accounts(
             collect_probe_result(&mut join_set, &mut summary).await;
         }
         let state = state.clone();
+        let probe_http = probe_http.clone();
+        let probe_proxy = probe_proxy.clone();
         join_set.spawn(async move {
-            probe_one_account(state, account, auth_file, options.refresh_before_probe).await
+            probe_one_account(
+                state,
+                account,
+                auth_file,
+                options.refresh_before_probe,
+                probe_http,
+                probe_proxy,
+            )
+            .await
         });
     }
     while !join_set.is_empty() {
@@ -598,16 +645,19 @@ async fn probe_one_account(
     summary: AccountSummary,
     mut auth_file: CodexAuthFile,
     refresh_before_probe: bool,
+    probe_http: Client,
+    probe_proxy: Option<String>,
 ) -> Result<Value, ApiError> {
     let mut refresh_status = "skipped";
     if refresh_before_probe
+        && summary.redeemed_at.is_none()
         && access_token_needs_refresh(
             auth_file.expires_at_epoch(),
             unix_now_secs(),
             ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
         )
     {
-        match refresh_codex_auth_file(&state, &auth_file).await {
+        match refresh_codex_auth_file_with_client(&state, &probe_http, &auth_file).await {
             Ok(refreshed) => {
                 state
                     .repo
@@ -630,10 +680,13 @@ async fn probe_one_account(
                     "account_id": summary.id,
                     "status": AccountStatus::RefreshFailed.as_str(),
                     "refresh": "failed",
+                    "proxy": probe_proxy,
                     "error": error,
                 }));
             }
         }
+    } else if refresh_before_probe && summary.redeemed_at.is_some() {
+        refresh_status = "skipped_redeemed";
     }
 
     let started = Instant::now();
@@ -650,11 +703,11 @@ async fn probe_one_account(
             "account_id": summary.id,
             "status": AccountStatus::AuthInvalid.as_str(),
             "refresh": refresh_status,
+            "proxy": probe_proxy,
             "error": "missing access_token"
         }));
     };
-    let mut request = state
-        .http
+    let mut request = probe_http
         .get(CODEX_WHAM_USAGE_URL)
         .header("accept", "application/json")
         .bearer_auth(access_token);
@@ -702,8 +755,206 @@ async fn probe_one_account(
         "plan_type": result.plan_type,
         "http_status": status_code,
         "refresh": refresh_status,
+        "proxy": probe_proxy,
         "error": result.error,
     }))
+}
+
+async fn resolve_probe_http_client(
+    state: &AppState,
+    settings: &AutoProbeSettings,
+) -> Result<(Client, Option<String>), ApiError> {
+    if !settings.proxy_enabled {
+        return Ok((state.http.clone(), None));
+    }
+    let raw_proxy = if settings.proxy_mode == "api" {
+        let api_url = settings
+            .proxy_api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::bad_request("proxy API URL is required"))?;
+        fetch_dynamic_proxy(&state.http, api_url).await?
+    } else {
+        settings
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ApiError::bad_request("proxy URL is required"))?
+    };
+    let proxy_url = normalize_proxy_url(&raw_proxy, &settings.proxy_default_scheme)?;
+    let proxy = Proxy::all(&proxy_url)
+        .map_err(|error| ApiError::bad_request(format!("invalid probe proxy: {error}")))?;
+    let client = Client::builder()
+        .user_agent("AetherPool/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .proxy(proxy)
+        .build()
+        .map_err(|error| ApiError::bad_request(format!("probe proxy client failed: {error}")))?;
+    Ok((client, Some(redact_proxy_url(&proxy_url))))
+}
+
+async fn fetch_dynamic_proxy(http: &Client, api_url: &str) -> Result<String, ApiError> {
+    let response = http
+        .get(api_url)
+        .header("accept", "application/json,text/plain,*/*")
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("proxy API request failed: {error}")))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        ApiError::bad_request(format!("proxy API response read failed: {error}"))
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::bad_request(format!(
+            "proxy API returned {status}: {}",
+            body.chars().take(200).collect::<String>()
+        )));
+    }
+    extract_proxy_from_api_body(&body)
+        .ok_or_else(|| ApiError::bad_request("proxy API did not return a usable proxy"))
+}
+
+fn normalize_proxy_url(raw: &str, default_scheme: &str) -> Result<String, ApiError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request("proxy URL is empty"));
+    }
+    if value.contains("://") {
+        return Ok(value.to_string());
+    }
+    let scheme = match default_scheme.trim().to_ascii_lowercase().as_str() {
+        "socks" | "socks5" => "socks5",
+        "socks5h" => "socks5h",
+        _ => "http",
+    };
+    if let Some((host, port, username, password)) = split_four_part_proxy(value) {
+        return Ok(format!("{scheme}://{username}:{password}@{host}:{port}"));
+    }
+    Ok(format!("{scheme}://{value}"))
+}
+
+fn extract_proxy_from_api_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(proxy) = extract_proxy_from_json(&value) {
+            return Some(proxy);
+        }
+    }
+    extract_proxy_token(trimmed)
+}
+
+fn extract_proxy_from_json(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => extract_proxy_token(value),
+        Value::Array(items) => items.iter().find_map(extract_proxy_from_json),
+        Value::Object(object) => {
+            for key in [
+                "proxy",
+                "proxy_url",
+                "url",
+                "http",
+                "https",
+                "socks5",
+                "server",
+                "address",
+            ] {
+                if let Some(proxy) = object.get(key).and_then(extract_proxy_from_json) {
+                    return Some(proxy);
+                }
+            }
+            let host = object
+                .get("host")
+                .or_else(|| object.get("ip"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let port = object
+                .get("port")
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .map(|port| port.to_string())
+                        .or_else(|| value.as_str().map(|port| port.trim().to_string()))
+                })
+                .filter(|value| !value.is_empty());
+            if let (Some(host), Some(port)) = (host, port) {
+                return Some(format!("{host}:{port}"));
+            }
+            for key in ["data", "result", "list", "proxies"] {
+                if let Some(proxy) = object.get(key).and_then(extract_proxy_from_json) {
+                    return Some(proxy);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_proxy_token(text: &str) -> Option<String> {
+    text.split(|character: char| character.is_whitespace() || character == ',' || character == ';')
+        .map(str::trim)
+        .map(|value| {
+            value.trim_matches(|character| matches!(character, '"' | '\'' | '[' | ']' | '{' | '}'))
+        })
+        .find(|value| looks_like_proxy(value))
+        .map(ToOwned::to_owned)
+}
+
+fn looks_like_proxy(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    if value.contains("://") {
+        return true;
+    }
+    if split_four_part_proxy(value).is_some() {
+        return true;
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    !host.trim().is_empty() && port.trim().parse::<u16>().is_ok()
+}
+
+fn split_four_part_proxy(value: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut parts = value.splitn(4, ':');
+    let host = parts.next()?.trim();
+    let port = parts.next()?.trim();
+    let username = parts.next()?.trim();
+    let password = parts.next()?.trim();
+    if host.is_empty() || username.is_empty() || password.is_empty() || port.parse::<u16>().is_err()
+    {
+        return None;
+    }
+    Some((host, port, username, password))
+}
+
+fn redact_proxy_url(value: &str) -> String {
+    let Some(scheme_index) = value.find("://") else {
+        return value.to_string();
+    };
+    let authority_start = scheme_index + 3;
+    let after_authority = value[authority_start..]
+        .find('/')
+        .map(|index| authority_start + index)
+        .unwrap_or(value.len());
+    let authority = &value[authority_start..after_authority];
+    let Some(at_index) = authority.rfind('@') else {
+        return value.to_string();
+    };
+    format!(
+        "{}***@{}{}",
+        &value[..authority_start],
+        &authority[at_index + 1..],
+        &value[after_authority..]
+    )
 }
 
 fn probe_run_payload(summary: &ProbeRunSummary, result_limit: usize) -> Value {
@@ -802,14 +1053,21 @@ async fn refresh_codex_auth_file(
     state: &AppState,
     auth_file: &CodexAuthFile,
 ) -> Result<CodexAuthFile, String> {
+    refresh_codex_auth_file_with_client(state, &state.http, auth_file).await
+}
+
+async fn refresh_codex_auth_file_with_client(
+    state: &AppState,
+    http: &Client,
+    auth_file: &CodexAuthFile,
+) -> Result<CodexAuthFile, String> {
     let refresh_token = auth_file
         .refresh_token
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "missing refresh_token".to_string())?;
-    let response = state
-        .http
+    let response = http
         .post(state.oauth_token_url.as_str())
         .form(&[
             ("grant_type", "refresh_token"),
@@ -927,6 +1185,58 @@ mod tests {
             HeaderValue::from_static("Bearer secret"),
         );
         assert!(admin_request_authorized("secret", false, &headers).is_ok());
+    }
+
+    #[test]
+    fn normalizes_plain_proxy_with_default_scheme() {
+        assert_eq!(
+            normalize_proxy_url("127.0.0.1:1080", "socks").unwrap(),
+            "socks5://127.0.0.1:1080"
+        );
+        assert_eq!(
+            normalize_proxy_url("http://user:pass@example.com:10000", "socks5").unwrap(),
+            "http://user:pass@example.com:10000"
+        );
+        assert_eq!(
+            normalize_proxy_url("proxy.example:10000:user:pass", "http").unwrap(),
+            "http://user:pass@proxy.example:10000"
+        );
+    }
+
+    #[test]
+    fn extracts_proxy_from_plain_and_json_api_body() {
+        assert_eq!(
+            extract_proxy_from_api_body("1.2.3.4:10000\n5.6.7.8:10000").as_deref(),
+            Some("1.2.3.4:10000")
+        );
+        assert_eq!(
+            extract_proxy_from_api_body(
+                r#"{"code":0,"data":[{"host":"proxy.example","port":10000}]}"#
+            )
+            .as_deref(),
+            Some("proxy.example:10000")
+        );
+        assert_eq!(
+            extract_proxy_from_api_body(r#"{"data":["socks5://user:pass@127.0.0.1:1080"]}"#)
+                .as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        assert_eq!(
+            extract_proxy_from_api_body("proxy.example:10000:user:pass").as_deref(),
+            Some("proxy.example:10000:user:pass")
+        );
+    }
+
+    #[test]
+    fn redacts_proxy_credentials() {
+        assert_eq!(
+            redact_proxy_url("http://user:pass@example.com:10000"),
+            "http://***@example.com:10000"
+        );
+        assert_eq!(
+            redact_proxy_url("socks5://127.0.0.1:1080"),
+            "socks5://127.0.0.1:1080"
+        );
     }
 }
 

@@ -15,6 +15,7 @@ pub enum AccountStatus {
     AtExpired,
     RefreshFailed,
     AuthInvalid,
+    Forbidden,
     QuotaExhausted,
     Redeemed,
 }
@@ -26,6 +27,7 @@ impl AccountStatus {
             Self::AtExpired => "at_expired",
             Self::RefreshFailed => "refresh_failed",
             Self::AuthInvalid => "auth_invalid",
+            Self::Forbidden => "forbidden",
             Self::QuotaExhausted => "quota_exhausted",
             Self::Redeemed => "redeemed",
         }
@@ -41,6 +43,7 @@ impl std::str::FromStr for AccountStatus {
             "at_expired" => Ok(Self::AtExpired),
             "refresh_failed" => Ok(Self::RefreshFailed),
             "auth_invalid" => Ok(Self::AuthInvalid),
+            "forbidden" => Ok(Self::Forbidden),
             "quota_exhausted" => Ok(Self::QuotaExhausted),
             "redeemed" => Ok(Self::Redeemed),
             _ => Err(()),
@@ -146,6 +149,39 @@ impl CodexAuthFile {
     }
 
     pub fn fingerprint_material(&self) -> String {
+        let workspace_id = normalized_string(
+            self.account_id
+                .as_deref()
+                .or(self.chatgpt_account_id.as_deref()),
+        );
+        if let Some(email) = normalized_email(self.email.as_deref()) {
+            return match workspace_id {
+                Some(workspace_id) => format!("email:{email}|workspace:{workspace_id}"),
+                None => format!("email:{email}"),
+            };
+        }
+        if let Some(subject) = token_subject(self.id_token.as_deref())
+            .or_else(|| token_subject(self.access_token.as_deref()))
+        {
+            return match workspace_id {
+                Some(workspace_id) => format!("subject:{subject}|workspace:{workspace_id}"),
+                None => format!("subject:{subject}"),
+            };
+        }
+        self.refresh_token
+            .as_deref()
+            .and_then(|value| normalized_string(Some(value)))
+            .map(|value| format!("refresh:{value}"))
+            .or_else(|| {
+                self.access_token
+                    .as_deref()
+                    .and_then(|value| normalized_string(Some(value)))
+                    .map(|value| format!("access:{value}"))
+            })
+            .unwrap_or_else(|| serde_json::to_string(&self.to_cpa_value()).unwrap_or_default())
+    }
+
+    pub fn legacy_fingerprint_material(&self) -> String {
         self.account_id
             .as_ref()
             .or(self.chatgpt_account_id.as_ref())
@@ -412,6 +448,30 @@ fn string_field(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     })
 }
 
+fn normalized_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalized_email(value: Option<&str>) -> Option<String> {
+    normalized_string(value).map(|value| value.to_ascii_lowercase())
+}
+
+fn token_subject(token: Option<&str>) -> Option<String> {
+    let claims = decode_access_token_claims(token?)?;
+    nested_string_field(
+        &claims,
+        &[
+            &["sub"][..],
+            &["user_id"][..],
+            &["https://api.openai.com/auth", "user_id"][..],
+            &["https://api.openai.com/profile", "user_id"][..],
+        ],
+    )
+}
+
 fn nested_string_field(object: &Map<String, Value>, paths: &[&[&str]]) -> Option<String> {
     paths.iter().find_map(|path| {
         let mut current = Value::Object(object.clone());
@@ -466,6 +526,12 @@ pub fn access_token_needs_refresh(
 pub fn fingerprint_auth_file(auth_file: &CodexAuthFile) -> String {
     let mut hasher = Sha256::new();
     hasher.update(auth_file.fingerprint_material().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn legacy_fingerprint_auth_file(auth_file: &CodexAuthFile) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(auth_file.legacy_fingerprint_material().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -704,12 +770,32 @@ pub struct HealthCheckResult {
 }
 
 pub fn normalize_wham_usage_response(status_code: u16, body: Option<Value>) -> HealthCheckResult {
-    if status_code == 401 || status_code == 403 {
+    let error_message = body.as_ref().and_then(extract_upstream_error_message);
+    if status_code == 401
+        || (status_code == 403 && codex_looks_like_token_invalidated(error_message.as_deref()))
+        || (status_code == 402 && codex_looks_like_workspace_deactivated(error_message.as_deref()))
+    {
         return HealthCheckResult {
             status: AccountStatus::AuthInvalid,
             plan_type: None,
             quota_snapshot: body,
-            error: Some(format!("wham/usage returned {status_code}")),
+            error: Some(wham_error_message(status_code, error_message.as_deref())),
+        };
+    }
+    if status_code == 403 {
+        return HealthCheckResult {
+            status: AccountStatus::Forbidden,
+            plan_type: body.as_ref().and_then(extract_plan_type),
+            quota_snapshot: body,
+            error: Some(wham_error_message(status_code, error_message.as_deref())),
+        };
+    }
+    if status_code == 402 {
+        return HealthCheckResult {
+            status: AccountStatus::QuotaExhausted,
+            plan_type: body.as_ref().and_then(extract_plan_type),
+            quota_snapshot: body,
+            error: Some(wham_error_message(status_code, error_message.as_deref())),
         };
     }
     if !(200..300).contains(&status_code) {
@@ -717,7 +803,7 @@ pub fn normalize_wham_usage_response(status_code: u16, body: Option<Value>) -> H
             status: AccountStatus::RefreshFailed,
             plan_type: None,
             quota_snapshot: body,
-            error: Some(format!("wham/usage returned {status_code}")),
+            error: Some(wham_error_message(status_code, error_message.as_deref())),
         };
     }
 
@@ -733,6 +819,53 @@ pub fn normalize_wham_usage_response(status_code: u16, body: Option<Value>) -> H
         quota_snapshot: body,
         error: None,
     }
+}
+
+fn wham_error_message(status_code: u16, detail: Option<&str>) -> String {
+    match detail.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(detail) => format!("wham/usage returned {status_code}: {detail}"),
+        None => format!("wham/usage returned {status_code}"),
+    }
+}
+
+fn extract_upstream_error_message(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Value::Object(object) => {
+            for key in ["message", "detail", "reason", "error_description"] {
+                if let Some(message) = object.get(key).and_then(extract_upstream_error_message) {
+                    return Some(message);
+                }
+            }
+            match object.get("error") {
+                Some(Value::String(message)) => {
+                    Some(message.trim().to_string()).filter(|value| !value.is_empty())
+                }
+                Some(Value::Object(_)) | Some(Value::Array(_)) => {
+                    object.get("error").and_then(extract_upstream_error_message)
+                }
+                _ => None,
+            }
+        }
+        Value::Array(items) => items.iter().find_map(extract_upstream_error_message),
+        _ => None,
+    }
+}
+
+fn codex_looks_like_token_invalidated(message: Option<&str>) -> bool {
+    let lowered = message.unwrap_or_default().trim().to_ascii_lowercase();
+    lowered.contains("token invalid")
+        || lowered.contains("token invalidated")
+        || lowered.contains("session has expired")
+        || lowered.contains("session expired")
+        || lowered.contains("account has been deactivated")
+        || lowered.contains("account deactivated")
+}
+
+fn codex_looks_like_workspace_deactivated(message: Option<&str>) -> bool {
+    let lowered = message.unwrap_or_default().trim().to_ascii_lowercase();
+    lowered.contains("deactivated_workspace")
+        || (lowered.contains("workspace") && lowered.contains("deactivated"))
 }
 
 fn extract_plan_type(value: &Value) -> Option<String> {
@@ -901,6 +1034,50 @@ mod tests {
     }
 
     #[test]
+    fn fingerprints_distinguish_same_workspace_accounts_by_email() {
+        let first = CodexAuthFile {
+            account_id: Some("workspace-1".to_string()),
+            chatgpt_account_id: Some("workspace-1".to_string()),
+            email: Some("User-A@example.com".to_string()),
+            access_token: Some("access-a".to_string()),
+            refresh_token: Some("refresh-a".to_string()),
+            ..CodexAuthFile::default()
+        }
+        .normalized();
+        let first_updated = CodexAuthFile {
+            account_id: Some("workspace-1".to_string()),
+            chatgpt_account_id: Some("workspace-1".to_string()),
+            email: Some("user-a@example.com".to_string()),
+            access_token: Some("access-a-updated".to_string()),
+            refresh_token: Some("refresh-a-updated".to_string()),
+            ..CodexAuthFile::default()
+        }
+        .normalized();
+        let second = CodexAuthFile {
+            account_id: Some("workspace-1".to_string()),
+            chatgpt_account_id: Some("workspace-1".to_string()),
+            email: Some("user-b@example.com".to_string()),
+            access_token: Some("access-b".to_string()),
+            refresh_token: Some("refresh-b".to_string()),
+            ..CodexAuthFile::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            fingerprint_auth_file(&first),
+            fingerprint_auth_file(&first_updated)
+        );
+        assert_ne!(
+            fingerprint_auth_file(&first),
+            fingerprint_auth_file(&second)
+        );
+        assert_eq!(
+            legacy_fingerprint_auth_file(&first),
+            legacy_fingerprint_auth_file(&second)
+        );
+    }
+
+    #[test]
     fn detects_refresh_need() {
         assert!(access_token_needs_refresh(Some(1_000), 900, 120));
         assert!(!access_token_needs_refresh(Some(2_000), 900, 120));
@@ -950,6 +1127,44 @@ mod tests {
         assert!(archive_text.contains("002-acct-b.json"));
         assert!(archive_text.contains("\"access_token\": \"at-a\""));
         assert!(archive_text.contains("\"access_token\": \"at-b\""));
+    }
+
+    #[test]
+    fn wham_usage_402_is_quota_exhausted() {
+        let result = normalize_wham_usage_response(
+            402,
+            Some(json!({
+                "plan_type": "plus",
+                "error": {"message": "quota exceeded"}
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::QuotaExhausted);
+        assert_eq!(result.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn wham_usage_plain_403_is_forbidden_not_auth_invalid() {
+        let result = normalize_wham_usage_response(
+            403,
+            Some(json!({
+                "error": {"message": "forbidden"}
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::Forbidden);
+    }
+
+    #[test]
+    fn wham_usage_token_invalid_403_is_auth_invalid() {
+        let result = normalize_wham_usage_response(
+            403,
+            Some(json!({
+                "error": {"message": "Token invalidated"}
+            })),
+        );
+
+        assert_eq!(result.status, AccountStatus::AuthInvalid);
     }
 
     #[test]

@@ -30,7 +30,6 @@ const batchForm = reactive({
   name: '',
   total_count: 10,
   accounts_per_code: 1,
-  plan_filter_text: '',
   expires_at_text: '',
 })
 const autoProbeForm = reactive({
@@ -39,13 +38,18 @@ const autoProbeForm = reactive({
   max_accounts_per_run: 100,
   concurrency: 4,
   refresh_before_probe: true,
+  proxy_enabled: false,
+  proxy_mode: 'fixed' as 'fixed' | 'api',
+  proxy_url: '',
+  proxy_api_url: '',
+  proxy_default_scheme: 'http' as 'http' | 'socks5' | 'socks5h',
 })
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
 const apiState = computed(() => ({ token: adminToken.value }))
 const availableCount = computed(() => accounts.value.filter((a) => a.status === 'available' && !a.redeemed_at).length)
 const redeemedCount = computed(() => accounts.value.filter((a) => a.redeemed_at || a.status === 'redeemed').length)
-const attentionCount = computed(() => accounts.value.filter((a) => ['at_expired', 'refresh_failed', 'auth_invalid', 'quota_exhausted'].includes(a.status)).length)
+const attentionCount = computed(() => accounts.value.filter((a) => ['at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted'].includes(a.status)).length)
 const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every((a) => selectedIds.value.includes(a.id)))
 const batchCodesText = computed(() => batchCodes.value.length ? JSON.stringify(batchCodes.value, null, 2) : '选择批次查看兑换码状态')
 const selectedBatch = computed(() => batches.value.find((batch) => batch.id === selectedBatchId.value) || null)
@@ -209,6 +213,14 @@ export async function probeSelected() {
   })
 }
 
+export async function probeAccount(accountId: string) {
+  await withBusy(async () => {
+    const result = await api.probeAccounts(apiState.value, [accountId])
+    adminResult.value = JSON.stringify(result, null, 2)
+    await loadAccounts()
+  })
+}
+
 export async function refreshSelected() {
   await withBusy(async () => {
     const ids = selectedIds.value.length ? selectedIds.value : undefined
@@ -226,6 +238,11 @@ export async function saveAutoProbeSettings() {
       max_accounts_per_run: Number(autoProbeForm.max_accounts_per_run || 1),
       concurrency: Number(autoProbeForm.concurrency || 1),
       refresh_before_probe: autoProbeForm.refresh_before_probe,
+      proxy_enabled: autoProbeForm.proxy_enabled,
+      proxy_mode: autoProbeForm.proxy_mode,
+      proxy_url: autoProbeForm.proxy_url.trim() || null,
+      proxy_api_url: autoProbeForm.proxy_api_url.trim() || null,
+      proxy_default_scheme: autoProbeForm.proxy_default_scheme,
     })
     applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
     autoProbeResult.value = JSON.stringify({ saved: true, settings: result.settings }, null, 2)
@@ -250,7 +267,7 @@ export async function exportSelected() {
     })
     adminResult.value = JSON.stringify(exportResultForDisplay(result), null, 2)
     if (result.download) downloadEncodedFile(result.download)
-    else downloadJson(`aether-pool-admin-${result.format}-${timestamp()}.json`, result.document)
+    else downloadJson(`account-pool-admin-${result.format}-${timestamp()}.json`, result.document)
   })
 }
 
@@ -269,7 +286,7 @@ export async function createBatch() {
       total_count: Number(batchForm.total_count || 1),
       accounts_per_code: Number(batchForm.accounts_per_code || 1),
       expires_at: Number.isFinite(expiresAt) ? expiresAt : null,
-      plan_filter: batchForm.plan_filter_text.split(',').map((s) => s.trim()).filter(Boolean),
+      plan_filter: null,
     })
     generatedCodes.value = result.codes.map((c) => c.code).join('\n')
     await loadBatches()
@@ -295,6 +312,11 @@ function applyAutoProbeSettings(settings: AutoProbeSettings, nextRunAt: number |
   autoProbeForm.max_accounts_per_run = settings.max_accounts_per_run
   autoProbeForm.concurrency = settings.concurrency
   autoProbeForm.refresh_before_probe = settings.refresh_before_probe
+  autoProbeForm.proxy_enabled = Boolean(settings.proxy_enabled)
+  autoProbeForm.proxy_mode = settings.proxy_mode || 'fixed'
+  autoProbeForm.proxy_url = settings.proxy_url || ''
+  autoProbeForm.proxy_api_url = settings.proxy_api_url || ''
+  autoProbeForm.proxy_default_scheme = settings.proxy_default_scheme || 'http'
 }
 
 export function exportResultForDisplay<T extends { download?: EncodedDownload | null }>(result: T) {
@@ -302,7 +324,7 @@ export function exportResultForDisplay<T extends { download?: EncodedDownload | 
   return {
     ...result,
     download: {
-      filename: result.download.filename,
+      filename: normalizeDownloadFileName(result.download.filename),
       content_type: result.download.content_type,
       encoding: result.download.encoding,
       data: `<base64 ${result.download.data.length} chars>`,
@@ -316,7 +338,7 @@ export function downloadEncodedFile(download: EncodedDownload) {
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
   const blob = new Blob([bytes], { type: download.content_type || 'application/octet-stream' })
-  downloadBlob(download.filename, blob)
+  downloadBlob(normalizeDownloadFileName(download.filename), blob)
 }
 
 export function downloadJson(fileName: string, value: unknown) {
@@ -344,6 +366,10 @@ export function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, '-')
 }
 
+export function normalizeDownloadFileName(fileName: string) {
+  return fileName.replace(/^aether-pool/i, 'account-pool')
+}
+
 export function statusLabel(status: string) {
   return ({
     active: '可兑换',
@@ -351,6 +377,7 @@ export function statusLabel(status: string) {
     at_expired: 'AT 过期',
     refresh_failed: '刷新失败',
     auth_invalid: '账号失效',
+    forbidden: '网络受限',
     quota_exhausted: '额度耗尽',
     redeemed: '已兑换',
     disabled: '已停用',

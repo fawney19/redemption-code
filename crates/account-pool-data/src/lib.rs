@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use account_pool_core::{
     export_accounts, fingerprint_auth_file, format_redeem_code, generate_redeem_code,
-    mask_redeem_code, normalize_redeem_code, redeem_code_hash, secret_preview, unix_now_secs,
-    AccountStatus, CodexAuthFile, ExportFormat, HealthCheckResult, ParsedAccount,
+    legacy_fingerprint_auth_file, mask_redeem_code, normalize_redeem_code, redeem_code_hash,
+    secret_preview, unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat, HealthCheckResult,
+    ParsedAccount,
 };
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -138,9 +139,8 @@ impl AccountPoolRepository {
         for parsed in accounts {
             let auth_file = parsed.auth_file.clone().normalized();
             let fingerprint = fingerprint_auth_file(&auth_file);
-            let exists = sqlx::query("SELECT id FROM accounts WHERE auth_fingerprint = ?")
-                .bind(&fingerprint)
-                .fetch_optional(&self.pool)
+            let exists = self
+                .find_import_existing_account(&auth_file, &fingerprint)
                 .await?;
             let ciphertext = self.secrets.encrypt_json(&auth_file)?;
             let expires_at = auth_file.expires_at_epoch().map(|value| value as i64);
@@ -154,7 +154,7 @@ impl AccountPoolRepository {
                 sqlx::query(
                     r#"
 UPDATE accounts
-SET email = ?, name = ?, account_id = ?, plan_type = ?,
+SET email = ?, name = ?, account_id = ?, plan_type = ?, auth_fingerprint = ?,
     auth_file_ciphertext = CASE WHEN redeemed_at IS NULL THEN ? ELSE auth_file_ciphertext END,
     access_token_preview = CASE WHEN redeemed_at IS NULL THEN ? ELSE access_token_preview END,
     refresh_token_preview = CASE WHEN redeemed_at IS NULL THEN ? ELSE refresh_token_preview END,
@@ -172,6 +172,7 @@ WHERE id = ?
                         .or(auth_file.chatgpt_account_id.clone()),
                 )
                 .bind(auth_file.plan_type.or(auth_file.chatgpt_plan_type.clone()))
+                .bind(&fingerprint)
                 .bind(ciphertext)
                 .bind(secret_preview(auth_file.access_token.as_deref()))
                 .bind(secret_preview(auth_file.refresh_token.as_deref()))
@@ -217,17 +218,60 @@ INSERT INTO accounts (
         Ok(ImportAccountsOutcome { imported, updated })
     }
 
+    async fn find_import_existing_account(
+        &self,
+        auth_file: &CodexAuthFile,
+        fingerprint: &str,
+    ) -> Result<Option<sqlx::sqlite::SqliteRow>, DataError> {
+        let current = sqlx::query("SELECT id FROM accounts WHERE auth_fingerprint = ?")
+            .bind(fingerprint)
+            .fetch_optional(&self.pool)
+            .await?;
+        if current.is_some() {
+            return Ok(current);
+        }
+
+        let Some(email) = auth_file
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+        else {
+            return Ok(None);
+        };
+        let legacy_fingerprint = legacy_fingerprint_auth_file(auth_file);
+        if legacy_fingerprint == fingerprint {
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"
+SELECT id
+FROM accounts
+WHERE auth_fingerprint = ? AND lower(email) = ?
+"#,
+        )
+        .bind(legacy_fingerprint)
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DataError::from)
+    }
+
     pub async fn list_accounts(
         &self,
         query: AccountListQuery,
     ) -> Result<AccountListPage, DataError> {
         let rows = sqlx::query(
             r#"
-SELECT id, email, name, account_id, plan_type, status, access_token_preview,
-       refresh_token_preview, expires_at, last_refresh_at, last_probe_at,
-       redeem_code_id, redemption_id, redeemed_at, created_at, updated_at
-FROM accounts
-ORDER BY updated_at DESC, created_at DESC
+SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+       a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
+       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.redeemed_at, a.created_at, a.updated_at
+FROM accounts a
+LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
+ORDER BY a.updated_at DESC, a.created_at DESC
 "#,
         )
         .fetch_all(&self.pool)
@@ -282,40 +326,54 @@ ORDER BY updated_at DESC, created_at DESC
         ids: &[String],
         include_redeemed: bool,
     ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
-        let all = self.load_all_auth_files().await?;
-        let id_set = ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        Ok(all
-            .into_iter()
-            .filter(|(summary, _)| id_set.contains(&summary.id))
-            .filter(|(summary, _)| include_redeemed || summary.redeemed_at.is_none())
-            .collect())
+        let mut out = Vec::new();
+        for id in ids {
+            let row = sqlx::query(
+                r#"
+SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+       a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
+       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
+FROM accounts a
+LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
+WHERE a.id = ? AND (? = 1 OR a.redeemed_at IS NULL)
+"#,
+            )
+            .bind(id)
+            .bind(if include_redeemed { 1_i64 } else { 0_i64 })
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(row) = row {
+                out.push(self.auth_pair_from_row(row)?);
+            }
+        }
+        Ok(out)
     }
 
     pub async fn load_unredeemed_auth_files(
         &self,
         ids: Option<&[String]>,
     ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
-        let id_set = ids.map(|items| {
-            items
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-        });
-        Ok(self
-            .load_all_auth_files()
-            .await?
-            .into_iter()
-            .filter(|(summary, _)| summary.redeemed_at.is_none())
-            .filter(|(summary, _)| {
-                id_set
-                    .as_ref()
-                    .map(|ids| ids.contains(&summary.id))
-                    .unwrap_or(true)
-            })
-            .collect())
+        if let Some(ids) = ids {
+            return self.load_auth_files_for_ids(ids, false).await;
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+       a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
+       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
+FROM accounts a
+LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
+WHERE a.redeemed_at IS NULL
+ORDER BY a.created_at ASC
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| self.auth_pair_from_row(row))
+            .collect()
     }
 
     pub async fn update_account_auth(
@@ -818,24 +876,30 @@ WHERE id = ? AND redeemed_at IS NULL
     async fn load_all_auth_files(&self) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
         let rows = sqlx::query(
             r#"
-SELECT id, email, name, account_id, plan_type, status, access_token_preview,
-       refresh_token_preview, expires_at, last_refresh_at, last_probe_at,
-       redeem_code_id, redemption_id, redeemed_at, created_at, updated_at,
-       auth_file_ciphertext
-FROM accounts
-ORDER BY created_at ASC
+SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+       a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
+       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
+FROM accounts a
+LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
+ORDER BY a.created_at ASC
 "#,
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|row| {
-                let summary = account_summary_from_row(&row)?;
-                let ciphertext: String = row.try_get("auth_file_ciphertext")?;
-                let auth_file = self.secrets.decrypt_json::<CodexAuthFile>(&ciphertext)?;
-                Ok((summary, auth_file.normalized()))
-            })
+            .map(|row| self.auth_pair_from_row(row))
             .collect()
+    }
+
+    fn auth_pair_from_row(
+        &self,
+        row: sqlx::sqlite::SqliteRow,
+    ) -> Result<(AccountSummary, CodexAuthFile), DataError> {
+        let summary = account_summary_from_row(&row)?;
+        let ciphertext: String = row.try_get("auth_file_ciphertext")?;
+        let auth_file = self.secrets.decrypt_json::<CodexAuthFile>(&ciphertext)?;
+        Ok((summary, auth_file.normalized()))
     }
 
     async fn load_auth_files_for_ids_tx(
@@ -847,11 +911,13 @@ ORDER BY created_at ASC
         for id in ids {
             let row = sqlx::query(
                 r#"
-SELECT id, email, name, account_id, plan_type, status, access_token_preview,
-       refresh_token_preview, expires_at, last_refresh_at, last_probe_at,
-       redeem_code_id, redemption_id, redeemed_at, created_at, updated_at,
-       auth_file_ciphertext
-FROM accounts WHERE id = ?
+SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+       a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
+       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
+FROM accounts a
+LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
+WHERE a.id = ?
 "#,
             )
             .bind(id)
@@ -905,6 +971,7 @@ pub struct AccountSummary {
     pub last_refresh_at: Option<u64>,
     pub last_probe_at: Option<u64>,
     pub redeem_code_id: Option<String>,
+    pub redeem_code_masked: Option<String>,
     pub redemption_id: Option<String>,
     pub redeemed_at: Option<u64>,
     pub created_at: u64,
@@ -918,6 +985,16 @@ pub struct AutoProbeSettings {
     pub max_accounts_per_run: u64,
     pub concurrency: u64,
     pub refresh_before_probe: bool,
+    #[serde(default)]
+    pub proxy_enabled: bool,
+    #[serde(default = "default_probe_proxy_mode")]
+    pub proxy_mode: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_api_url: Option<String>,
+    #[serde(default = "default_probe_proxy_scheme")]
+    pub proxy_default_scheme: String,
     pub last_started_at: Option<u64>,
     pub last_finished_at: Option<u64>,
     pub last_checked_count: u64,
@@ -934,6 +1011,11 @@ impl Default for AutoProbeSettings {
             max_accounts_per_run: 100,
             concurrency: 4,
             refresh_before_probe: true,
+            proxy_enabled: false,
+            proxy_mode: default_probe_proxy_mode(),
+            proxy_url: None,
+            proxy_api_url: None,
+            proxy_default_scheme: default_probe_proxy_scheme(),
             last_started_at: None,
             last_finished_at: None,
             last_checked_count: 0,
@@ -949,8 +1031,38 @@ impl AutoProbeSettings {
         self.interval_seconds = self.interval_seconds.clamp(60, 24 * 60 * 60);
         self.max_accounts_per_run = self.max_accounts_per_run.clamp(1, 5_000);
         self.concurrency = self.concurrency.clamp(1, 32);
+        self.proxy_mode = match self.proxy_mode.trim().to_ascii_lowercase().as_str() {
+            "api" | "dynamic_api" | "711" => "api".to_string(),
+            _ => "fixed".to_string(),
+        };
+        self.proxy_default_scheme = match self
+            .proxy_default_scheme
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "socks" | "socks5" => "socks5".to_string(),
+            "socks5h" => "socks5h".to_string(),
+            _ => "http".to_string(),
+        };
+        self.proxy_url = self
+            .proxy_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.proxy_api_url = self
+            .proxy_api_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self
     }
+}
+
+fn default_probe_proxy_mode() -> String {
+    "fixed".to_string()
+}
+
+fn default_probe_proxy_scheme() -> String {
+    "http".to_string()
 }
 
 fn account_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountSummary, DataError> {
@@ -967,6 +1079,7 @@ fn account_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountSumm
         last_refresh_at: optional_i64(row, "last_refresh_at")?,
         last_probe_at: optional_i64(row, "last_probe_at")?,
         redeem_code_id: row.try_get("redeem_code_id")?,
+        redeem_code_masked: row.try_get("redeem_code_masked")?,
         redemption_id: row.try_get("redemption_id")?,
         redeemed_at: optional_i64(row, "redeemed_at")?,
         created_at: optional_i64(row, "created_at")?.unwrap_or_default(),
@@ -1111,12 +1224,115 @@ mod tests {
         }
     }
 
+    fn parsed_workspace_account(email: &str, access_token: &str) -> ParsedAccount {
+        ParsedAccount {
+            source: "test".to_string(),
+            auth_file: CodexAuthFile {
+                kind: Some("codex".to_string()),
+                account_id: Some("shared-workspace".to_string()),
+                chatgpt_account_id: Some("shared-workspace".to_string()),
+                email: Some(email.to_string()),
+                name: Some(email.to_string()),
+                plan_type: Some("plus".to_string()),
+                chatgpt_plan_type: Some("plus".to_string()),
+                access_token: Some(access_token.to_string()),
+                refresh_token: Some(format!("refresh-{email}")),
+                expires_at: Some(json!(2_000_000_000_u64)),
+                ..CodexAuthFile::default()
+            },
+        }
+    }
+
     fn document_access_token(value: &Value) -> String {
         value
             .get("access_token")
             .and_then(Value::as_str)
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn imports_same_workspace_accounts_as_distinct_emails() {
+        let repo = temp_repo().await;
+        let outcome = repo
+            .import_accounts(&[
+                parsed_workspace_account("alpha@example.com", "access-alpha"),
+                parsed_workspace_account("beta@example.com", "access-beta"),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(outcome.imported, 2);
+        assert_eq!(outcome.updated, 0);
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|account| account.account_id.as_deref() == Some("shared-workspace"))
+                .count(),
+            2
+        );
+
+        let update = repo
+            .import_accounts(&[parsed_workspace_account(
+                "ALPHA@example.com",
+                "access-alpha-updated",
+            )])
+            .await
+            .unwrap();
+        assert_eq!(update.imported, 0);
+        assert_eq!(update.updated, 1);
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+    }
+
+    #[tokio::test]
+    async fn import_migrates_matching_legacy_workspace_fingerprint() {
+        let repo = temp_repo().await;
+        let first = parsed_workspace_account("legacy@example.com", "access-legacy");
+        repo.import_accounts(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let auth_file = first.auth_file.normalized();
+        let legacy_fingerprint = legacy_fingerprint_auth_file(&auth_file);
+        sqlx::query("UPDATE accounts SET auth_fingerprint = ?")
+            .bind(legacy_fingerprint)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+
+        let update = repo
+            .import_accounts(&[parsed_workspace_account(
+                "legacy@example.com",
+                "access-legacy-updated",
+            )])
+            .await
+            .unwrap();
+        assert_eq!(update.imported, 0);
+        assert_eq!(update.updated, 1);
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
     }
 
     #[tokio::test]
@@ -1159,6 +1375,43 @@ mod tests {
                 .iter()
                 .filter(|account| account.status == AccountStatus::Redeemed.as_str())
                 .count(),
+            1
+        );
+        let redeemed_account = page
+            .items
+            .iter()
+            .find(|account| account.status == AccountStatus::Redeemed.as_str())
+            .unwrap();
+        assert_eq!(
+            redeemed_account.redeem_code_masked.as_deref(),
+            Some(batch.codes[0].masked_code.as_str())
+        );
+        let available_account = page
+            .items
+            .iter()
+            .find(|account| account.redeemed_at.is_none())
+            .unwrap();
+        assert_eq!(
+            repo.load_unredeemed_auth_files(None).await.unwrap().len(),
+            1
+        );
+        sqlx::query("UPDATE accounts SET auth_file_ciphertext = 'bad-ciphertext' WHERE id = ?")
+            .bind(&redeemed_account.id)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.load_auth_files_for_ids(std::slice::from_ref(&redeemed_account.id), false)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            repo.load_auth_files_for_ids(std::slice::from_ref(&available_account.id), false)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
@@ -1255,6 +1508,9 @@ mod tests {
         assert_eq!(default_settings.max_accounts_per_run, 100);
         assert_eq!(default_settings.concurrency, 4);
         assert!(default_settings.refresh_before_probe);
+        assert!(!default_settings.proxy_enabled);
+        assert_eq!(default_settings.proxy_mode, "fixed");
+        assert_eq!(default_settings.proxy_default_scheme, "http");
 
         let saved = repo
             .save_auto_probe_settings(&AutoProbeSettings {
@@ -1263,6 +1519,11 @@ mod tests {
                 max_accounts_per_run: 50_000,
                 concurrency: 0,
                 refresh_before_probe: false,
+                proxy_enabled: true,
+                proxy_mode: "711".to_string(),
+                proxy_url: Some("  http://user:pass@proxy.example:10000  ".to_string()),
+                proxy_api_url: Some("  https://api.example/proxies  ".to_string()),
+                proxy_default_scheme: "socks".to_string(),
                 last_started_at: Some(100),
                 last_finished_at: Some(200),
                 last_checked_count: 12,
@@ -1278,6 +1539,17 @@ mod tests {
         assert_eq!(saved.max_accounts_per_run, 5_000);
         assert_eq!(saved.concurrency, 1);
         assert!(!saved.refresh_before_probe);
+        assert!(saved.proxy_enabled);
+        assert_eq!(saved.proxy_mode, "api");
+        assert_eq!(
+            saved.proxy_url.as_deref(),
+            Some("http://user:pass@proxy.example:10000")
+        );
+        assert_eq!(
+            saved.proxy_api_url.as_deref(),
+            Some("https://api.example/proxies")
+        );
+        assert_eq!(saved.proxy_default_scheme, "socks5");
 
         let loaded = repo.get_auto_probe_settings().await.unwrap();
         assert_eq!(loaded.interval_seconds, 60);

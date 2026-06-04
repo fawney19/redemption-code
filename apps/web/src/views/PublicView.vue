@@ -48,17 +48,55 @@
             <div class="panel-header">
               <div>
                 <h2>导出结果</h2>
-                <p>{{ redeemDownload ? redeemDownload.filename : formatLabel }}</p>
+                <p>{{ redeemFileName || formatLabel }}</p>
               </div>
               <button class="button on-dark" :disabled="!redeemDocument && !redeemDownload" @click="handleDownload">
                 <FileJson :size="15" />下载
               </button>
             </div>
-            <div class="panel-body">
-              <div class="terminal-bar">
-                <span></span><span></span><span></span>
+            <div class="panel-body result-summary-body">
+              <div v-if="redeemStatus === 'idle'" class="result-empty">
+                {{ previewText }}
               </div>
-              <pre class="result mono dark-result">{{ redeemResultText || previewText }}</pre>
+
+              <div v-else-if="redeemStatus === 'success'" class="result-summary">
+                <div class="result-status success">
+                  <CircleCheck :size="18" />
+                  <span>导出文件已生成</span>
+                </div>
+                <div class="result-metrics">
+                  <div>
+                    <span>成功兑换</span>
+                    <strong>{{ redeemSuccesses.length }}</strong>
+                  </div>
+                  <div>
+                    <span>导出账号</span>
+                    <strong>{{ redeemedAccountCount }}</strong>
+                  </div>
+                  <div>
+                    <span>失败兑换码</span>
+                    <strong>{{ redeemFailures.length }}</strong>
+                  </div>
+                </div>
+                <div class="download-summary">
+                  <span>文件</span>
+                  <strong>{{ redeemFileName || `${formatLabel} 文件` }}</strong>
+                </div>
+                <div v-if="redeemFailures.length" class="failure-list">
+                  <div v-for="failure in redeemFailures" :key="failure.code" class="failure-item">
+                    <span class="mono">{{ failure.code }}</span>
+                    <strong>{{ failure.reason }}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="result-summary">
+                <div class="result-status error">
+                  <CircleAlert :size="18" />
+                  <span>兑换失败</span>
+                </div>
+                <div class="inline-dark-error">{{ redeemErrorText }}</div>
+              </div>
             </div>
           </div>
         </div>
@@ -76,9 +114,9 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Download, FileCode, FileJson, ShieldCheck } from 'lucide-vue-next'
-import { api, type EncodedDownload, type ExportFormat } from '../api/client'
-import { downloadEncodedFile, downloadJson, exportResultForDisplay, timestamp, withBusy } from '../composables/useAdmin'
+import { CircleAlert, CircleCheck, Download, FileCode, FileJson, ShieldCheck } from 'lucide-vue-next'
+import { api, type EncodedDownload, type ExportFormat, type RedeemFailure, type RedeemSuccess } from '../api/client'
+import { downloadEncodedFile, downloadJson, normalizeDownloadFileName, timestamp } from '../composables/useAdmin'
 import { useToast } from '../composables/useToast'
 import BrandMark from '../components/BrandMark.vue'
 
@@ -87,29 +125,47 @@ const { success, error: showError } = useToast()
 const busy = ref(false)
 const redeemText = ref('')
 const redeemFormat = ref<ExportFormat>('cpa')
-const redeemResultText = ref('')
+const redeemStatus = ref<'idle' | 'success' | 'error'>('idle')
+const redeemErrorText = ref('')
 const redeemDocument = ref<unknown | null>(null)
 const redeemDownload = ref<EncodedDownload | null>(null)
+const redeemFileName = ref('')
+const redeemSuccesses = ref<RedeemSuccess[]>([])
+const redeemFailures = ref<RedeemFailure[]>([])
 
 const formatLabel = computed(() => redeemFormat.value === 'cpa' ? 'CPA JSON / ZIP' : 'Sub2API JSON')
 const previewText = computed(() => redeemFormat.value === 'cpa'
   ? 'CPA 单账号会导出 JSON，多账号会导出 ZIP 包。'
   : 'Sub2API 会导出包含 accounts 的 JSON。')
+const redeemedAccountCount = computed(() => redeemSuccesses.value.reduce((sum, item) => sum + Number(item.account_count || 0), 0))
 
 async function handleRedeem() {
   busy.value = true
   try {
     const codes = redeemText.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
     const result = await api.redeemExport({ codes, format: redeemFormat.value })
+    const fallbackFileName = `account-pool-redeem-${result.format}-${timestamp()}.json`
     redeemDocument.value = result.document
     redeemDownload.value = result.download || null
-    redeemResultText.value = JSON.stringify(exportResultForDisplay(result), null, 2)
+    redeemFileName.value = result.download?.filename
+      ? normalizeDownloadFileName(result.download.filename)
+      : fallbackFileName
+    redeemSuccesses.value = result.successes
+    redeemFailures.value = result.failures
+    redeemStatus.value = 'success'
+    redeemErrorText.value = ''
     if (result.download) downloadEncodedFile(result.download)
-    else downloadJson(`aether-pool-redeem-${result.format}-${timestamp()}.json`, result.document)
+    else downloadJson(fallbackFileName, result.document)
     success('兑换成功，文件已开始下载')
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    redeemResultText.value = msg
+    redeemStatus.value = 'error'
+    redeemErrorText.value = msg
+    redeemDocument.value = null
+    redeemDownload.value = null
+    redeemFileName.value = ''
+    redeemSuccesses.value = []
+    redeemFailures.value = []
     showError(msg)
   } finally {
     busy.value = false
@@ -122,6 +178,6 @@ function handleDownload() {
     return
   }
   if (!redeemDocument.value) return
-  downloadJson(`aether-pool-redeem-${redeemFormat.value}-${timestamp()}.json`, redeemDocument.value)
+  downloadJson(redeemFileName.value || `account-pool-redeem-${redeemFormat.value}-${timestamp()}.json`, redeemDocument.value)
 }
 </script>

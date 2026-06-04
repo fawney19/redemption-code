@@ -13,6 +13,7 @@ export interface AccountSummary {
   last_refresh_at?: number | null
   last_probe_at?: number | null
   redeem_code_id?: string | null
+  redeem_code_masked?: string | null
   redemption_id?: string | null
   redeemed_at?: number | null
   created_at: number
@@ -66,9 +67,19 @@ export interface ExportResponse {
   download?: EncodedDownload | null
 }
 
+export interface RedeemSuccess {
+  code: string
+  account_count: number
+}
+
+export interface RedeemFailure {
+  code: string
+  reason: string
+}
+
 export interface RedeemExportResponse extends ExportResponse {
-  successes: unknown[]
-  failures: unknown[]
+  successes: RedeemSuccess[]
+  failures: RedeemFailure[]
 }
 
 export interface AutoProbeSettings {
@@ -77,6 +88,11 @@ export interface AutoProbeSettings {
   max_accounts_per_run: number
   concurrency: number
   refresh_before_probe: boolean
+  proxy_enabled: boolean
+  proxy_mode: 'fixed' | 'api'
+  proxy_url?: string | null
+  proxy_api_url?: string | null
+  proxy_default_scheme: 'http' | 'socks5' | 'socks5h'
   last_started_at?: number | null
   last_finished_at?: number | null
   last_checked_count: number
@@ -180,7 +196,16 @@ export const api = {
   },
   updateAutoProbeSettings(state: ApiState, payload: Partial<Pick<
     AutoProbeSettings,
-    'enabled' | 'interval_seconds' | 'max_accounts_per_run' | 'concurrency' | 'refresh_before_probe'
+    | 'enabled'
+    | 'interval_seconds'
+    | 'max_accounts_per_run'
+    | 'concurrency'
+    | 'refresh_before_probe'
+    | 'proxy_enabled'
+    | 'proxy_mode'
+    | 'proxy_url'
+    | 'proxy_api_url'
+    | 'proxy_default_scheme'
   >>) {
     return request<AutoProbeSettingsResponse>('/api/admin/settings/auto-probe', state, {
       method: 'POST',

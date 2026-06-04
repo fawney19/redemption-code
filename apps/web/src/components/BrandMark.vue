@@ -6,7 +6,7 @@
       </svg>
     </div>
     <div>
-      <strong>AetherPool</strong>
+      <strong>AccountPool</strong>
       <span>{{ subtitle }}</span>
     </div>
   </div>

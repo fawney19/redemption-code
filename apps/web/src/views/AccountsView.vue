@@ -35,6 +35,7 @@
               <option value="refresh_failed">刷新失败</option>
               <option value="quota_exhausted">额度耗尽</option>
               <option value="auth_invalid">账号失效</option>
+              <option value="forbidden">网络受限</option>
               <option value="redeemed">已兑换</option>
             </select>
             <button class="button" @click="loadAccounts"><Search :size="15" />查询</button>
@@ -56,12 +57,13 @@
                 <tr>
                   <th><input type="checkbox" :checked="allSelected" @change="toggleAll" /></th>
                   <th>账号</th>
-                  <th>套餐</th>
                   <th>状态</th>
+                  <th>绑定兑换码</th>
                   <th>AT</th>
                   <th>RT</th>
                   <th>过期</th>
                   <th>测活</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -71,15 +73,20 @@
                     <strong>{{ account.email || account.name || 'Codex Account' }}</strong>
                     <div class="muted mono">{{ account.account_id || account.id }}</div>
                   </td>
-                  <td>{{ account.plan_type || '-' }}</td>
                   <td><span class="badge" :class="account.status">{{ statusLabel(account.status) }}</span></td>
+                  <td class="mono">{{ account.redeem_code_masked || '-' }}</td>
                   <td class="mono">{{ account.access_token_preview || '-' }}</td>
                   <td class="mono">{{ account.refresh_token_preview || '-' }}</td>
                   <td>{{ formatTime(account.expires_at) }}</td>
                   <td>{{ formatTime(account.last_probe_at) }}</td>
+                  <td>
+                    <button class="button ghost tiny" :disabled="busy" @click="probeAccount(account.id)">
+                      <Activity :size="14" />测活
+                    </button>
+                  </td>
                 </tr>
                 <tr v-if="!accounts.length">
-                  <td colspan="8" class="empty-row">
+                  <td colspan="9" class="empty-row">
                     <Database :size="20" />
                     <span>暂无账号数据</span>
                   </td>
@@ -132,6 +139,52 @@
                 <small>过期或接近过期时刷新，已兑换账号跳过</small>
               </span>
             </label>
+
+            <label class="setting-toggle compact-toggle">
+              <input v-model="autoProbeForm.proxy_enabled" type="checkbox" />
+              <span>
+                <strong>测活代理</strong>
+                <small>手动测活、单账号测活、自动测活共用</small>
+              </span>
+            </label>
+
+            <div v-if="autoProbeForm.proxy_enabled" class="proxy-settings">
+              <div class="settings-grid">
+                <label class="field-label">
+                  <span>代理来源</span>
+                  <select v-model="autoProbeForm.proxy_mode" class="select">
+                    <option value="fixed">固定代理</option>
+                    <option value="api">711 / API 拉取</option>
+                  </select>
+                </label>
+                <label class="field-label">
+                  <span>默认协议</span>
+                  <select v-model="autoProbeForm.proxy_default_scheme" class="select">
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                    <option value="socks5h">SOCKS5H</option>
+                  </select>
+                </label>
+              </div>
+
+              <label v-if="autoProbeForm.proxy_mode === 'fixed'" class="field-label full">
+                <span>固定代理</span>
+                <input
+                  v-model="autoProbeForm.proxy_url"
+                  class="input"
+                  placeholder="http://user:pass@host:port 或 socks5://host:port"
+                />
+              </label>
+              <label v-else class="field-label full">
+                <span>代理 API</span>
+                <input
+                  v-model="autoProbeForm.proxy_api_url"
+                  class="input"
+                  placeholder="粘贴 711Proxy Get API 链接"
+                />
+              </label>
+              <p class="form-note">API 返回 ip:port 会自动补默认协议；ip:port:user:pass 会自动转为代理 URL 并脱敏显示。</p>
+            </div>
 
             <div class="probe-meta-grid">
               <div>
@@ -200,6 +253,7 @@ import {
   useAdmin,
   loadAccounts,
   probeSelected,
+  probeAccount,
   refreshSelected,
   exportSelected,
   importAccounts,
