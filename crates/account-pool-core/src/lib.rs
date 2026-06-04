@@ -6,7 +6,12 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const CODEX_DEFAULT_USER_AGENT: &str =
+    "codex-tui/0.122.0 (Mac OS 15.2.0; arm64) vscode/2.6.11 (codex-tui; 0.122.0)";
+pub const CODEX_DEFAULT_ORIGINATOR: &str = "codex-tui";
 pub const ACCESS_TOKEN_REFRESH_GRACE_SECONDS: u64 = 10 * 60;
+pub const REDEEMED_ACCOUNT_DELETABLE_STATUSES: &[&str] =
+    &["at_expired", "refresh_failed", "auth_invalid", "forbidden"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +54,12 @@ impl std::str::FromStr for AccountStatus {
             _ => Err(()),
         }
     }
+}
+
+pub fn is_redeemed_account_deletable_status(status: &str) -> bool {
+    REDEEMED_ACCOUNT_DELETABLE_STATUSES
+        .iter()
+        .any(|allowed| status.trim().eq_ignore_ascii_case(allowed))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1149,6 +1160,16 @@ mod tests {
         let header = json!({"alg":"none","typ":"JWT"});
         let encode = |value: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
         format!("{}.{}.sig", encode(header), encode(payload))
+    }
+
+    #[test]
+    fn redeemed_deletable_statuses_exclude_quota_exhausted() {
+        assert!(is_redeemed_account_deletable_status("auth_invalid"));
+        assert!(is_redeemed_account_deletable_status("refresh_failed"));
+        assert!(is_redeemed_account_deletable_status("at_expired"));
+        assert!(is_redeemed_account_deletable_status("forbidden"));
+        assert!(!is_redeemed_account_deletable_status("available"));
+        assert!(!is_redeemed_account_deletable_status("quota_exhausted"));
     }
 
     #[test]

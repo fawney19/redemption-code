@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use account_pool_core::{
     access_token_needs_refresh, export_cpa_zip_from_document, normalize_wham_usage_response,
     parse_codex_accounts, unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat,
-    ACCESS_TOKEN_REFRESH_GRACE_SECONDS, CODEX_WHAM_USAGE_URL,
+    ACCESS_TOKEN_REFRESH_GRACE_SECONDS, CODEX_DEFAULT_ORIGINATOR, CODEX_DEFAULT_USER_AGENT,
+    CODEX_WHAM_USAGE_URL,
 };
 use account_pool_data::{
     AccountListQuery, AccountPoolRepository, AccountSummary, AutoProbeSettings,
@@ -26,6 +27,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 const MAX_JSON_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REDEEM_CODES_PER_REQUEST: usize = 500;
@@ -638,9 +640,29 @@ async fn redeem_export(
         let _ =
             refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), true).await?;
     }
+    if !preparation.probe_account_ids.is_empty() {
+        let settings = state.repo.get_auto_probe_settings().await?;
+        let probe_summary = run_probe_accounts(
+            &state,
+            Some(&preparation.probe_account_ids),
+            ProbeRunOptions {
+                max_accounts: None,
+                concurrency: settings.concurrency as usize,
+                include_redeemed: false,
+            },
+        )
+        .await?;
+        if probe_summary.failed > 0 {
+            return Err(ApiError::bad_request("兑换前测活失败，请稍后重试"));
+        }
+    }
     let outcome = state
         .repo
-        .redeem_codes_for_export(&payload.codes, format)
+        .redeem_codes_for_export_with_verified_accounts(
+            &payload.codes,
+            format,
+            Some(&preparation.probe_account_ids),
+        )
         .await?;
     Ok(Json(json!({
         "success": true,
@@ -864,6 +886,11 @@ async fn probe_one_account(
     let mut request = probe_http
         .get(CODEX_WHAM_USAGE_URL)
         .header("accept", "application/json")
+        .header("user-agent", CODEX_DEFAULT_USER_AGENT)
+        .header("originator", CODEX_DEFAULT_ORIGINATOR)
+        .header("x-client-request-id", Uuid::new_v4().to_string())
+        .header("session_id", Uuid::new_v4().to_string())
+        .header("conversation_id", Uuid::new_v4().to_string())
         .bearer_auth(access_token);
     if let Some(account_id) = auth_file
         .account_id

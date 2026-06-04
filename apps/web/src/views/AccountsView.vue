@@ -100,7 +100,8 @@
                     </button>
                     <button
                       class="button ghost danger tiny"
-                      :disabled="busy || !!(account.redeem_code_id || account.redemption_id || account.redeemed_at)"
+                      :disabled="busy || !canDeleteAccount(account)"
+                      :title="canDeleteAccount(account) ? '删除账号' : '已兑换账号需测活为失效状态后才能删除'"
                       @click="deleteAccount(account.id)"
                     >
                       <Trash2 :size="14" />删除
@@ -407,6 +408,7 @@ import {
   toggleAll,
   statusLabel,
   statusBadgeClass,
+  canDeleteAccount,
   formatTime,
 } from '../composables/useAdmin'
 

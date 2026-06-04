@@ -72,6 +72,7 @@ const redeemRateLimitForm = reactive({
   max_requests: 30,
   whitelist_text: '',
 })
+const redeemedAccountDeletableStatuses = new Set(['at_expired', 'refresh_failed', 'auth_invalid', 'forbidden'])
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
 const apiState = computed(() => ({ token: adminToken.value }))
@@ -337,14 +338,14 @@ export async function deleteSelectedAccounts() {
     adminResult.value = '请选择要删除的账号'
     return
   }
-  if (!window.confirm(`确认删除选中的 ${ids.length} 个未绑定兑换码账号？已绑定兑换码的账号会被跳过。`)) {
+  if (!window.confirm(`确认删除选中的 ${ids.length} 个账号？未兑换账号会直接删除；已兑换账号仅在 AT 过期、刷新失败、账号失效或网络受限时删除，其余会跳过。`)) {
     return
   }
   await deleteAccountsByIds(ids)
 }
 
 export async function deleteAccount(accountId: string) {
-  if (!window.confirm('确认删除这个未绑定兑换码账号？')) return
+  if (!window.confirm('确认删除这个账号？未兑换账号会直接删除；已兑换账号仅在 AT 过期、刷新失败、账号失效或网络受限时删除。')) return
   await deleteAccountsByIds([accountId])
 }
 
@@ -594,6 +595,10 @@ export function statusBadgeClass(status: string) {
 
 function accountRedeemed(account: AccountSummary) {
   return Boolean(account.redeemed_at || account.redeem_code_id || account.redemption_id)
+}
+
+export function canDeleteAccount(account: AccountSummary) {
+  return !accountRedeemed(account) || redeemedAccountDeletableStatuses.has(account.status)
 }
 
 export function formatTime(value?: number | null) {

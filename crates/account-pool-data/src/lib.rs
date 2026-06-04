@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use account_pool_core::{
     access_token_needs_refresh, export_accounts, fingerprint_auth_file, format_redeem_code,
-    generate_redeem_code, legacy_fingerprint_auth_file, mask_redeem_code, normalize_redeem_code,
-    redeem_code_hash, secret_preview, unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat,
-    HealthCheckResult, ParsedAccount, ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
+    generate_redeem_code, is_redeemed_account_deletable_status, legacy_fingerprint_auth_file,
+    mask_redeem_code, normalize_redeem_code, redeem_code_hash, secret_preview, unix_now_secs,
+    AccountStatus, CodexAuthFile, ExportFormat, HealthCheckResult, ParsedAccount,
+    ACCESS_TOKEN_REFRESH_GRACE_SECONDS, REDEEMED_ACCOUNT_DELETABLE_STATUSES,
 };
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -349,7 +350,7 @@ FROM accounts
         {
             let Some(row) = sqlx::query(
                 r#"
-SELECT redeem_code_id, redemption_id, redeemed_at
+SELECT status, redeem_code_id, redemption_id, redeemed_at
 FROM accounts
 WHERE id = ?
 "#,
@@ -367,29 +368,50 @@ WHERE id = ?
                 continue;
             };
 
+            let status: String = row.try_get("status")?;
             let redeem_code_id: Option<String> = row.try_get("redeem_code_id")?;
             let redemption_id: Option<String> = row.try_get("redemption_id")?;
             let redeemed_at: Option<i64> = row.try_get("redeemed_at")?;
-            if redeem_code_id.is_some() || redemption_id.is_some() || redeemed_at.is_some() {
+            let is_redeemed =
+                redeem_code_id.is_some() || redemption_id.is_some() || redeemed_at.is_some();
+            if is_redeemed && !is_redeemed_account_deletable_status(&status) {
                 outcome.skipped += 1;
                 outcome.results.push(DeleteAccountResult {
                     account_id: account_id.to_string(),
                     status: "skipped".to_string(),
-                    reason: Some("账号已绑定兑换码或已兑换".to_string()),
+                    reason: Some("账号已兑换且当前状态未失效，未删除".to_string()),
                 });
                 continue;
             }
 
-            let deleted = sqlx::query(
+            let mut delete_builder = QueryBuilder::<Sqlite>::new(
                 r#"
 DELETE FROM accounts
-WHERE id = ? AND redeem_code_id IS NULL AND redemption_id IS NULL AND redeemed_at IS NULL
+WHERE id =
 "#,
-            )
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            );
+            delete_builder.push_bind(account_id);
+            delete_builder.push(
+                r#"
+ AND (
+  (redeem_code_id IS NULL AND redemption_id IS NULL AND redeemed_at IS NULL)
+  OR (
+    (redeem_code_id IS NOT NULL OR redemption_id IS NOT NULL OR redeemed_at IS NOT NULL)
+    AND status IN (
+"#,
+            );
+            {
+                let mut separated = delete_builder.separated(", ");
+                for status in REDEEMED_ACCOUNT_DELETABLE_STATUSES {
+                    separated.push_bind(*status);
+                }
+                separated.push_unseparated(")))");
+            }
+            let deleted = delete_builder
+                .build()
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             if deleted == 1 {
                 outcome.deleted += 1;
                 outcome.results.push(DeleteAccountResult {
@@ -810,6 +832,7 @@ WHERE codes.code_hash = ?
             return Ok(RedeemExportPreparation {
                 estimated_account_count,
                 refresh_account_ids: Vec::new(),
+                probe_account_ids: Vec::new(),
             });
         }
 
@@ -837,6 +860,7 @@ ORDER BY created_at ASC
 
         let mut selected_ids = HashSet::new();
         let mut refresh_ids = Vec::new();
+        let mut probe_ids = Vec::new();
         for demand in demands {
             let mut remaining = demand.count;
             for candidate in &candidates {
@@ -848,6 +872,7 @@ ORDER BY created_at ASC
                 }
                 if candidate.is_usable(now) {
                     selected_ids.insert(candidate.id.clone());
+                    probe_ids.push(candidate.id.clone());
                     remaining -= 1;
                 }
             }
@@ -861,6 +886,7 @@ ORDER BY created_at ASC
                 if candidate.needs_refresh(now) {
                     selected_ids.insert(candidate.id.clone());
                     refresh_ids.push(candidate.id.clone());
+                    probe_ids.push(candidate.id.clone());
                     remaining -= 1;
                 }
             }
@@ -868,6 +894,7 @@ ORDER BY created_at ASC
         Ok(RedeemExportPreparation {
             estimated_account_count,
             refresh_account_ids: refresh_ids,
+            probe_account_ids: probe_ids,
         })
     }
 
@@ -875,6 +902,16 @@ ORDER BY created_at ASC
         &self,
         raw_codes: &[String],
         format: ExportFormat,
+    ) -> Result<RedeemExportOutcome, DataError> {
+        self.redeem_codes_for_export_with_verified_accounts(raw_codes, format, None)
+            .await
+    }
+
+    pub async fn redeem_codes_for_export_with_verified_accounts(
+        &self,
+        raw_codes: &[String],
+        format: ExportFormat,
+        verified_account_ids: Option<&[String]>,
     ) -> Result<RedeemExportOutcome, DataError> {
         let _redeem_guard = self.redemption_lock.lock().await;
         let mut successes = Vec::new();
@@ -967,17 +1004,28 @@ WHERE codes.code_hash = ?
                 let plan_filter = plan_filter
                     .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
                     .unwrap_or_default();
-                let rows = sqlx::query(
+                let mut account_query = QueryBuilder::<Sqlite>::new(
                     r#"
 SELECT id, plan_type
 FROM accounts
-WHERE redeemed_at IS NULL AND status = 'available' AND expires_at IS NOT NULL AND expires_at > ?
-ORDER BY created_at ASC
+WHERE redeemed_at IS NULL AND status = 'available' AND expires_at IS NOT NULL AND expires_at >
 "#,
-                )
-                .bind(usable_after)
-                .fetch_all(&mut *tx)
-                .await?;
+                );
+                account_query.push_bind(usable_after);
+                if let Some(verified_account_ids) = verified_account_ids {
+                    if verified_account_ids.is_empty() {
+                        account_query.push(" AND 1 = 0");
+                    } else {
+                        account_query.push(" AND id IN (");
+                        let mut separated = account_query.separated(", ");
+                        for account_id in verified_account_ids {
+                            separated.push_bind(account_id);
+                        }
+                        separated.push_unseparated(")");
+                    }
+                }
+                account_query.push(" ORDER BY created_at ASC");
+                let rows = account_query.build().fetch_all(&mut *tx).await?;
                 let account_ids = rows
                     .into_iter()
                     .filter_map(|row| {
@@ -1660,6 +1708,7 @@ pub struct RedeemExportOutcome {
 pub struct RedeemExportPreparation {
     pub estimated_account_count: usize,
     pub refresh_account_ids: Vec<String>,
+    pub probe_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1943,7 +1992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_skips_redeemed_accounts() {
+    async fn delete_skips_redeemed_accounts_that_are_not_invalid() {
         let repo = temp_repo().await;
         repo.import_accounts(&[
             parsed_account("acct-1", "access-1"),
@@ -2003,6 +2052,73 @@ mod tests {
         assert_eq!(remaining.total, 1);
         assert_eq!(remaining.items[0].id, redeemed);
         assert!(remaining.items[0].redeem_code_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_allows_redeemed_invalid_accounts() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("acct-1", "access-1")])
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "delete invalid redeemed".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        repo.redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let redeemed = page.items[0].id.clone();
+
+        repo.record_health_check(
+            &redeemed,
+            &HealthCheckResult {
+                status: AccountStatus::AuthInvalid,
+                plan_type: Some("plus".to_string()),
+                quota_snapshot: None,
+                error: Some("invalid token".to_string()),
+            },
+            Some(401),
+            Some(36),
+        )
+        .await
+        .unwrap();
+
+        let outcome = repo
+            .delete_unbound_accounts(std::slice::from_ref(&redeemed))
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.results[0].status, "deleted");
+
+        let remaining = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining.total, 0);
+        let row =
+            sqlx::query("SELECT COUNT(*) AS count FROM redeem_codes WHERE redeemed_at IS NOT NULL")
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        let redeemed_codes: i64 = row.try_get("count").unwrap();
+        assert_eq!(redeemed_codes, 1);
     }
 
     #[tokio::test]
@@ -2239,6 +2355,7 @@ mod tests {
             .unwrap();
         assert_eq!(first_only.estimated_account_count, 1);
         assert!(first_only.refresh_account_ids.is_empty());
+        assert_eq!(first_only.probe_account_ids.len(), 1);
 
         let both = repo
             .prepare_redeem_export(&[batch.codes[0].code.clone(), batch.codes[1].code.clone()])
@@ -2246,6 +2363,7 @@ mod tests {
             .unwrap();
         assert_eq!(both.estimated_account_count, 2);
         assert_eq!(both.refresh_account_ids.len(), 1);
+        assert_eq!(both.probe_account_ids.len(), 2);
         let refreshed = repo
             .load_auth_files_for_ids(&both.refresh_account_ids, false)
             .await
@@ -2254,6 +2372,63 @@ mod tests {
             .map(|(summary, _)| summary.email.unwrap_or_default())
             .collect::<Vec<_>>();
         assert!(refreshed[0].starts_with("expired-"));
+    }
+
+    #[tokio::test]
+    async fn redeem_with_verified_scope_does_not_use_unverified_available_accounts() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("acct-1", "access-1"),
+            parsed_account("acct-2", "access-2"),
+        ])
+        .await
+        .unwrap();
+        let accounts = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let verified_id = accounts
+            .items
+            .iter()
+            .find(|account| account.email.as_deref() == Some("acct-2@example.com"))
+            .unwrap()
+            .id
+            .clone();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "verified scope".to_string(),
+                total_count: 2,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let blocked = repo
+            .redeem_codes_for_export_with_verified_accounts(
+                &[batch.codes[0].code.clone()],
+                ExportFormat::Cpa,
+                Some(&[]),
+            )
+            .await
+            .unwrap();
+        assert!(blocked.successes.is_empty());
+        assert_eq!(blocked.failures[0].reason, "可兑换账号库存不足");
+
+        let scoped = repo
+            .redeem_codes_for_export_with_verified_accounts(
+                &[batch.codes[1].code.clone()],
+                ExportFormat::Cpa,
+                Some(&[verified_id]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.successes.len(), 1);
+        assert_eq!(document_access_token(&scoped.document), "access-2");
     }
 
     #[tokio::test]
