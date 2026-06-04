@@ -3,18 +3,18 @@
     <div class="stats">
       <div class="stat dark-stat">
         <span>总账号</span>
-        <strong>{{ accountPagination.total }}</strong>
+        <strong>{{ accountStats.total }}</strong>
       </div>
       <div class="stat">
-        <span>本页可分配</span>
+        <span>总可分配</span>
         <strong>{{ availableCount }}</strong>
       </div>
       <div class="stat">
-        <span>本页已兑换</span>
+        <span>总已兑换</span>
         <strong>{{ redeemedCount }}</strong>
       </div>
       <div class="stat stat-attention">
-        <span>本页需处理</span>
+        <span>总需处理</span>
         <strong>{{ attentionCount }}</strong>
       </div>
     </div>
@@ -428,6 +428,7 @@ const {
   redeemRateLimitForm,
   filters,
   accountPagination,
+  accountStats,
   busy,
   availableCount,
   redeemedCount,

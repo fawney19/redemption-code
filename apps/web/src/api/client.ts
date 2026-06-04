@@ -25,6 +25,14 @@ export interface AccountListPage {
   total: number
   limit: number
   offset: number
+  stats: AccountPoolStats
+}
+
+export interface AccountPoolStats {
+  total: number
+  available: number
+  redeemed: number
+  attention: number
 }
 
 export interface RedeemBatch {

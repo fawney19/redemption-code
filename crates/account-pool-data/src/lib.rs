@@ -304,11 +304,34 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
             .into_iter()
             .map(|row| account_summary_from_row(&row))
             .collect::<Result<Vec<_>, _>>()?;
+        let stats = self.load_account_pool_stats().await?;
         Ok(AccountListPage {
             items,
             total,
             limit,
             offset,
+            stats,
+        })
+    }
+
+    async fn load_account_pool_stats(&self) -> Result<AccountPoolStats, DataError> {
+        let row = sqlx::query(
+            r#"
+SELECT
+  COUNT(*) AS total,
+  COALESCE(SUM(CASE WHEN status = 'available' AND redeemed_at IS NULL THEN 1 ELSE 0 END), 0) AS available,
+  COALESCE(SUM(CASE WHEN redeemed_at IS NOT NULL OR redeem_code_id IS NOT NULL OR redemption_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS redeemed,
+  COALESCE(SUM(CASE WHEN status IN ('at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted') THEN 1 ELSE 0 END), 0) AS attention
+FROM accounts
+"#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(AccountPoolStats {
+            total: usize_from_i64(row.try_get("total")?),
+            available: usize_from_i64(row.try_get("available")?),
+            redeemed: usize_from_i64(row.try_get("redeemed")?),
+            attention: usize_from_i64(row.try_get("attention")?),
         })
     }
 
@@ -1242,6 +1265,15 @@ pub struct AccountListPage {
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
+    pub stats: AccountPoolStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AccountPoolStats {
+    pub total: usize,
+    pub available: usize,
+    pub redeemed: usize,
+    pub attention: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1523,6 +1555,10 @@ fn optional_i64(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<u64>
         .and_then(|value| u64::try_from(value).ok()))
 }
 
+fn usize_from_i64(value: i64) -> usize {
+    usize::try_from(value).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateRedeemBatchInput {
     pub name: String,
@@ -1785,6 +1821,10 @@ mod tests {
             .unwrap();
         assert_eq!(first_page.total, 3);
         assert_eq!(first_page.items.len(), 2);
+        assert_eq!(first_page.stats.total, 3);
+        assert_eq!(first_page.stats.available, 3);
+        assert_eq!(first_page.stats.redeemed, 0);
+        assert_eq!(first_page.stats.attention, 0);
 
         let second_page = repo
             .list_accounts(AccountListQuery {
@@ -1807,6 +1847,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.stats.total, 3);
+        assert_eq!(filtered.stats.available, 3);
         assert_eq!(
             filtered.items[0].email.as_deref(),
             Some("acct-b@example.com")

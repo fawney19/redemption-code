@@ -1,6 +1,7 @@
 import { computed, reactive, ref } from 'vue'
 import {
   api,
+  type AccountPoolStats,
   type AccountSummary,
   type AutoProbeSettings,
   type DeleteAccountsResponse,
@@ -41,6 +42,12 @@ const accountPagination = reactive({
   limit: 50,
   offset: 0,
 })
+const accountStats = reactive<AccountPoolStats>({
+  total: 0,
+  available: 0,
+  redeemed: 0,
+  attention: 0,
+})
 const batchForm = reactive({
   name: '',
   total_count: 10,
@@ -68,9 +75,9 @@ const redeemRateLimitForm = reactive({
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
 const apiState = computed(() => ({ token: adminToken.value }))
-const availableCount = computed(() => accounts.value.filter((a) => a.status === 'available' && !accountRedeemed(a)).length)
-const redeemedCount = computed(() => accounts.value.filter(accountRedeemed).length)
-const attentionCount = computed(() => accounts.value.filter((a) => ['at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted'].includes(a.status)).length)
+const availableCount = computed(() => accountStats.available)
+const redeemedCount = computed(() => accountStats.redeemed)
+const attentionCount = computed(() => accountStats.attention)
 const allSelected = computed(() => accounts.value.length > 0 && accounts.value.every((a) => selectedIds.value.includes(a.id)))
 const accountPageStart = computed(() => accountPagination.total ? accountPagination.offset + 1 : 0)
 const accountPageEnd = computed(() => Math.min(accountPagination.offset + accounts.value.length, accountPagination.total))
@@ -153,6 +160,7 @@ export function useAdmin() {
     activeView,
     filters,
     accountPagination,
+    accountStats,
     batchForm,
     adminAuthenticated,
     apiState,
@@ -214,6 +222,7 @@ export function logoutAdmin() {
   redeemRateLimitResult.value = ''
   accountPagination.total = 0
   accountPagination.offset = 0
+  applyAccountStats()
   selectedIds.value = []
   sessionStorage.removeItem(adminTokenStorageKey)
 }
@@ -232,6 +241,7 @@ export async function loadAccounts() {
   accountPagination.total = page.total
   accountPagination.limit = page.limit
   accountPagination.offset = page.offset
+  applyAccountStats(page.stats)
   selectedIds.value = selectedIds.value.filter((id) => accounts.value.some((a) => a.id === id))
 }
 
@@ -487,6 +497,13 @@ function applyRedeemRateLimitSettings(settings: RedeemRateLimitSettings) {
   redeemRateLimitForm.window_seconds = settings.window_seconds
   redeemRateLimitForm.max_requests = settings.max_requests
   redeemRateLimitForm.whitelist_text = (settings.whitelist_ips || []).join('\n')
+}
+
+function applyAccountStats(stats?: AccountPoolStats) {
+  accountStats.total = Number(stats?.total || 0)
+  accountStats.available = Number(stats?.available || 0)
+  accountStats.redeemed = Number(stats?.redeemed || 0)
+  accountStats.attention = Number(stats?.attention || 0)
 }
 
 export function exportResultForDisplay<T extends { download?: EncodedDownload | null }>(result: T) {
