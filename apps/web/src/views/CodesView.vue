@@ -166,8 +166,10 @@
                   <tr>
                     <th>兑换码</th>
                     <th>状态</th>
+                    <th>绑定账号</th>
                     <th>兑换时间</th>
                     <th>兑换记录</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -177,11 +179,32 @@
                       <div v-if="!code.code" class="muted">历史脱敏</div>
                     </td>
                     <td><span class="badge" :class="code.status">{{ statusLabel(code.status) }}</span></td>
+                    <td>
+                      <div v-if="code.accounts.length" class="bound-account-list">
+                        <div v-for="account in code.accounts" :key="account.id" class="bound-account-item">
+                          <div>
+                            <strong>{{ accountDisplayName(account) }}</strong>
+                            <span class="muted mono">{{ accountDetailText(account) }}</span>
+                          </div>
+                          <span class="badge" :class="statusBadgeClass(account.status)">{{ statusLabel(account.status) }}</span>
+                        </div>
+                      </div>
+                      <span v-else class="muted">-</span>
+                    </td>
                     <td>{{ formatTime(code.redeemed_at) }}</td>
                     <td class="mono">{{ code.redemption_id || '-' }}</td>
+                    <td>
+                      <button
+                        class="button ghost tiny"
+                        :disabled="busy || probingCodeId === code.id || !boundAccountIds(code).length"
+                        @click="probeCodeAccounts(code)"
+                      >
+                        <Activity :size="14" />测活
+                      </button>
+                    </td>
                   </tr>
                   <tr v-if="!batchCodes.length">
-                    <td colspan="4" class="empty-row">
+                    <td colspan="6" class="empty-row">
                       <Ticket :size="20" />
                       <span>暂无兑换码明细</span>
                     </td>
@@ -216,8 +239,9 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Copy, Download, Plus, RefreshCw, Ticket } from 'lucide-vue-next'
+import { Activity, Copy, Download, Plus, RefreshCw, Ticket } from 'lucide-vue-next'
 import type { RedeemBatch, RedeemCode } from '../api/client'
+import { api } from '../api/client'
 import {
   useAdmin,
   createBatch,
@@ -226,6 +250,7 @@ import {
   downloadText,
   formatTime,
   statusLabel,
+  statusBadgeClass,
   timestamp,
 } from '../composables/useAdmin'
 import { useToast } from '../composables/useToast'
@@ -240,10 +265,12 @@ const {
   generatedCodes,
   redeemStats,
   busy,
+  apiState,
 } = useAdmin()
 const toast = useToast()
 const manualCopyTitle = ref('')
 const manualCopyText = ref('')
+const probingCodeId = ref('')
 
 const generatedCodeCount = computed(() => generatedCodes.value.split(/\r?\n/).filter(Boolean).length)
 const selectedCodes = computed(() => batchCodes.value.map(displayCode).join('\n'))
@@ -332,6 +359,7 @@ function buildBatchCsv(batch: RedeemBatch) {
       displayCode(code),
       code.code ? '' : code.masked_code,
       code.status,
+      formatBoundAccounts(code),
       formatCsvTime(code.redeemed_at),
       code.redemption_id || '',
       formatCsvTime(code.created_at),
@@ -354,6 +382,7 @@ function buildBatchCsv(batch: RedeemBatch) {
       '',
       '',
       '',
+      '',
     ]]
   const header = [
     'exported_at',
@@ -368,6 +397,7 @@ function buildBatchCsv(batch: RedeemBatch) {
     'code',
     'masked_code_fallback',
     'code_status',
+    'bound_accounts',
     'code_redeemed_at',
     'redemption_id',
     'code_created_at',
@@ -378,6 +408,49 @@ function buildBatchCsv(batch: RedeemBatch) {
 
 function displayCode(code: RedeemCode) {
   return code.code || code.masked_code
+}
+
+function boundAccountIds(code: RedeemCode) {
+  return code.accounts.filter((account) => account.status !== 'deleted').map((account) => account.id)
+}
+
+function accountDisplayName(account: RedeemCode['accounts'][number]) {
+  return account.email || account.name || account.account_id || account.id
+}
+
+function accountDetailText(account: RedeemCode['accounts'][number]) {
+  const parts = [
+    account.account_id && account.account_id !== account.id ? account.account_id : '',
+    account.plan_type || '',
+    account.last_probe_at ? `测活 ${formatTime(account.last_probe_at)}` : '',
+  ].filter(Boolean)
+  return parts.length ? parts.join(' / ') : account.id
+}
+
+function formatBoundAccounts(code: RedeemCode) {
+  return code.accounts
+    .map((account) => `${accountDisplayName(account)} (${account.status})`)
+    .join('; ')
+}
+
+async function probeCodeAccounts(code: RedeemCode) {
+  const accountIds = boundAccountIds(code)
+  if (!accountIds.length) {
+    toast.info('这个兑换码暂无可测活账号')
+    return
+  }
+  probingCodeId.value = code.id
+  try {
+    await api.probeAccounts(apiState.value, accountIds)
+    if (selectedBatchId.value) {
+      await loadCodes(selectedBatchId.value)
+    }
+    toast.success(`已测活 ${accountIds.length} 个绑定账号`)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    probingCodeId.value = ''
+  }
 }
 
 function csvCell(value: unknown) {

@@ -12,6 +12,7 @@ export interface AccountSummary {
   expires_at?: number | null
   last_refresh_at?: number | null
   last_probe_at?: number | null
+  quota_snapshot?: Record<string, unknown> | null
   redeem_code_id?: string | null
   redeem_code_masked?: string | null
   redemption_id?: string | null
@@ -55,6 +56,16 @@ export interface RedeemCode {
   status: string
   redemption_id?: string | null
   redeemed_at?: number | null
+  accounts: Array<{
+    id: string
+    email?: string | null
+    name?: string | null
+    account_id?: string | null
+    plan_type?: string | null
+    status: string
+    last_probe_at?: number | null
+    quota_snapshot?: Record<string, unknown> | null
+  }>
   created_at: number
   updated_at: number
 }

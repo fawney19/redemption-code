@@ -593,6 +593,35 @@ export function statusBadgeClass(status: string) {
   return status === 'redeemed' ? 'disabled' : status
 }
 
+type QuotaWindow = 'five_hour' | 'weekly'
+
+function quotaPercentValue(account: AccountSummary, window: QuotaWindow) {
+  const key = window === 'five_hour' ? 'primary_used_percent' : 'secondary_used_percent'
+  const raw = account.quota_snapshot?.[key]
+  const value = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseFloat(raw) : NaN
+  return Number.isFinite(value) ? Math.max(0, value) : null
+}
+
+export function quotaPercentText(account: AccountSummary, window: QuotaWindow) {
+  const value = quotaPercentValue(account, window)
+  if (value === null) return '-'
+  const rounded = Math.round(value * 10) / 10
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`
+}
+
+export function quotaPercentBarWidth(account: AccountSummary, window: QuotaWindow) {
+  const value = quotaPercentValue(account, window)
+  return `${Math.min(value ?? 0, 100)}%`
+}
+
+export function quotaUsageClass(account: AccountSummary, window: QuotaWindow) {
+  const value = quotaPercentValue(account, window)
+  if (value === null) return 'empty'
+  if (value >= 100) return 'exhausted'
+  if (value >= 80) return 'warning'
+  return 'ok'
+}
+
 function accountRedeemed(account: AccountSummary) {
   return Boolean(account.redeemed_at || account.redeem_code_id || account.redemption_id)
 }

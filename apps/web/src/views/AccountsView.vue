@@ -67,6 +67,7 @@
                   <th>状态</th>
                   <th>绑定兑换码</th>
                   <th>Token</th>
+                  <th>额度</th>
                   <th>过期</th>
                   <th>测活</th>
                   <th>操作</th>
@@ -92,6 +93,24 @@
                       <span><b>RT</b>{{ account.refresh_token_preview || '-' }}</span>
                     </div>
                   </td>
+                  <td>
+                    <div class="quota-stack">
+                      <div class="quota-row" :class="quotaUsageClass(account, 'five_hour')">
+                        <span class="quota-label">5h</span>
+                        <span class="quota-value">{{ quotaPercentText(account, 'five_hour') }}</span>
+                        <span class="quota-track">
+                          <span class="quota-fill" :style="{ width: quotaPercentBarWidth(account, 'five_hour') }"></span>
+                        </span>
+                      </div>
+                      <div class="quota-row" :class="quotaUsageClass(account, 'weekly')">
+                        <span class="quota-label">周</span>
+                        <span class="quota-value">{{ quotaPercentText(account, 'weekly') }}</span>
+                        <span class="quota-track">
+                          <span class="quota-fill" :style="{ width: quotaPercentBarWidth(account, 'weekly') }"></span>
+                        </span>
+                      </div>
+                    </div>
+                  </td>
                   <td>{{ formatTime(account.expires_at) }}</td>
                   <td>{{ formatTime(account.last_probe_at) }}</td>
                   <td>
@@ -109,7 +128,7 @@
                   </td>
                 </tr>
                 <tr v-if="!accounts.length">
-                  <td colspan="8" class="empty-row">
+                  <td colspan="9" class="empty-row">
                     <Database :size="20" />
                     <span>暂无账号数据</span>
                   </td>
@@ -409,6 +428,9 @@ import {
   statusLabel,
   statusBadgeClass,
   canDeleteAccount,
+  quotaPercentText,
+  quotaPercentBarWidth,
+  quotaUsageClass,
   formatTime,
 } from '../composables/useAdmin'
 

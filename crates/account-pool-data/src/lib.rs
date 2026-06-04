@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -288,7 +288,7 @@ WHERE auth_fingerprint = ? AND lower(email) = ?
             r#"
 SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
-       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at
 FROM accounts a
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
@@ -444,7 +444,7 @@ WHERE id =
                 r#"
 SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
-       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
@@ -473,7 +473,7 @@ WHERE a.id = ? AND (? = 1 OR a.redeemed_at IS NULL)
             r#"
 SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
-       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
@@ -741,18 +741,40 @@ ORDER BY created_at DESC
     ) -> Result<Vec<RedeemCodeSummary>, DataError> {
         let rows = sqlx::query(
             r#"
-SELECT id, batch_id, masked_code, code_ciphertext, status, redemption_id, redeemed_at, created_at, updated_at
-FROM redeem_codes
-WHERE batch_id = ?
-ORDER BY created_at ASC
+SELECT codes.id, codes.batch_id, codes.masked_code, codes.code_ciphertext, codes.status,
+       codes.redemption_id, codes.redeemed_at, codes.created_at, codes.updated_at,
+       redemptions.account_ids_json
+FROM redeem_codes AS codes
+LEFT JOIN redeem_redemptions AS redemptions ON redemptions.id = codes.redemption_id
+WHERE codes.batch_id = ?
+ORDER BY codes.created_at ASC
 "#,
         )
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
+        let mut codes = rows
+            .into_iter()
             .map(|row| code_summary_from_row(row, &self.secrets))
-            .collect()
+            .collect::<Result<Vec<_>, DataError>>()?;
+        let account_ids = codes
+            .iter()
+            .flat_map(|code| code.account_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let account_map = self.load_redeem_code_account_map(&account_ids).await?;
+        for code in &mut codes {
+            code.summary.accounts = code
+                .account_ids
+                .iter()
+                .map(|account_id| {
+                    account_map
+                        .get(account_id)
+                        .cloned()
+                        .unwrap_or_else(|| deleted_redeem_code_account(account_id.clone()))
+                })
+                .collect();
+        }
+        Ok(codes.into_iter().map(|code| code.summary).collect())
     }
 
     pub async fn prepare_redeem_export(
@@ -1208,7 +1230,7 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = ex
             r#"
 SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
-       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
@@ -1243,7 +1265,7 @@ ORDER BY a.created_at ASC
                 r#"
 SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
-       a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
+       a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
@@ -1259,6 +1281,50 @@ WHERE a.id = ?
                 summary,
                 self.secrets.decrypt_json::<CodexAuthFile>(&ciphertext)?,
             ));
+        }
+        Ok(out)
+    }
+
+    async fn load_redeem_code_account_map(
+        &self,
+        account_ids: &[String],
+    ) -> Result<HashMap<String, RedeemCodeAccountSummary>, DataError> {
+        let mut unique_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for account_id in account_ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            if seen_ids.insert(account_id.to_string()) {
+                unique_ids.push(account_id.to_string());
+            }
+        }
+        if unique_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut out = HashMap::new();
+        for chunk in unique_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                r#"
+SELECT id, email, name, account_id, plan_type, status, last_probe_at, quota_snapshot
+FROM accounts
+WHERE id IN (
+"#,
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for account_id in chunk {
+                    separated.push_bind(account_id);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&self.pool).await?;
+            for row in rows {
+                let account = redeem_code_account_from_row(row)?;
+                out.insert(account.id.clone(), account);
+            }
         }
         Ok(out)
     }
@@ -1352,6 +1418,7 @@ pub struct AccountSummary {
     pub expires_at: Option<u64>,
     pub last_refresh_at: Option<u64>,
     pub last_probe_at: Option<u64>,
+    pub quota_snapshot: Option<Value>,
     pub redeem_code_id: Option<String>,
     pub redeem_code_masked: Option<String>,
     pub redemption_id: Option<String>,
@@ -1588,6 +1655,7 @@ fn account_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountSumm
         expires_at: optional_i64(row, "expires_at")?,
         last_refresh_at: optional_i64(row, "last_refresh_at")?,
         last_probe_at: optional_i64(row, "last_probe_at")?,
+        quota_snapshot: optional_json(row, "quota_snapshot")?,
         redeem_code_id: row.try_get("redeem_code_id")?,
         redeem_code_masked: row.try_get("redeem_code_masked")?,
         redemption_id: row.try_get("redemption_id")?,
@@ -1601,6 +1669,12 @@ fn optional_i64(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<u64>
     Ok(row
         .try_get::<Option<i64>, _>(name)?
         .and_then(|value| u64::try_from(value).ok()))
+}
+
+fn optional_json(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<Value>, DataError> {
+    Ok(row
+        .try_get::<Option<String>, _>(name)?
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok()))
 }
 
 fn usize_from_i64(value: i64) -> usize {
@@ -1671,29 +1745,83 @@ pub struct RedeemCodeSummary {
     pub status: String,
     pub redemption_id: Option<String>,
     pub redeemed_at: Option<u64>,
+    pub accounts: Vec<RedeemCodeAccountSummary>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RedeemCodeAccountSummary {
+    pub id: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+    pub status: String,
+    pub last_probe_at: Option<u64>,
+    pub quota_snapshot: Option<Value>,
+}
+
+struct RedeemCodeWithAccountIds {
+    summary: RedeemCodeSummary,
+    account_ids: Vec<String>,
 }
 
 fn code_summary_from_row(
     row: sqlx::sqlite::SqliteRow,
     secrets: &SecretBox,
-) -> Result<RedeemCodeSummary, DataError> {
+) -> Result<RedeemCodeWithAccountIds, DataError> {
     let code = row
         .try_get::<Option<String>, _>("code_ciphertext")?
         .as_deref()
         .and_then(|ciphertext| secrets.decrypt_json::<String>(ciphertext).ok());
-    Ok(RedeemCodeSummary {
-        id: row.try_get("id")?,
-        batch_id: row.try_get("batch_id")?,
-        code,
-        masked_code: row.try_get("masked_code")?,
-        status: row.try_get("status")?,
-        redemption_id: row.try_get("redemption_id")?,
-        redeemed_at: optional_i64(&row, "redeemed_at")?,
-        created_at: optional_i64(&row, "created_at")?.unwrap_or_default(),
-        updated_at: optional_i64(&row, "updated_at")?.unwrap_or_default(),
+    let account_ids = row
+        .try_get::<Option<String>, _>("account_ids_json")?
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default();
+    Ok(RedeemCodeWithAccountIds {
+        summary: RedeemCodeSummary {
+            id: row.try_get("id")?,
+            batch_id: row.try_get("batch_id")?,
+            code,
+            masked_code: row.try_get("masked_code")?,
+            status: row.try_get("status")?,
+            redemption_id: row.try_get("redemption_id")?,
+            redeemed_at: optional_i64(&row, "redeemed_at")?,
+            accounts: Vec::new(),
+            created_at: optional_i64(&row, "created_at")?.unwrap_or_default(),
+            updated_at: optional_i64(&row, "updated_at")?.unwrap_or_default(),
+        },
+        account_ids,
     })
+}
+
+fn redeem_code_account_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<RedeemCodeAccountSummary, DataError> {
+    Ok(RedeemCodeAccountSummary {
+        id: row.try_get("id")?,
+        email: row.try_get("email")?,
+        name: row.try_get("name")?,
+        account_id: row.try_get("account_id")?,
+        plan_type: row.try_get("plan_type")?,
+        status: row.try_get("status")?,
+        last_probe_at: optional_i64(&row, "last_probe_at")?,
+        quota_snapshot: optional_json(&row, "quota_snapshot")?,
+    })
+}
+
+fn deleted_redeem_code_account(account_id: String) -> RedeemCodeAccountSummary {
+    RedeemCodeAccountSummary {
+        id: account_id,
+        email: None,
+        name: None,
+        account_id: None,
+        plan_type: None,
+        status: "deleted".to_string(),
+        last_probe_at: None,
+        quota_snapshot: None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1902,6 +2030,50 @@ mod tests {
             filtered.items[0].email.as_deref(),
             Some("acct-b@example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn list_accounts_includes_quota_snapshot() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("quota-acct", "quota-access")])
+            .await
+            .unwrap();
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let account_id = page.items[0].id.clone();
+
+        repo.record_health_check(
+            &account_id,
+            &HealthCheckResult {
+                status: AccountStatus::Available,
+                plan_type: Some("plus".to_string()),
+                quota_snapshot: Some(json!({
+                    "primary_used_percent": 12.5,
+                    "secondary_used_percent": 34.0,
+                })),
+                error: None,
+            },
+            Some(200),
+            Some(30),
+        )
+        .await
+        .unwrap();
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let snapshot = page.items[0].quota_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.get("primary_used_percent"), Some(&json!(12.5)));
+        assert_eq!(snapshot.get("secondary_used_percent"), Some(&json!(34.0)));
     }
 
     #[tokio::test]
@@ -2152,6 +2324,40 @@ mod tests {
             .iter()
             .zip(batch.codes.iter())
             .all(|(listed, created)| listed.masked_code == created.masked_code));
+        assert!(codes.iter().all(|code| code.accounts.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn list_redeem_codes_includes_bound_accounts() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("bound-acct", "bound-access")])
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "bound accounts".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        repo.redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        let codes = repo.list_redeem_codes(&batch.batch_id).await.unwrap();
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].accounts.len(), 1);
+        assert_eq!(
+            codes[0].accounts[0].email.as_deref(),
+            Some("bound-acct@example.com")
+        );
+        assert_eq!(
+            codes[0].accounts[0].status,
+            AccountStatus::Available.as_str()
+        );
     }
 
     #[tokio::test]
