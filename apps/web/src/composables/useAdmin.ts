@@ -7,6 +7,7 @@ import {
   type AccountSummary,
   type AutoProbeSettings,
   type DeleteAccountsResponse,
+  type DeleteRedeemBatchResponse,
   type EncodedDownload,
   type ExportFormat,
   type CpaTestResponse,
@@ -659,6 +660,22 @@ export async function loadCodes(batchId: string) {
   await withBusy(() => fetchCodes(batchId))
 }
 
+export async function deleteBatch(batch: RedeemBatch) {
+  if (!window.confirm(`确认删除兑换码批次「${batch.name}」？这会清空该批次的兑换码、兑换记录、售后记录，并解除已分配账号的兑换绑定。`)) {
+    return
+  }
+  await withBusy(async () => {
+    const result = await api.deleteBatch(apiState.value, batch.id)
+    adminResult.value = formatDeleteRedeemBatchResult(batch, result)
+    if (selectedBatchId.value === batch.id) {
+      selectedBatchId.value = ''
+      batchCodes.value = []
+    }
+    await loadBatches()
+    await loadAccounts()
+  })
+}
+
 async function fetchCodes(batchId: string) {
   selectedBatchId.value = batchId
   const result = await api.listCodes(apiState.value, batchId)
@@ -728,6 +745,14 @@ function formatDeleteAccountsResult(result: DeleteAccountsResponse) {
     )
   }
   return lines.join('\n')
+}
+
+function formatDeleteRedeemBatchResult(batch: RedeemBatch, result: DeleteRedeemBatchResponse) {
+  return [
+    `兑换码批次「${batch.name}」已删除。`,
+    `清理兑换码 ${result.codes_deleted} 个，兑换记录 ${result.redemptions_deleted} 条，售后记录 ${result.after_sales_deleted} 条。`,
+    `已解除 ${result.accounts_reset} 个账号的兑换绑定。`,
+  ].join('\n')
 }
 
 function poolPayloadFromForm(): AccountPoolPayload {

@@ -229,6 +229,16 @@ export interface DeleteAccountsResponse {
   }>
 }
 
+export interface DeleteRedeemBatchResponse {
+  success: boolean
+  message: string
+  deleted: boolean
+  accounts_reset: number
+  codes_deleted: number
+  redemptions_deleted: number
+  after_sales_deleted: number
+}
+
 export interface RedeemRateLimitSettings {
   enabled: boolean
   window_seconds: number
@@ -357,6 +367,13 @@ export const api = {
   },
   listCodes(state: ApiState, batchId: string) {
     return request<{ items: RedeemCode[] }>(`${MANAGEMENT_API_PREFIX}/redeem-code-batches/${batchId}/codes`, state)
+  },
+  deleteBatch(state: ApiState, batchId: string) {
+    return request<DeleteRedeemBatchResponse>(
+      `${MANAGEMENT_API_PREFIX}/redeem-code-batches/${encodeURIComponent(batchId)}`,
+      state,
+      { method: 'DELETE' },
+    )
   },
   getAutoProbeSettings(state: ApiState) {
     return request<AutoProbeSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe`, state)

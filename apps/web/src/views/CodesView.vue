@@ -150,6 +150,9 @@
                       <button class="button ghost tiny" @click="selectBatch(batch.id)">查看</button>
                       <button class="button ghost tiny" @click="copyBatchCodes(batch)">复制</button>
                       <button class="button ghost tiny" @click="exportBatchCodes(batch)">导出 CSV</button>
+                      <button class="button danger tiny" :disabled="busy" @click="deleteBatch(batch)">
+                        <Trash2 :size="14" />删除
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -271,12 +274,13 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Activity, Copy, Download, Plus, RefreshCw, Ticket } from 'lucide-vue-next'
+import { Activity, Copy, Download, Plus, RefreshCw, Ticket, Trash2 } from 'lucide-vue-next'
 import type { RedeemAfterSale, RedeemBatch, RedeemCode } from '../api/client'
 import { api } from '../api/client'
 import {
   useAdmin,
   createBatch,
+  deleteBatch,
   loadBatches,
   loadCodes,
   downloadText,

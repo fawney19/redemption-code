@@ -17,7 +17,7 @@ use account_pool_data::{
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::{Client, Proxy};
@@ -196,7 +196,7 @@ fn cors_layer() -> CorsLayer {
     };
     CorsLayer::new()
         .allow_origin(allow_origin)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::DELETE, Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -249,6 +249,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/alalalateam/redeem-code-batches",
             post(create_redeem_batch).get(list_redeem_batches),
+        )
+        .route(
+            "/api/alalalateam/redeem-code-batches/{batch_id}",
+            delete(delete_redeem_batch),
         )
         .route(
             "/api/alalalateam/redeem-code-batches/{batch_id}/codes",
@@ -325,6 +329,7 @@ async fn update_account_pool(
 struct ImportAccountsRequest {
     credentials: String,
     pool_id: Option<String>,
+    client_batch_id: Option<String>,
 }
 
 async fn import_accounts(
@@ -343,6 +348,8 @@ async fn import_accounts(
         "imported": outcome.imported,
         "updated": outcome.updated,
         "parse_errors": parsed.errors,
+        "client_batch_id": payload.client_batch_id,
+        "results": outcome.results,
     })))
 }
 
@@ -855,6 +862,30 @@ async fn list_redeem_batches(
         .list_redeem_batches_scoped(query.pool_id.as_deref())
         .await?;
     Ok(Json(json!({ "items": items })))
+}
+
+async fn delete_redeem_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    if batch_id.trim().is_empty() {
+        return Err(ApiError::bad_request("batch_id is required"));
+    }
+    let outcome = state.repo.delete_redeem_batch(&batch_id).await?;
+    if !outcome.deleted {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "兑换码批次不存在"));
+    }
+    Ok(Json(json!({
+        "success": true,
+        "message": "兑换码批次已删除",
+        "deleted": outcome.deleted,
+        "accounts_reset": outcome.accounts_reset,
+        "codes_deleted": outcome.codes_deleted,
+        "redemptions_deleted": outcome.redemptions_deleted,
+        "after_sales_deleted": outcome.after_sales_deleted,
+    })))
 }
 
 async fn list_redeem_codes(

@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_accounts_redeemed_at ON accounts(redeemed_at);
+CREATE INDEX IF NOT EXISTS idx_accounts_unredeemed_created ON accounts(redeemed_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_accounts_plan_type ON accounts(plan_type);
 
 CREATE TABLE IF NOT EXISTS account_health_checks (
