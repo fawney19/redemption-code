@@ -1,4 +1,4 @@
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import {
   api,
   type AccountPool,
@@ -18,7 +18,10 @@ import {
 } from '../api/client'
 
 const adminTokenStorageKey = 'aether-pool.admin-token'
+const activeViewStorageKey = 'aether-pool.admin-active-view'
+const managementEntryPath = '/alalalateam'
 localStorage.removeItem(adminTokenStorageKey)
+type AdminView = 'accounts' | 'codes'
 
 const adminToken = ref(sessionStorage.getItem(adminTokenStorageKey) || '')
 const adminTokenDraft = ref('')
@@ -45,7 +48,7 @@ const proxyTestResult = ref<ProxyTestResponse | null>(null)
 const proxyTestError = ref('')
 const cpaTestResult = ref<CpaTestResponse | null>(null)
 const cpaTestError = ref('')
-const activeView = ref<'accounts' | 'codes'>('accounts')
+const activeView = ref<AdminView>(initialAdminView())
 const filters = reactive({ search: '', status: '', redeemed: '' })
 const accountPagination = reactive({
   total: 0,
@@ -356,6 +359,10 @@ export async function changeAccountsPageSize() {
   accountPagination.limit = Number(accountPagination.limit || 50)
   accountPagination.offset = 0
   await loadAccounts()
+}
+
+export function setActiveView(view: AdminView) {
+  activeView.value = view
 }
 
 export async function loadBatches() {
@@ -770,6 +777,33 @@ function downloadBlob(fileName: string, blob: Blob) {
 export function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, '-')
 }
+
+function initialAdminView(): AdminView {
+  return viewFromValue(window.location.hash)
+    || viewFromValue(sessionStorage.getItem(activeViewStorageKey))
+    || 'accounts'
+}
+
+function viewFromValue(value?: string | null): AdminView | null {
+  const normalized = (value || '').replace(/^#\/?/, '').trim().toLowerCase()
+  if (normalized === 'accounts' || normalized === 'codes') return normalized
+  return null
+}
+
+function isManagementEntryPath() {
+  return window.location.pathname.replace(/\/+$/, '') === managementEntryPath
+}
+
+watch(activeView, (view) => {
+  sessionStorage.setItem(activeViewStorageKey, view)
+  if (!isManagementEntryPath()) return
+
+  const nextHash = view === 'codes' ? '#codes' : ''
+  if (window.location.hash === nextHash) return
+
+  const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`
+  window.history.replaceState(window.history.state, '', nextUrl)
+}, { immediate: true })
 
 export function normalizeDownloadFileName(fileName: string) {
   return fileName.replace(/^aether-pool/i, 'account-pool')

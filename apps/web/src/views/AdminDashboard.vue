@@ -3,10 +3,10 @@
     <aside class="sidebar">
       <BrandMark subtitle="Pool Console" />
       <nav class="sidebar-nav">
-        <button class="nav-button" :class="{ active: activeView === 'accounts' }" @click="activeView = 'accounts'">
+        <button class="nav-button" :class="{ active: activeView === 'accounts' }" @click="setActiveView('accounts')">
           <Database :size="16" />账号池
         </button>
-        <button class="nav-button" :class="{ active: activeView === 'codes' }" @click="activeView = 'codes'">
+        <button class="nav-button" :class="{ active: activeView === 'codes' }" @click="setActiveView('codes')">
           <Ticket :size="16" />兑换码
         </button>
       </nav>
@@ -45,7 +45,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Database, LogOut, RefreshCw, Ticket } from 'lucide-vue-next'
-import { useAdmin, logoutAdmin, refreshAdmin, changeSelectedPool, poolLabel } from '../composables/useAdmin'
+import { useAdmin, logoutAdmin, refreshAdmin, changeSelectedPool, poolLabel, setActiveView } from '../composables/useAdmin'
 import BrandMark from '../components/BrandMark.vue'
 import AccountsView from './AccountsView.vue'
 import CodesView from './CodesView.vue'

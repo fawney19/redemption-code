@@ -431,7 +431,7 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
         );
         push_account_filters(&mut builder, &query);
         builder
-            .push(" ORDER BY a.updated_at DESC, a.created_at DESC LIMIT ")
+            .push(" ORDER BY a.created_at DESC, a.rowid DESC LIMIT ")
             .push_bind(limit as i64)
             .push(" OFFSET ")
             .push_bind(offset as i64);
@@ -3735,6 +3735,60 @@ CREATE TABLE redeem_code_batches (
         let snapshot = page.items[0].quota_snapshot.as_ref().unwrap();
         assert_eq!(snapshot.get("primary_used_percent"), Some(&json!(12.5)));
         assert_eq!(snapshot.get("secondary_used_percent"), Some(&json!(34.0)));
+    }
+
+    #[tokio::test]
+    async fn health_check_does_not_move_account_to_top_of_list() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("stable-a", "access-a"),
+            parsed_account("stable-b", "access-b"),
+            parsed_account("stable-c", "access-c"),
+        ])
+        .await
+        .unwrap();
+
+        let before = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let before_ids = before
+            .items
+            .iter()
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        let checked_id = before_ids[1].clone();
+
+        repo.record_health_check(
+            &checked_id,
+            &HealthCheckResult {
+                status: AccountStatus::Available,
+                plan_type: Some("plus".to_string()),
+                quota_snapshot: Some(json!({ "primary_used_percent": 5.0 })),
+                error: None,
+            },
+            Some(200),
+            Some(25),
+        )
+        .await
+        .unwrap();
+
+        let after = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let after_ids = after
+            .items
+            .iter()
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(after_ids, before_ids);
     }
 
     #[tokio::test]
