@@ -884,9 +884,10 @@ ORDER BY created_at ASC
         let mut refresh_ids = Vec::new();
         let mut probe_ids = Vec::new();
         for demand in demands {
-            let mut remaining = demand.count;
+            let target_count = redeem_probe_target_count(demand.count);
+            let mut selected_for_demand = 0_usize;
             for candidate in &candidates {
-                if remaining == 0 {
+                if selected_for_demand >= target_count {
                     break;
                 }
                 if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
@@ -895,11 +896,11 @@ ORDER BY created_at ASC
                 if candidate.is_usable(now) {
                     selected_ids.insert(candidate.id.clone());
                     probe_ids.push(candidate.id.clone());
-                    remaining -= 1;
+                    selected_for_demand += 1;
                 }
             }
             for candidate in &candidates {
-                if remaining == 0 {
+                if selected_for_demand >= demand.count {
                     break;
                 }
                 if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
@@ -909,7 +910,7 @@ ORDER BY created_at ASC
                     selected_ids.insert(candidate.id.clone());
                     refresh_ids.push(candidate.id.clone());
                     probe_ids.push(candidate.id.clone());
-                    remaining -= 1;
+                    selected_for_demand += 1;
                 }
             }
         }
@@ -1605,6 +1606,10 @@ fn push_account_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &AccountL
 struct RedeemAccountDemand {
     count: usize,
     plan_filter: Vec<String>,
+}
+
+fn redeem_probe_target_count(required: usize) -> usize {
+    required.saturating_add(required.clamp(1, 10))
 }
 
 struct RedeemCandidateAccount {
@@ -2578,6 +2583,76 @@ mod tests {
             .map(|(summary, _)| summary.email.unwrap_or_default())
             .collect::<Vec<_>>();
         assert!(refreshed[0].starts_with("expired-"));
+    }
+
+    #[tokio::test]
+    async fn redeem_uses_probe_backup_when_selected_candidate_becomes_unavailable() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("acct-1", "access-1"),
+            parsed_account("acct-2", "access-2"),
+            parsed_account("acct-3", "access-3"),
+        ])
+        .await
+        .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "probe backup".to_string(),
+                total_count: 2,
+                accounts_per_code: 1,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let preparation = repo
+            .prepare_redeem_export(&[batch.codes[0].code.clone(), batch.codes[1].code.clone()])
+            .await
+            .unwrap();
+        assert_eq!(preparation.estimated_account_count, 2);
+        assert!(preparation.refresh_account_ids.is_empty());
+        assert_eq!(preparation.probe_account_ids.len(), 3);
+
+        repo.mark_account_status(
+            &preparation.probe_account_ids[0],
+            AccountStatus::QuotaExhausted,
+        )
+        .await
+        .unwrap();
+
+        let outcome = repo
+            .redeem_codes_for_export_with_verified_accounts(
+                &[batch.codes[0].code.clone(), batch.codes[1].code.clone()],
+                ExportFormat::Cpa,
+                Some(&preparation.probe_account_ids),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.successes.len(), 2);
+        assert!(outcome.failures.is_empty());
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|account| account.redeemed_at.is_some())
+                .count(),
+            2
+        );
+        let unavailable = page
+            .items
+            .iter()
+            .find(|account| account.id == preparation.probe_account_ids[0])
+            .unwrap();
+        assert_eq!(unavailable.status, AccountStatus::QuotaExhausted.as_str());
+        assert!(unavailable.redeemed_at.is_none());
     }
 
     #[tokio::test]
