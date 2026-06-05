@@ -211,6 +211,7 @@ fn router(state: AppState) -> Router {
             "/api/alalalateam/pools",
             get(list_account_pools).post(create_account_pool),
         )
+        .route("/api/alalalateam/account-pools", get(list_account_pools))
         .route(
             "/api/alalalateam/pools/{pool_id}",
             post(update_account_pool),
@@ -270,12 +271,21 @@ struct PoolScopedQuery {
     pool_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListPoolsQuery {
+    active_only: Option<bool>,
+}
+
 async fn list_account_pools(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListPoolsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
-    let items = state.repo.list_account_pools().await?;
+    let mut items = state.repo.list_account_pools().await?;
+    if query.active_only.unwrap_or(false) {
+        items.retain(|pool| pool.is_active);
+    }
     let default_pool_id = state.repo.default_account_pool_id().await?;
     Ok(Json(json!({
         "success": true,

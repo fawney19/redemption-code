@@ -9,6 +9,9 @@
         <button class="nav-button" :class="{ active: activeView === 'codes' }" @click="setActiveView('codes')">
           <Ticket :size="16" />兑换码
         </button>
+        <button class="nav-button" :class="{ active: activeView === 'pools' }" @click="setActiveView('pools')">
+          <Database :size="16" />号池
+        </button>
       </nav>
       <button class="nav-button danger" @click="handleLogout">
         <LogOut :size="16" />退出后台
@@ -36,7 +39,8 @@
 
       <Transition name="view" mode="out-in">
         <AccountsView v-if="activeView === 'accounts'" />
-        <CodesView v-else />
+        <CodesView v-else-if="activeView === 'codes'" />
+        <PoolsView v-else />
       </Transition>
     </main>
   </div>
@@ -49,13 +53,20 @@ import { useAdmin, logoutAdmin, refreshAdmin, changeSelectedPool, poolLabel, set
 import BrandMark from '../components/BrandMark.vue'
 import AccountsView from './AccountsView.vue'
 import CodesView from './CodesView.vue'
+import PoolsView from './PoolsView.vue'
 
 const { activeView, busy, accountPools, selectedPoolId, selectedPoolLabel } = useAdmin()
 
-const pageTitle = computed(() => activeView.value === 'accounts' ? 'Codex 账号池' : '兑换码管理')
-const pageSubtitle = computed(() => activeView.value === 'accounts'
-  ? `上传账号、刷新 AT、测活并按 CPA/Sub2API 格式导出 · ${selectedPoolLabel.value}`
-  : `生成独占兑换码，兑换后账号保留但不再分配 · ${selectedPoolLabel.value}`)
+const pageTitle = computed(() => {
+  if (activeView.value === 'accounts') return 'Codex 账号池'
+  if (activeView.value === 'codes') return '兑换码管理'
+  return '号池管理'
+})
+const pageSubtitle = computed(() => {
+  if (activeView.value === 'accounts') return `上传账号、刷新 AT、测活并按 CPA/Sub2API 格式导出 · ${selectedPoolLabel.value}`
+  if (activeView.value === 'codes') return `生成独占兑换码，兑换后账号保留但不再分配 · ${selectedPoolLabel.value}`
+  return '创建、启停和查看 Codex 号池，供后台与注册机上传时选择'
+})
 
 function handleLogout() {
   logoutAdmin()

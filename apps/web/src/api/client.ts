@@ -281,9 +281,12 @@ export const api = {
     if (params.pool_id) query.set('pool_id', params.pool_id)
     return request<AccountListPage>(`${MANAGEMENT_API_PREFIX}/accounts?${query}`, state)
   },
-  listPools(state: ApiState) {
+  listPools(state: ApiState, params: { active_only?: boolean } = {}) {
+    const query = new URLSearchParams()
+    if (params.active_only) query.set('active_only', 'true')
+    const suffix = query.toString() ? `?${query}` : ''
     return request<{ success: boolean; items: AccountPool[]; default_pool_id: string }>(
-      `${MANAGEMENT_API_PREFIX}/pools`,
+      `${MANAGEMENT_API_PREFIX}/pools${suffix}`,
       state,
     )
   },

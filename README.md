@@ -32,6 +32,7 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 
 - `GET /health`
 - `GET /api/alalalateam/pools`
+- `GET /api/alalalateam/account-pools`
 - `POST /api/alalalateam/pools`
 - `POST /api/alalalateam/pools/{pool_id}`
 - `POST /api/alalalateam/accounts/import`
@@ -49,7 +50,7 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 - `POST /api/redeem/after-sale`
 
 Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-admin-token`.
-Pool-aware admin endpoints accept `pool_id` as documented by shape: account list and batch list use query `pool_id`; import, probe, refresh, admin export, and batch creation use JSON `pool_id`. When `pool_id` is omitted, legacy behavior is preserved: account/batch lists are global, while new imports and new batches use the default pool.
+Pool-aware admin endpoints accept `pool_id` as documented by shape: account list and batch list use query `pool_id`; import, probe, refresh, admin export, and batch creation use JSON `pool_id`. When `pool_id` is omitted, legacy behavior is preserved: account/batch lists are global, while new imports and new batches use the default pool. Registrars can call `GET /api/alalalateam/account-pools?active_only=true` with the admin token to fetch selectable upload pools, then submit `POST /api/alalalateam/accounts/import` with body `{"pool_id":"<pool id>","credentials":"<auth json/text>"}`.
 By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. The API refuses known example admin tokens and empty/example encryption secrets unless `AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1` is explicitly set for isolated local development. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
 Cross-origin browser access is restricted by `AETHER_POOL_CORS_ORIGINS`, defaulting to local Vite origins.
 Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`.

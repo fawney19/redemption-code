@@ -480,55 +480,6 @@
             </Transition>
           </div>
         </div>
-
-        <div class="panel pool-panel">
-          <div class="panel-header">
-            <div>
-              <h2>号池管理</h2>
-              <p>按工作区和账号类型隔离库存</p>
-            </div>
-            <button class="button primary" :disabled="busy || !poolForm.name.trim()" @click="createPool">
-              <Plus :size="15" />新建
-            </button>
-          </div>
-          <div class="panel-body grid">
-            <div class="settings-grid">
-              <label class="field-label">
-                <span>名称</span>
-                <input v-model="poolForm.name" class="input" placeholder="例如 Team US Plus" />
-              </label>
-              <label class="field-label">
-                <span>工作区</span>
-                <input v-model="poolForm.workspace_label" class="input" placeholder="例如 workspace/team" />
-              </label>
-              <label class="field-label">
-                <span>类型</span>
-                <input v-model="poolForm.account_type" class="input" placeholder="codex" />
-              </label>
-            </div>
-            <label class="field-label full">
-              <span>备注</span>
-              <input v-model="poolForm.description" class="input" placeholder="可选" />
-            </label>
-            <div class="pool-list">
-              <div v-for="pool in accountPools" :key="pool.id" class="pool-row">
-                <div>
-                  <strong>{{ pool.name }}</strong>
-                  <span class="muted">{{ pool.workspace_label || '-' }} / {{ pool.account_type || 'codex' }}</span>
-                  <span class="muted mono">{{ pool.id }}</span>
-                </div>
-                <div class="toolbar compact-toolbar">
-                  <span class="badge" :class="pool.is_active ? 'available' : 'disabled'">
-                    {{ pool.is_active ? '启用' : '停用' }}
-                  </span>
-                  <button class="button ghost tiny" :disabled="busy || pool.is_default" @click="togglePoolActive(pool)">
-                    {{ pool.is_active ? '停用' : '启用' }}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   </section>
@@ -536,7 +487,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Activity, Database, Download, Globe, Play, Plus, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
+import { Activity, Database, Download, Globe, Play, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
 import {
   useAdmin,
   searchAccounts,
@@ -556,8 +507,6 @@ import {
   testCpaConnection,
   scanCpa401,
   runAutoProbeNow,
-  createPool,
-  togglePoolActive,
   toggleAll,
   poolLabel,
   statusLabel,
@@ -573,7 +522,6 @@ const {
   accounts,
   selectedIds,
   importText,
-  accountPools,
   activePools,
   importPoolId,
   adminResult,
@@ -590,7 +538,6 @@ const {
   autoProbeForm,
   autoProbeIntervalMinutes,
   redeemRateLimitForm,
-  poolForm,
   filters,
   accountPagination,
   accountStats,

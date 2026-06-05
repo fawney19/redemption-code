@@ -628,6 +628,21 @@ button:disabled { cursor: not-allowed; }
   gap: 18px;
 }
 
+.pools-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.82fr) minmax(0, 1.18fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.pools-list-panel {
+  grid-row: span 2;
+}
+
+.pools-api-panel {
+  align-self: start;
+}
+
 /* === Stats === */
 .stats {
   display: grid;
@@ -665,6 +680,15 @@ button:disabled { cursor: not-allowed; }
   font-weight: 400;
   line-height: 1;
   letter-spacing: -0.5px;
+}
+
+.stat strong.stat-label-value {
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 .dark-stat {
@@ -900,6 +924,40 @@ button:disabled { cursor: not-allowed; }
   display: grid;
   gap: 2px;
   min-width: 0;
+}
+
+.pool-empty {
+  min-height: 92px;
+  border: 1px dashed var(--hairline);
+  border-radius: var(--rounded-md);
+  background: rgba(250, 249, 245, 0.56);
+}
+
+.endpoint-list {
+  display: grid;
+  gap: 8px;
+}
+
+.endpoint-list > div {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--rounded-md);
+  background: rgba(250, 249, 245, 0.62);
+}
+
+.endpoint-list span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.endpoint-list strong {
+  color: var(--body-strong);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .button.tiny {
@@ -1684,8 +1742,13 @@ button:disabled { cursor: not-allowed; }
   }
 
   .admin-grid,
-  .codes-grid {
+  .codes-grid,
+  .pools-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pools-list-panel {
+    grid-row: auto;
   }
 }
 

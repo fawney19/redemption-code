@@ -21,7 +21,7 @@ const adminTokenStorageKey = 'aether-pool.admin-token'
 const activeViewStorageKey = 'aether-pool.admin-active-view'
 const managementEntryPath = '/alalalateam'
 localStorage.removeItem(adminTokenStorageKey)
-type AdminView = 'accounts' | 'codes'
+type AdminView = 'accounts' | 'codes' | 'pools'
 
 const adminToken = ref(sessionStorage.getItem(adminTokenStorageKey) || '')
 const adminTokenDraft = ref('')
@@ -387,6 +387,9 @@ export async function loadRedeemRateLimitSettings() {
 export async function refreshAdmin() {
   await withBusy(async () => {
     await loadPools()
+    if (activeView.value === 'pools') {
+      return
+    }
     if (activeView.value === 'codes') {
       await loadBatches()
       if (selectedBatchId.value) await fetchCodes(selectedBatchId.value)
@@ -786,7 +789,7 @@ function initialAdminView(): AdminView {
 
 function viewFromValue(value?: string | null): AdminView | null {
   const normalized = (value || '').replace(/^#\/?/, '').trim().toLowerCase()
-  if (normalized === 'accounts' || normalized === 'codes') return normalized
+  if (normalized === 'accounts' || normalized === 'codes' || normalized === 'pools') return normalized
   return null
 }
 
@@ -798,7 +801,7 @@ watch(activeView, (view) => {
   sessionStorage.setItem(activeViewStorageKey, view)
   if (!isManagementEntryPath()) return
 
-  const nextHash = view === 'codes' ? '#codes' : ''
+  const nextHash = view === 'accounts' ? '' : `#${view}`
   if (window.location.hash === nextHash) return
 
   const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`
