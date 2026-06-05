@@ -11,8 +11,8 @@ use account_pool_core::{
     OPENAI_OAUTH_REFRESH_SCOPE,
 };
 use account_pool_data::{
-    AccountListQuery, AccountPoolRepository, AccountSummary, AutoProbeSettings,
-    CreateRedeemBatchInput, DataError, RedeemRateLimitSettings,
+    AccountListQuery, AccountPoolRepository, AccountPoolUpsertInput, AccountSummary,
+    AutoProbeSettings, CreateRedeemBatchInput, DataError, RedeemRateLimitSettings,
 };
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -207,6 +207,14 @@ fn cors_layer() -> CorsLayer {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/api/alalalateam/pools",
+            get(list_account_pools).post(create_account_pool),
+        )
+        .route(
+            "/api/alalalateam/pools/{pool_id}",
+            post(update_account_pool),
+        )
         .route("/api/alalalateam/accounts/import", post(import_accounts))
         .route("/api/alalalateam/accounts", get(list_accounts))
         .route("/api/alalalateam/accounts/probe", post(probe_accounts))
@@ -258,8 +266,55 @@ async fn health() -> Json<Value> {
 }
 
 #[derive(Debug, Deserialize)]
+struct PoolScopedQuery {
+    pool_id: Option<String>,
+}
+
+async fn list_account_pools(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let items = state.repo.list_account_pools().await?;
+    let default_pool_id = state.repo.default_account_pool_id().await?;
+    Ok(Json(json!({
+        "success": true,
+        "items": items,
+        "default_pool_id": default_pool_id,
+    })))
+}
+
+async fn create_account_pool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AccountPoolUpsertInput>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let pool = state.repo.create_account_pool(payload).await?;
+    Ok(Json(json!({
+        "success": true,
+        "pool": pool,
+    })))
+}
+
+async fn update_account_pool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(pool_id): Path<String>,
+    Json(payload): Json<AccountPoolUpsertInput>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let pool = state.repo.update_account_pool(&pool_id, payload).await?;
+    Ok(Json(json!({
+        "success": true,
+        "pool": pool,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
 struct ImportAccountsRequest {
     credentials: String,
+    pool_id: Option<String>,
 }
 
 async fn import_accounts(
@@ -269,7 +324,10 @@ async fn import_accounts(
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
     let parsed = parse_codex_accounts(&payload.credentials);
-    let outcome = state.repo.import_accounts(&parsed.accounts).await?;
+    let outcome = state
+        .repo
+        .import_accounts_into_pool(&parsed.accounts, payload.pool_id.as_deref())
+        .await?;
     Ok(Json(json!({
         "success": true,
         "imported": outcome.imported,
@@ -291,6 +349,7 @@ async fn list_accounts(
 #[derive(Debug, Deserialize)]
 struct AccountIdRequest {
     account_ids: Option<Vec<String>>,
+    pool_id: Option<String>,
 }
 
 async fn refresh_accounts(
@@ -299,7 +358,13 @@ async fn refresh_accounts(
     Json(payload): Json<AccountIdRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
-    let outcome = refresh_expired_accounts(&state, payload.account_ids.as_deref(), true).await?;
+    let outcome = refresh_expired_accounts(
+        &state,
+        payload.account_ids.as_deref(),
+        payload.pool_id.as_deref(),
+        true,
+    )
+    .await?;
     Ok(Json(json!({
         "success": true,
         "refreshed": outcome.refreshed,
@@ -349,6 +414,7 @@ async fn probe_accounts(
             max_accounts: None,
             concurrency: settings.concurrency as usize,
             include_redeemed: payload.account_ids.is_some(),
+            pool_id: pool_scope_for_ids(payload.account_ids.as_deref(), payload.pool_id.as_deref()),
         },
     )
     .await?;
@@ -637,6 +703,7 @@ async fn run_auto_probe_once(
             max_accounts: Some(settings.max_accounts_per_run as usize),
             concurrency: settings.concurrency as usize,
             include_redeemed: false,
+            pool_id: None,
         },
     )
     .await
@@ -677,6 +744,7 @@ async fn run_auto_probe_once(
 struct ExportAccountsRequest {
     account_ids: Option<Vec<String>>,
     include_redeemed: Option<bool>,
+    pool_id: Option<String>,
     format: String,
 }
 
@@ -692,11 +760,22 @@ async fn export_admin_accounts(
         .map_err(|_| ApiError::bad_request("unsupported export format"))?;
     let include_redeemed = payload.include_redeemed.unwrap_or(false);
     if !include_redeemed {
-        let _ = refresh_expired_accounts(&state, payload.account_ids.as_deref(), false).await?;
+        let _ = refresh_expired_accounts(
+            &state,
+            payload.account_ids.as_deref(),
+            payload.pool_id.as_deref(),
+            false,
+        )
+        .await?;
     }
     let document = state
         .repo
-        .export_admin_accounts(payload.account_ids.as_deref(), include_redeemed, format)
+        .export_admin_accounts_scoped(
+            payload.account_ids.as_deref(),
+            include_redeemed,
+            format,
+            payload.pool_id.as_deref(),
+        )
         .await?;
     let download = export_download(format, &document, "aether-pool-admin");
     Ok(Json(json!({
@@ -707,10 +786,21 @@ async fn export_admin_accounts(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateRedeemBatchRequest {
+    pool_id: Option<String>,
+    name: String,
+    total_count: usize,
+    accounts_per_code: usize,
+    after_sale_limit: Option<usize>,
+    expires_at: Option<u64>,
+    plan_filter: Option<Vec<String>>,
+}
+
 async fn create_redeem_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<CreateRedeemBatchInput>,
+    Json(payload): Json<CreateRedeemBatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
     if payload.name.trim().is_empty() {
@@ -725,7 +815,18 @@ async fn create_redeem_batch(
     if payload.after_sale_limit.unwrap_or(1) > 10 {
         return Err(ApiError::bad_request("after_sale_limit must be 0..=10"));
     }
-    let outcome = state.repo.create_redeem_batch(payload).await?;
+    let input = CreateRedeemBatchInput {
+        name: payload.name,
+        total_count: payload.total_count,
+        accounts_per_code: payload.accounts_per_code,
+        after_sale_limit: payload.after_sale_limit,
+        expires_at: payload.expires_at,
+        plan_filter: payload.plan_filter,
+    };
+    let outcome = state
+        .repo
+        .create_redeem_batch_in_pool(input, payload.pool_id.as_deref())
+        .await?;
     Ok(Json(json!({
         "success": true,
         "batch_id": outcome.batch_id,
@@ -736,9 +837,13 @@ async fn create_redeem_batch(
 async fn list_redeem_batches(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<PoolScopedQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
-    let items = state.repo.list_redeem_batches().await?;
+    let items = state
+        .repo
+        .list_redeem_batches_scoped(query.pool_id.as_deref())
+        .await?;
     Ok(Json(json!({ "items": items })))
 }
 
@@ -780,7 +885,8 @@ async fn redeem_export(
     validate_redeem_export_limits(payload.codes.len(), preparation.estimated_account_count)?;
     if !preparation.refresh_account_ids.is_empty() {
         let _ =
-            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), true).await?;
+            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), None, true)
+                .await?;
     }
     if !preparation.probe_account_ids.is_empty() {
         let settings = state.repo.get_auto_probe_settings().await?;
@@ -791,6 +897,7 @@ async fn redeem_export(
                 max_accounts: None,
                 concurrency: settings.concurrency as usize,
                 include_redeemed: false,
+                pool_id: None,
             },
         )
         .await?;
@@ -832,7 +939,8 @@ async fn redeem_after_sale_export(
     validate_redeem_export_limits(payload.codes.len(), preparation.estimated_account_count)?;
     if !preparation.refresh_account_ids.is_empty() {
         let _ =
-            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), true).await?;
+            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), None, true)
+                .await?;
     }
     if !preparation.probe_account_ids.is_empty() {
         let settings = state.repo.get_auto_probe_settings().await?;
@@ -843,6 +951,7 @@ async fn redeem_after_sale_export(
                 max_accounts: None,
                 concurrency: settings.concurrency as usize,
                 include_redeemed: true,
+                pool_id: None,
             },
         )
         .await?;
@@ -941,6 +1050,7 @@ async fn auto_probe_worker_tick(state: &AppState) -> Result<(), ApiError> {
             max_accounts: Some(settings.max_accounts_per_run as usize),
             concurrency: settings.concurrency as usize,
             include_redeemed: false,
+            pool_id: None,
         },
     )
     .await
@@ -969,11 +1079,12 @@ async fn auto_probe_worker_tick(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProbeRunOptions {
     max_accounts: Option<usize>,
     concurrency: usize,
     include_redeemed: bool,
+    pool_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -995,10 +1106,16 @@ async fn run_probe_accounts(
                 .load_auth_files_for_ids(account_ids, true)
                 .await?
         } else {
-            state.repo.load_unredeemed_auth_files(None).await?
+            state
+                .repo
+                .load_unredeemed_auth_files_scoped(None, options.pool_id.as_deref())
+                .await?
         }
     } else {
-        state.repo.load_unredeemed_auth_files(account_ids).await?
+        state
+            .repo
+            .load_unredeemed_auth_files_scoped(account_ids, options.pool_id.as_deref())
+            .await?
     };
     if let Some(max_accounts) = options.max_accounts {
         accounts.truncate(max_accounts);
@@ -1035,6 +1152,16 @@ async fn run_probe_accounts(
         collect_probe_result(&mut join_set, &mut summary).await;
     }
     Ok(summary)
+}
+
+fn pool_scope_for_ids(account_ids: Option<&[String]>, pool_id: Option<&str>) -> Option<String> {
+    if account_ids.is_some() {
+        return None;
+    }
+    pool_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn collect_probe_result(
@@ -2569,10 +2696,14 @@ struct RefreshOutcome {
 async fn refresh_expired_accounts(
     state: &AppState,
     account_ids: Option<&[String]>,
+    pool_id: Option<&str>,
     force: bool,
 ) -> Result<RefreshOutcome, ApiError> {
     let now = unix_now_secs();
-    let accounts = state.repo.load_unredeemed_auth_files(account_ids).await?;
+    let accounts = state
+        .repo
+        .load_unredeemed_auth_files_scoped(account_ids, pool_id)
+        .await?;
     let settings = state.repo.get_auto_probe_settings().await?;
     let (refresh_http, refresh_proxy) = resolve_probe_http_client(state, &settings).await?;
     let mut outcome = RefreshOutcome::default();
@@ -3380,6 +3511,9 @@ impl ApiError {
 
 impl From<DataError> for ApiError {
     fn from(error: DataError) -> Self {
+        if let DataError::InvalidInput(message) = error {
+            return Self::bad_request(message);
+        }
         tracing::error!(error = %error, "data layer error");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     }

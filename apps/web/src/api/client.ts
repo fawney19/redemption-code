@@ -1,7 +1,29 @@
 export type ExportFormat = 'cpa' | 'sub2api'
 
+export interface AccountPool {
+  id: string
+  name: string
+  workspace_label?: string | null
+  account_type?: string | null
+  description?: string | null
+  is_default: boolean
+  is_active: boolean
+  created_at: number
+  updated_at: number
+}
+
+export interface AccountPoolPayload {
+  name: string
+  workspace_label?: string | null
+  account_type?: string | null
+  description?: string | null
+  is_active?: boolean | null
+}
+
 export interface AccountSummary {
   id: string
+  pool_id: string
+  pool_name?: string | null
   email?: string | null
   name?: string | null
   account_id?: string | null
@@ -38,6 +60,8 @@ export interface AccountPoolStats {
 
 export interface RedeemBatch {
   id: string
+  pool_id: string
+  pool_name?: string | null
   name: string
   status: string
   total_count: number
@@ -51,6 +75,8 @@ export interface RedeemBatch {
 
 export interface RedeemCodeAccount {
   id: string
+  pool_id: string
+  pool_name?: string | null
   email?: string | null
   name?: string | null
   account_id?: string | null
@@ -238,6 +264,7 @@ async function request<T>(
 
 export const api = {
   listAccounts(state: ApiState, params: {
+    pool_id?: string
     search?: string
     status?: string
     redeemed?: string
@@ -251,26 +278,45 @@ export const api = {
     if (params.search) query.set('search', params.search)
     if (params.status) query.set('status', params.status)
     if (params.redeemed) query.set('redeemed', params.redeemed)
+    if (params.pool_id) query.set('pool_id', params.pool_id)
     return request<AccountListPage>(`${MANAGEMENT_API_PREFIX}/accounts?${query}`, state)
   },
-  importAccounts(state: ApiState, credentials: string) {
+  listPools(state: ApiState) {
+    return request<{ success: boolean; items: AccountPool[]; default_pool_id: string }>(
+      `${MANAGEMENT_API_PREFIX}/pools`,
+      state,
+    )
+  },
+  createPool(state: ApiState, payload: AccountPoolPayload) {
+    return request<{ success: boolean; pool: AccountPool }>(`${MANAGEMENT_API_PREFIX}/pools`, state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  updatePool(state: ApiState, poolId: string, payload: AccountPoolPayload) {
+    return request<{ success: boolean; pool: AccountPool }>(`${MANAGEMENT_API_PREFIX}/pools/${poolId}`, state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  importAccounts(state: ApiState, credentials: string, poolId?: string) {
     return request<{ imported: number; updated: number; parse_errors: string[] }>(
       `${MANAGEMENT_API_PREFIX}/accounts/import`,
       state,
-      { method: 'POST', body: JSON.stringify({ credentials }) },
+      { method: 'POST', body: JSON.stringify({ credentials, pool_id: poolId || undefined }) },
     )
   },
-  probeAccounts(state: ApiState, accountIds?: string[]) {
+  probeAccounts(state: ApiState, accountIds?: string[], poolId?: string) {
     return request<{ results: unknown[] }>(`${MANAGEMENT_API_PREFIX}/accounts/probe`, state, {
       method: 'POST',
-      body: JSON.stringify({ account_ids: accountIds }),
+      body: JSON.stringify({ account_ids: accountIds, pool_id: poolId || undefined }),
     })
   },
-  refreshAccounts(state: ApiState, accountIds?: string[]) {
+  refreshAccounts(state: ApiState, accountIds?: string[], poolId?: string) {
     return request<{ refreshed: number; skipped: number; failed: number; results: unknown[] }>(
       `${MANAGEMENT_API_PREFIX}/accounts/refresh`,
       state,
-      { method: 'POST', body: JSON.stringify({ account_ids: accountIds }) },
+      { method: 'POST', body: JSON.stringify({ account_ids: accountIds, pool_id: poolId || undefined }) },
     )
   },
   deleteAccounts(state: ApiState, accountIds: string[]) {
@@ -279,16 +325,20 @@ export const api = {
       body: JSON.stringify({ account_ids: accountIds }),
     })
   },
-  exportAccounts(state: ApiState, payload: { account_ids?: string[]; include_redeemed?: boolean; format: ExportFormat }) {
+  exportAccounts(state: ApiState, payload: { account_ids?: string[]; include_redeemed?: boolean; pool_id?: string; format: ExportFormat }) {
     return request<ExportResponse>(`${MANAGEMENT_API_PREFIX}/accounts/export`, state, {
       method: 'POST',
       body: JSON.stringify(payload),
     })
   },
-  listBatches(state: ApiState) {
-    return request<{ items: RedeemBatch[] }>(`${MANAGEMENT_API_PREFIX}/redeem-code-batches`, state)
+  listBatches(state: ApiState, poolId?: string) {
+    const query = new URLSearchParams()
+    if (poolId) query.set('pool_id', poolId)
+    const suffix = query.toString() ? `?${query}` : ''
+    return request<{ items: RedeemBatch[] }>(`${MANAGEMENT_API_PREFIX}/redeem-code-batches${suffix}`, state)
   },
   createBatch(state: ApiState, payload: {
+    pool_id?: string
     name: string
     total_count: number
     accounts_per_code: number

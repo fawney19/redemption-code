@@ -1,5 +1,29 @@
+CREATE TABLE IF NOT EXISTS account_pools (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  workspace_label TEXT,
+  account_type TEXT,
+  description TEXT,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_pools_default ON account_pools(is_default) WHERE is_default = 1;
+CREATE INDEX IF NOT EXISTS idx_account_pools_active ON account_pools(is_active, updated_at);
+
+INSERT OR IGNORE INTO account_pools (
+  id, name, workspace_label, account_type, description, is_default, is_active, created_at, updated_at
+) VALUES (
+  'default', '默认 Codex 号池', '默认工作区', 'codex', '旧账号和未指定池的默认归属', 1, 1,
+  CAST(strftime('%s', 'now') AS INTEGER),
+  CAST(strftime('%s', 'now') AS INTEGER)
+);
+
 CREATE TABLE IF NOT EXISTS accounts (
   id TEXT PRIMARY KEY,
+  pool_id TEXT NOT NULL DEFAULT 'default',
   email TEXT,
   name TEXT,
   account_id TEXT,
@@ -17,7 +41,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   redemption_id TEXT,
   redeemed_at INTEGER,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(pool_id) REFERENCES account_pools(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status, updated_at);
@@ -49,6 +74,7 @@ CREATE TABLE IF NOT EXISTS account_exports (
 
 CREATE TABLE IF NOT EXISTS redeem_code_batches (
   id TEXT PRIMARY KEY,
+  pool_id TEXT NOT NULL DEFAULT 'default',
   name TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
   total_count INTEGER NOT NULL,
@@ -58,7 +84,8 @@ CREATE TABLE IF NOT EXISTS redeem_code_batches (
   plan_filter_json TEXT,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(pool_id) REFERENCES account_pools(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_redeem_code_batches_status ON redeem_code_batches(status, created_at);

@@ -64,6 +64,7 @@
                 <tr>
                   <th><input type="checkbox" :checked="allSelected" @change="toggleAll" /></th>
                   <th>账号</th>
+                  <th>号池</th>
                   <th>状态</th>
                   <th>绑定兑换码</th>
                   <th>兑换时间</th>
@@ -80,6 +81,10 @@
                   <td>
                     <strong>{{ account.email || account.name || 'Codex Account' }}</strong>
                     <div class="muted mono">{{ account.account_id || account.id }}</div>
+                  </td>
+                  <td>
+                    <span class="badge available">{{ account.pool_name || poolLabel(account.pool_id) }}</span>
+                    <div class="muted mono">{{ account.pool_id }}</div>
                   </td>
                   <td><span class="badge" :class="statusBadgeClass(account.status)">{{ statusLabel(account.status) }}</span></td>
                   <td>
@@ -130,7 +135,7 @@
                   </td>
                 </tr>
                 <tr v-if="!accounts.length">
-                  <td colspan="10" class="empty-row">
+                  <td colspan="11" class="empty-row">
                     <Database :size="20" />
                     <span>暂无账号数据</span>
                   </td>
@@ -460,11 +465,68 @@
               <Upload :size="15" />导入
             </button>
           </div>
-          <div class="panel-body">
+          <div class="panel-body grid">
+            <label class="field-label full">
+              <span>导入到号池</span>
+              <select v-model="importPoolId" class="select">
+                <option v-for="pool in activePools" :key="pool.id" :value="pool.id">
+                  {{ poolLabel(pool.id) }}
+                </option>
+              </select>
+            </label>
             <textarea v-model="importText" class="textarea" spellcheck="false" placeholder="粘贴 CPA auth JSON / auth 数组 / Sub2API accounts JSON / Codex token JSONL"></textarea>
             <Transition name="fade">
               <pre v-if="adminResult" class="result mono admin-result">{{ adminResult }}</pre>
             </Transition>
+          </div>
+        </div>
+
+        <div class="panel pool-panel">
+          <div class="panel-header">
+            <div>
+              <h2>号池管理</h2>
+              <p>按工作区和账号类型隔离库存</p>
+            </div>
+            <button class="button primary" :disabled="busy || !poolForm.name.trim()" @click="createPool">
+              <Plus :size="15" />新建
+            </button>
+          </div>
+          <div class="panel-body grid">
+            <div class="settings-grid">
+              <label class="field-label">
+                <span>名称</span>
+                <input v-model="poolForm.name" class="input" placeholder="例如 Team US Plus" />
+              </label>
+              <label class="field-label">
+                <span>工作区</span>
+                <input v-model="poolForm.workspace_label" class="input" placeholder="例如 workspace/team" />
+              </label>
+              <label class="field-label">
+                <span>类型</span>
+                <input v-model="poolForm.account_type" class="input" placeholder="codex" />
+              </label>
+            </div>
+            <label class="field-label full">
+              <span>备注</span>
+              <input v-model="poolForm.description" class="input" placeholder="可选" />
+            </label>
+            <div class="pool-list">
+              <div v-for="pool in accountPools" :key="pool.id" class="pool-row">
+                <div>
+                  <strong>{{ pool.name }}</strong>
+                  <span class="muted">{{ pool.workspace_label || '-' }} / {{ pool.account_type || 'codex' }}</span>
+                  <span class="muted mono">{{ pool.id }}</span>
+                </div>
+                <div class="toolbar compact-toolbar">
+                  <span class="badge" :class="pool.is_active ? 'available' : 'disabled'">
+                    {{ pool.is_active ? '启用' : '停用' }}
+                  </span>
+                  <button class="button ghost tiny" :disabled="busy || pool.is_default" @click="togglePoolActive(pool)">
+                    {{ pool.is_active ? '停用' : '启用' }}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -474,7 +536,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Activity, Database, Download, Globe, Play, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
+import { Activity, Database, Download, Globe, Play, Plus, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
 import {
   useAdmin,
   searchAccounts,
@@ -494,7 +556,10 @@ import {
   testCpaConnection,
   scanCpa401,
   runAutoProbeNow,
+  createPool,
+  togglePoolActive,
   toggleAll,
+  poolLabel,
   statusLabel,
   statusBadgeClass,
   canDeleteAccount,
@@ -508,6 +573,9 @@ const {
   accounts,
   selectedIds,
   importText,
+  accountPools,
+  activePools,
+  importPoolId,
   adminResult,
   adminExportFormat,
   autoProbeSettings,
@@ -522,6 +590,7 @@ const {
   autoProbeForm,
   autoProbeIntervalMinutes,
   redeemRateLimitForm,
+  poolForm,
   filters,
   accountPagination,
   accountStats,

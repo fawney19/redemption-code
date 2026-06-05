@@ -22,6 +22,12 @@
           <p>{{ pageSubtitle }}</p>
         </div>
         <div class="token-box">
+          <select v-model="selectedPoolId" class="select pool-select" :disabled="busy" @change="changeSelectedPool">
+            <option value="">全部号池</option>
+            <option v-for="pool in accountPools" :key="pool.id" :value="pool.id">
+              {{ poolLabel(pool.id) }}{{ pool.is_active ? '' : '（停用）' }}
+            </option>
+          </select>
           <button class="button" :disabled="busy" @click="refreshAdmin">
             <RefreshCw :size="15" :class="{ spinning: busy }" />刷新
           </button>
@@ -39,17 +45,17 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Database, LogOut, RefreshCw, Ticket } from 'lucide-vue-next'
-import { useAdmin, logoutAdmin, refreshAdmin } from '../composables/useAdmin'
+import { useAdmin, logoutAdmin, refreshAdmin, changeSelectedPool, poolLabel } from '../composables/useAdmin'
 import BrandMark from '../components/BrandMark.vue'
 import AccountsView from './AccountsView.vue'
 import CodesView from './CodesView.vue'
 
-const { activeView, busy } = useAdmin()
+const { activeView, busy, accountPools, selectedPoolId, selectedPoolLabel } = useAdmin()
 
 const pageTitle = computed(() => activeView.value === 'accounts' ? 'Codex 账号池' : '兑换码管理')
 const pageSubtitle = computed(() => activeView.value === 'accounts'
-  ? '上传账号、刷新 AT、测活并按 CPA/Sub2API 格式导出'
-  : '生成独占兑换码，兑换后账号保留但不再分配')
+  ? `上传账号、刷新 AT、测活并按 CPA/Sub2API 格式导出 · ${selectedPoolLabel.value}`
+  : `生成独占兑换码，兑换后账号保留但不再分配 · ${selectedPoolLabel.value}`)
 
 function handleLogout() {
   logoutAdmin()

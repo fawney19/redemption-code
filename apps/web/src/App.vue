@@ -9,6 +9,7 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import {
   useAdmin,
+  loadPools,
   loadAccounts,
   loadBatches,
   loadAutoProbeSettings,
@@ -36,12 +37,16 @@ onMounted(() => {
   window.addEventListener('popstate', syncRoute)
   if (isAdminRoute.value && adminAuthenticated.value) {
     adminTokenDraft.value = adminToken.value
-    loadAccounts().catch((e) => {
-      adminResult.value = e instanceof Error ? e.message : String(e)
-    })
-    loadBatches().catch(() => undefined)
-    loadAutoProbeSettings().catch(() => undefined)
-    loadRedeemRateLimitSettings().catch(() => undefined)
+    loadPools()
+      .then(() => Promise.all([
+        loadAccounts(),
+        loadBatches(),
+        loadAutoProbeSettings(),
+        loadRedeemRateLimitSettings(),
+      ]))
+      .catch((e) => {
+        adminResult.value = e instanceof Error ? e.message : String(e)
+      })
   }
 })
 

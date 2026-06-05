@@ -1,6 +1,8 @@
 import { computed, reactive, ref } from 'vue'
 import {
   api,
+  type AccountPool,
+  type AccountPoolPayload,
   type AccountPoolStats,
   type AccountSummary,
   type AutoProbeSettings,
@@ -24,6 +26,10 @@ const busy = ref(false)
 const accounts = ref<AccountSummary[]>([])
 const selectedIds = ref<string[]>([])
 const importText = ref('')
+const accountPools = ref<AccountPool[]>([])
+const defaultPoolId = ref('')
+const selectedPoolId = ref('')
+const importPoolId = ref('')
 const adminResult = ref('')
 const adminExportFormat = ref<ExportFormat>('cpa')
 const batches = ref<RedeemBatch[]>([])
@@ -53,6 +59,7 @@ const accountStats = reactive<AccountPoolStats>({
   attention: 0,
 })
 const batchForm = reactive({
+  pool_id: '',
   name: '',
   total_count: 10,
   accounts_per_code: 1,
@@ -82,6 +89,12 @@ const redeemRateLimitForm = reactive({
   max_requests: 30,
   whitelist_text: '',
 })
+const poolForm = reactive({
+  name: '',
+  workspace_label: '',
+  account_type: 'codex',
+  description: '',
+})
 const redeemedAccountDeletableStatuses = new Set(['at_expired', 'refresh_failed', 'auth_invalid', 'forbidden'])
 
 const adminAuthenticated = computed(() => adminToken.value.trim().length > 0)
@@ -96,6 +109,14 @@ const accountCurrentPage = computed(() => accountPagination.total ? Math.floor(a
 const accountTotalPages = computed(() => Math.max(1, Math.ceil(accountPagination.total / accountPagination.limit)))
 const canPrevAccountsPage = computed(() => accountPagination.offset > 0)
 const canNextAccountsPage = computed(() => accountPagination.offset + accountPagination.limit < accountPagination.total)
+const activePools = computed(() => accountPools.value.filter((pool) => pool.is_active))
+const selectedPool = computed(() => accountPools.value.find((pool) => pool.id === selectedPoolId.value) || null)
+const operationPoolId = computed(() => {
+  if (selectedPool.value?.is_active) return selectedPool.value.id
+  const defaultPool = accountPools.value.find((pool) => pool.id === defaultPoolId.value && pool.is_active)
+  return defaultPool?.id || activePools.value[0]?.id || ''
+})
+const selectedPoolLabel = computed(() => selectedPool.value ? poolLabel(selectedPool.value.id) : '全部号池')
 const proxyTestDisabled = computed(() => {
   if (busy.value) return true
   if (!autoProbeForm.proxy_enabled) return false
@@ -163,6 +184,13 @@ export function useAdmin() {
     accounts,
     selectedIds,
     importText,
+    accountPools,
+    activePools,
+    defaultPoolId,
+    selectedPoolId,
+    selectedPool,
+    selectedPoolLabel,
+    importPoolId,
     adminResult,
     adminExportFormat,
     batches,
@@ -181,6 +209,7 @@ export function useAdmin() {
     autoProbeForm,
     autoProbeIntervalMinutes,
     redeemRateLimitForm,
+    poolForm,
     activeView,
     filters,
     accountPagination,
@@ -205,6 +234,7 @@ export function useAdmin() {
     selectedBatch,
     redeemStats,
     selectedBatchStats,
+    operationPoolId,
   }
 }
 
@@ -226,6 +256,7 @@ export async function loginAdmin() {
     adminResult.value = ''
     adminToken.value = adminTokenDraft.value.trim()
     sessionStorage.setItem(adminTokenStorageKey, adminToken.value)
+    await loadPools()
     await loadAccounts()
     await loadBatches()
     await loadAutoProbeSettings()
@@ -237,6 +268,10 @@ export function logoutAdmin() {
   adminToken.value = ''
   adminTokenDraft.value = ''
   accounts.value = []
+  accountPools.value = []
+  defaultPoolId.value = ''
+  selectedPoolId.value = ''
+  importPoolId.value = ''
   batches.value = []
   batchCodes.value = []
   selectedBatchId.value = ''
@@ -257,9 +292,34 @@ export function logoutAdmin() {
   sessionStorage.removeItem(adminTokenStorageKey)
 }
 
+export async function loadPools() {
+  const result = await api.listPools(apiState.value)
+  accountPools.value = result.items
+  defaultPoolId.value = result.default_pool_id || result.items.find((pool) => pool.is_default)?.id || result.items[0]?.id || ''
+  if (selectedPoolId.value && !accountPools.value.some((pool) => pool.id === selectedPoolId.value)) {
+    selectedPoolId.value = ''
+  }
+  if (!importPoolId.value || !accountPools.value.some((pool) => pool.id === importPoolId.value && pool.is_active)) {
+    importPoolId.value = operationPoolId.value
+  }
+  if (!batchForm.pool_id || !accountPools.value.some((pool) => pool.id === batchForm.pool_id && pool.is_active)) {
+    batchForm.pool_id = operationPoolId.value
+  }
+}
+
+export async function changeSelectedPool() {
+  accountPagination.offset = 0
+  selectedIds.value = []
+  importPoolId.value = operationPoolId.value
+  batchForm.pool_id = operationPoolId.value
+  await loadAccounts()
+  await loadBatches()
+}
+
 export async function loadAccounts() {
   const page = await api.listAccounts(apiState.value, {
     ...filters,
+    pool_id: selectedPoolId.value || undefined,
     limit: accountPagination.limit,
     offset: accountPagination.offset,
   })
@@ -299,8 +359,12 @@ export async function changeAccountsPageSize() {
 }
 
 export async function loadBatches() {
-  const result = await api.listBatches(apiState.value)
+  const result = await api.listBatches(apiState.value, selectedPoolId.value || undefined)
   batches.value = result.items
+  if (selectedBatchId.value && !batches.value.some((batch) => batch.id === selectedBatchId.value)) {
+    selectedBatchId.value = ''
+    batchCodes.value = []
+  }
 }
 
 export async function loadAutoProbeSettings() {
@@ -315,6 +379,7 @@ export async function loadRedeemRateLimitSettings() {
 
 export async function refreshAdmin() {
   await withBusy(async () => {
+    await loadPools()
     if (activeView.value === 'codes') {
       await loadBatches()
       if (selectedBatchId.value) await fetchCodes(selectedBatchId.value)
@@ -328,7 +393,7 @@ export async function refreshAdmin() {
 
 export async function importAccounts() {
   await withBusy(async () => {
-    const result = await api.importAccounts(apiState.value, importText.value)
+    const result = await api.importAccounts(apiState.value, importText.value, importPoolId.value || operationPoolId.value)
     adminResult.value = JSON.stringify(result, null, 2)
     importText.value = ''
     await loadAccounts()
@@ -338,7 +403,7 @@ export async function importAccounts() {
 export async function probeSelected() {
   await withBusy(async () => {
     const ids = selectedIds.value.length ? selectedIds.value : undefined
-    const result = await api.probeAccounts(apiState.value, ids)
+    const result = await api.probeAccounts(apiState.value, ids, ids ? undefined : selectedPoolId.value || undefined)
     adminResult.value = JSON.stringify(result, null, 2)
     await loadAccounts()
   })
@@ -355,7 +420,7 @@ export async function probeAccount(accountId: string) {
 export async function refreshSelected() {
   await withBusy(async () => {
     const ids = selectedIds.value.length ? selectedIds.value : undefined
-    const result = await api.refreshAccounts(apiState.value, ids)
+    const result = await api.refreshAccounts(apiState.value, ids, ids ? undefined : selectedPoolId.value || undefined)
     adminResult.value = JSON.stringify(result, null, 2)
     await loadAccounts()
   })
@@ -504,6 +569,7 @@ export async function exportSelected() {
     const result = await api.exportAccounts(apiState.value, {
       account_ids: selectedIds.value.length ? selectedIds.value : undefined,
       include_redeemed: false,
+      pool_id: selectedIds.value.length ? undefined : selectedPoolId.value || undefined,
       format: adminExportFormat.value,
     })
     adminResult.value = JSON.stringify(exportResultForDisplay(result), null, 2)
@@ -523,6 +589,7 @@ export async function createBatch() {
       ? Math.floor(new Date(batchForm.expires_at_text.trim()).getTime() / 1000)
       : null
     const result = await api.createBatch(apiState.value, {
+      pool_id: batchForm.pool_id || operationPoolId.value,
       name: batchForm.name || `兑换码批次 ${new Date().toLocaleString()}`,
       total_count: Number(batchForm.total_count || 1),
       accounts_per_code: Number(batchForm.accounts_per_code || 1),
@@ -533,6 +600,48 @@ export async function createBatch() {
     generatedCodes.value = result.codes.map((c) => c.code).join('\n')
     await loadBatches()
     await fetchCodes(result.batch_id)
+  })
+}
+
+export async function createPool() {
+  await withBusy(async () => {
+    const payload = poolPayloadFromForm()
+    const result = await api.createPool(apiState.value, payload)
+    adminResult.value = `已创建号池：${result.pool.name}`
+    poolForm.name = ''
+    poolForm.workspace_label = ''
+    poolForm.account_type = 'codex'
+    poolForm.description = ''
+    await loadPools()
+    selectedPoolId.value = result.pool.id
+    importPoolId.value = result.pool.id
+    batchForm.pool_id = result.pool.id
+    await loadAccounts()
+    await loadBatches()
+  })
+}
+
+export async function togglePoolActive(pool: AccountPool) {
+  if (pool.is_default) {
+    adminResult.value = '默认号池不能停用'
+    return
+  }
+  await withBusy(async () => {
+    const payload: AccountPoolPayload = {
+      name: pool.name,
+      workspace_label: pool.workspace_label || null,
+      account_type: pool.account_type || 'codex',
+      description: pool.description || null,
+      is_active: !pool.is_active,
+    }
+    const result = await api.updatePool(apiState.value, pool.id, payload)
+    adminResult.value = result.pool.is_active ? `已启用号池：${result.pool.name}` : `已停用号池：${result.pool.name}`
+    await loadPools()
+    if (!result.pool.is_active && selectedPoolId.value === result.pool.id) {
+      selectedPoolId.value = ''
+    }
+    await loadAccounts()
+    await loadBatches()
   })
 }
 
@@ -609,6 +718,23 @@ function formatDeleteAccountsResult(result: DeleteAccountsResponse) {
     )
   }
   return lines.join('\n')
+}
+
+function poolPayloadFromForm(): AccountPoolPayload {
+  return {
+    name: poolForm.name.trim(),
+    workspace_label: poolForm.workspace_label.trim() || null,
+    account_type: poolForm.account_type.trim() || 'codex',
+    description: poolForm.description.trim() || null,
+    is_active: true,
+  }
+}
+
+export function poolLabel(poolId?: string | null) {
+  const pool = accountPools.value.find((item) => item.id === poolId)
+  if (!pool) return poolId || '默认号池'
+  const meta = [pool.workspace_label, pool.account_type].filter(Boolean).join(' / ')
+  return meta ? `${pool.name} (${meta})` : pool.name
 }
 
 export function downloadEncodedFile(download: EncodedDownload) {

@@ -28,6 +28,14 @@
           </div>
         </div>
         <div class="panel-body grid">
+          <label class="field-label full">
+            <span>号池</span>
+            <select v-model="batchForm.pool_id" class="select">
+              <option v-for="pool in activePools" :key="pool.id" :value="pool.id">
+                {{ poolLabel(pool.id) }}
+              </option>
+            </select>
+          </label>
           <input v-model="batchForm.name" class="input" placeholder="批次名称" />
           <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="5000" placeholder="兑换码数量" />
           <input v-model.number="batchForm.accounts_per_code" class="input" type="number" min="1" max="100" placeholder="每码账号数" />
@@ -102,6 +110,7 @@
               <thead>
                 <tr>
                   <th>批次</th>
+                  <th>号池</th>
                   <th>兑换进度</th>
                   <th>每码</th>
                   <th>售后</th>
@@ -118,6 +127,10 @@
                   <td>
                     <strong>{{ batch.name }}</strong>
                     <div class="muted mono">{{ batch.id }}</div>
+                  </td>
+                  <td>
+                    <span class="badge available">{{ batch.pool_name || poolLabel(batch.pool_id) }}</span>
+                    <div class="muted mono">{{ batch.pool_id }}</div>
                   </td>
                   <td>
                     <div class="progress-cell">
@@ -141,7 +154,7 @@
                   </td>
                 </tr>
                 <tr v-if="!batches.length">
-                  <td colspan="6" class="empty-row">
+                  <td colspan="7" class="empty-row">
                     <Ticket :size="20" />
                     <span>暂无批次</span>
                   </td>
@@ -270,6 +283,7 @@ import {
   formatTime,
   statusLabel,
   statusBadgeClass,
+  poolLabel,
   timestamp,
 } from '../composables/useAdmin'
 import { useToast } from '../composables/useToast'
@@ -283,6 +297,7 @@ const {
   selectedBatchStats,
   generatedCodes,
   redeemStats,
+  activePools,
   busy,
   apiState,
 } = useAdmin()
@@ -369,6 +384,8 @@ function buildBatchCsv(batch: RedeemBatch) {
       exportedAt,
       batch.id,
       batch.name,
+      batch.pool_id,
+      batch.pool_name || poolLabel(batch.pool_id),
       batch.status,
       batch.total_count,
       batch.redeemed_count,
@@ -391,6 +408,8 @@ function buildBatchCsv(batch: RedeemBatch) {
       exportedAt,
       batch.id,
       batch.name,
+      batch.pool_id,
+      batch.pool_name || poolLabel(batch.pool_id),
       batch.status,
       batch.total_count,
       batch.redeemed_count,
@@ -413,6 +432,8 @@ function buildBatchCsv(batch: RedeemBatch) {
     'exported_at',
     'batch_id',
     'batch_name',
+    'pool_id',
+    'pool_name',
     'batch_status',
     'total_count',
     'redeemed_count',

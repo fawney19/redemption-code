@@ -12,6 +12,10 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 ## Behavior
 
 - Imported Codex accounts start as `available`, or `at_expired` when the access token is already expired.
+- Codex accounts belong to an `account_pools` pool. Pools are only an inventory isolation label for workspace/account type; they do not add provider routing, endpoint selection, model mapping, or scheduling.
+- Existing databases are upgraded with a default pool (`default`). Existing accounts and redeem-code batches are backfilled into that default pool.
+- Admin imports and redeem-code batches can target a specific pool. Re-importing an unredeemed account can move it to the selected pool; redeemed accounts keep their original pool so historical redemptions stay stable.
+- Redeem-code batches are bound to one pool. Public redeem and after-sale exports infer the pool from the submitted codes and never allocate replacement accounts from another pool.
 - Redeem exports use exclusive allocation. Redeemed accounts stay in the database with `redeemed_at`, `redeem_code_id`, and `redemption_id`; the account `status` remains the latest health state.
 - Redeemed accounts are not returned to the allocatable pool, are skipped by automatic refresh/probe loading paths, and keep a redemption-time auth snapshot for repeat downloads.
 - Access tokens are refreshed only for unredeemed accounts. Refresh failures mark accounts as `refresh_failed`.
@@ -27,6 +31,9 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 ## API
 
 - `GET /health`
+- `GET /api/alalalateam/pools`
+- `POST /api/alalalateam/pools`
+- `POST /api/alalalateam/pools/{pool_id}`
 - `POST /api/alalalateam/accounts/import`
 - `GET /api/alalalateam/accounts`
 - `POST /api/alalalateam/accounts/probe`
@@ -42,6 +49,7 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 - `POST /api/redeem/after-sale`
 
 Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-admin-token`.
+Pool-aware admin endpoints accept `pool_id` as documented by shape: account list and batch list use query `pool_id`; import, probe, refresh, admin export, and batch creation use JSON `pool_id`. When `pool_id` is omitted, legacy behavior is preserved: account/batch lists are global, while new imports and new batches use the default pool.
 By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. The API refuses known example admin tokens and empty/example encryption secrets unless `AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1` is explicitly set for isolated local development. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
 Cross-origin browser access is restricted by `AETHER_POOL_CORS_ORIGINS`, defaulting to local Vite origins.
 Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`.
@@ -125,7 +133,7 @@ docker compose up -d --build api
 
 Then set Baota's site root to `/absolute/path/to/aether-pool/deploy/web` and proxy `/api/` to `http://127.0.0.1:8318`.
 
-SQLite schema upgrades are applied automatically at API startup. The after-sale upgrade adds `redeem_code_batches.after_sale_limit` and `redeem_after_sales`; no manual migration command is required for existing deployments.
+SQLite schema upgrades are applied automatically at API startup. Current upgrades add `account_pools`, `accounts.pool_id`, `redeem_code_batches.pool_id`, `redeem_code_batches.after_sale_limit`, and `redeem_after_sales`; no manual migration command is required for existing deployments.
 
 ## Verification
 

@@ -26,6 +26,11 @@ const INIT_SQL: &str = include_str!("../migrations/sqlite/0001_init.sql");
 const AUTO_PROBE_SETTINGS_KEY: &str = "auto_probe";
 const CPA_MANAGEMENT_KEY_SETTING_KEY: &str = "cpa_management_key";
 const REDEEM_RATE_LIMIT_SETTINGS_KEY: &str = "redeem_rate_limit";
+pub const DEFAULT_ACCOUNT_POOL_ID: &str = "default";
+const DEFAULT_ACCOUNT_POOL_NAME: &str = "默认 Codex 号池";
+const DEFAULT_ACCOUNT_POOL_WORKSPACE_LABEL: &str = "默认工作区";
+const DEFAULT_ACCOUNT_POOL_TYPE: &str = "codex";
+const DEFAULT_ACCOUNT_POOL_DESCRIPTION: &str = "旧账号和未指定池的默认归属";
 
 #[derive(Debug, Error)]
 pub enum DataError {
@@ -35,6 +40,8 @@ pub enum DataError {
     Encryption,
     #[error("invalid export format")]
     InvalidExportFormat,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("not found")]
     NotFound,
 }
@@ -134,10 +141,133 @@ impl AccountPoolRepository {
         &self.pool
     }
 
+    pub async fn default_account_pool_id(&self) -> Result<String, DataError> {
+        self.resolve_account_pool_id(None, false).await
+    }
+
+    pub async fn list_account_pools(&self) -> Result<Vec<AccountPoolSummary>, DataError> {
+        let rows = sqlx::query(
+            r#"
+SELECT id, name, workspace_label, account_type, description, is_default, is_active, created_at, updated_at
+FROM account_pools
+ORDER BY is_default DESC, updated_at DESC, created_at DESC
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(account_pool_from_row).collect()
+    }
+
+    pub async fn create_account_pool(
+        &self,
+        input: AccountPoolUpsertInput,
+    ) -> Result<AccountPoolSummary, DataError> {
+        let input = input.normalized()?;
+        let now = unix_now_secs() as i64;
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+INSERT INTO account_pools (
+  id, name, workspace_label, account_type, description, is_default, is_active, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+"#,
+        )
+        .bind(&id)
+        .bind(input.name)
+        .bind(input.workspace_label)
+        .bind(input.account_type)
+        .bind(input.description)
+        .bind(if input.is_active.unwrap_or(true) { 1_i64 } else { 0_i64 })
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        self.load_account_pool(&id).await
+    }
+
+    pub async fn update_account_pool(
+        &self,
+        pool_id: &str,
+        input: AccountPoolUpsertInput,
+    ) -> Result<AccountPoolSummary, DataError> {
+        let pool_id = normalize_required_pool_id(pool_id)?;
+        let existing = self.load_account_pool(&pool_id).await?;
+        let input = input.normalized()?;
+        let now = unix_now_secs() as i64;
+        let is_active = if existing.is_default {
+            true
+        } else {
+            input.is_active.unwrap_or(existing.is_active)
+        };
+        sqlx::query(
+            r#"
+UPDATE account_pools
+SET name = ?, workspace_label = ?, account_type = ?, description = ?, is_active = ?, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(input.name)
+        .bind(input.workspace_label)
+        .bind(input.account_type)
+        .bind(input.description)
+        .bind(if is_active { 1_i64 } else { 0_i64 })
+        .bind(now)
+        .bind(&pool_id)
+        .execute(&self.pool)
+        .await?;
+        self.load_account_pool(&pool_id).await
+    }
+
+    async fn load_account_pool(&self, pool_id: &str) -> Result<AccountPoolSummary, DataError> {
+        let row = sqlx::query(
+            r#"
+SELECT id, name, workspace_label, account_type, description, is_default, is_active, created_at, updated_at
+FROM account_pools
+WHERE id = ?
+"#,
+        )
+        .bind(pool_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(account_pool_from_row)
+            .transpose()?
+            .ok_or(DataError::NotFound)
+    }
+
+    async fn resolve_account_pool_id(
+        &self,
+        pool_id: Option<&str>,
+        require_active: bool,
+    ) -> Result<String, DataError> {
+        let pool_id = normalize_optional_pool_id(pool_id)
+            .unwrap_or_else(|| DEFAULT_ACCOUNT_POOL_ID.to_string());
+        let row = sqlx::query("SELECT is_active FROM account_pools WHERE id = ?")
+            .bind(&pool_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Err(DataError::InvalidInput("号池不存在".to_string()));
+        };
+        let is_active = row.try_get::<i64, _>("is_active").unwrap_or(0) != 0;
+        if require_active && !is_active {
+            return Err(DataError::InvalidInput("号池已停用".to_string()));
+        }
+        Ok(pool_id)
+    }
+
     pub async fn import_accounts(
         &self,
         accounts: &[ParsedAccount],
     ) -> Result<ImportAccountsOutcome, DataError> {
+        self.import_accounts_into_pool(accounts, None).await
+    }
+
+    pub async fn import_accounts_into_pool(
+        &self,
+        accounts: &[ParsedAccount],
+        pool_id: Option<&str>,
+    ) -> Result<ImportAccountsOutcome, DataError> {
+        let pool_id = self.resolve_account_pool_id(pool_id, true).await?;
         let now = unix_now_secs() as i64;
         let mut imported = 0;
         let mut updated = 0;
@@ -159,7 +289,8 @@ impl AccountPoolRepository {
                 sqlx::query(
                     r#"
 UPDATE accounts
-SET email = ?, name = ?, account_id = ?, plan_type = ?, auth_fingerprint = ?,
+SET pool_id = CASE WHEN redeemed_at IS NULL THEN ? ELSE pool_id END,
+    email = ?, name = ?, account_id = ?, plan_type = ?, auth_fingerprint = ?,
     auth_file_ciphertext = CASE WHEN redeemed_at IS NULL THEN ? ELSE auth_file_ciphertext END,
     access_token_preview = CASE WHEN redeemed_at IS NULL THEN ? ELSE access_token_preview END,
     refresh_token_preview = CASE WHEN redeemed_at IS NULL THEN ? ELSE refresh_token_preview END,
@@ -169,6 +300,7 @@ SET email = ?, name = ?, account_id = ?, plan_type = ?, auth_fingerprint = ?,
 WHERE id = ?
 "#,
                 )
+                .bind(&pool_id)
                 .bind(&auth_file.email)
                 .bind(&auth_file.name)
                 .bind(
@@ -192,13 +324,14 @@ WHERE id = ?
                 sqlx::query(
                     r#"
 INSERT INTO accounts (
-  id, email, name, account_id, plan_type, status, auth_fingerprint,
+  id, pool_id, email, name, account_id, plan_type, status, auth_fingerprint,
   auth_file_ciphertext, access_token_preview, refresh_token_preview,
   expires_at, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
                 )
                 .bind(Uuid::new_v4().to_string())
+                .bind(&pool_id)
                 .bind(&auth_file.email)
                 .bind(&auth_file.name)
                 .bind(
@@ -287,11 +420,12 @@ WHERE auth_fingerprint = ? AND lower(email) = ?
 
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
        a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at
 FROM accounts a
+LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
 "#,
         );
@@ -306,7 +440,9 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
             .into_iter()
             .map(|row| account_summary_from_row(&row))
             .collect::<Result<Vec<_>, _>>()?;
-        let stats = self.load_account_pool_stats().await?;
+        let stats = self
+            .load_account_pool_stats(query.pool_id.as_deref())
+            .await?;
         Ok(AccountListPage {
             items,
             total,
@@ -316,19 +452,24 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
         })
     }
 
-    async fn load_account_pool_stats(&self) -> Result<AccountPoolStats, DataError> {
-        let row = sqlx::query(
+    async fn load_account_pool_stats(
+        &self,
+        pool_id: Option<&str>,
+    ) -> Result<AccountPoolStats, DataError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT
   COUNT(*) AS total,
   COALESCE(SUM(CASE WHEN status = 'available' AND redeemed_at IS NULL THEN 1 ELSE 0 END), 0) AS available,
   COALESCE(SUM(CASE WHEN redeemed_at IS NOT NULL OR redeem_code_id IS NOT NULL OR redemption_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS redeemed,
   COALESCE(SUM(CASE WHEN status IN ('at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted') THEN 1 ELSE 0 END), 0) AS attention
-FROM accounts
+FROM accounts a
 "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        );
+        if let Some(pool_id) = normalize_optional_pool_id(pool_id) {
+            builder.push(" WHERE a.pool_id = ").push_bind(pool_id);
+        }
+        let row = builder.build().fetch_one(&self.pool).await?;
         Ok(AccountPoolStats {
             total: usize_from_i64(row.try_get("total")?),
             available: usize_from_i64(row.try_get("available")?),
@@ -443,11 +584,12 @@ WHERE id =
         for id in ids {
             let row = sqlx::query(
                 r#"
-SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
        a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
+LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
 WHERE a.id = ? AND (? = 1 OR a.redeemed_at IS NULL)
 "#,
@@ -467,23 +609,34 @@ WHERE a.id = ? AND (? = 1 OR a.redeemed_at IS NULL)
         &self,
         ids: Option<&[String]>,
     ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
+        self.load_unredeemed_auth_files_scoped(ids, None).await
+    }
+
+    pub async fn load_unredeemed_auth_files_scoped(
+        &self,
+        ids: Option<&[String]>,
+        pool_id: Option<&str>,
+    ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
         if let Some(ids) = ids {
             return self.load_auth_files_for_ids(ids, false).await;
         }
-        let rows = sqlx::query(
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
        a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
+LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
 WHERE a.redeemed_at IS NULL
-ORDER BY a.created_at ASC
 "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        if let Some(pool_id) = normalize_optional_pool_id(pool_id) {
+            builder.push(" AND a.pool_id = ").push_bind(pool_id);
+        }
+        builder.push(" ORDER BY a.created_at ASC");
+        let rows = builder.build().fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| self.auth_pair_from_row(row))
             .collect()
@@ -777,6 +930,15 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = ex
         &self,
         input: CreateRedeemBatchInput,
     ) -> Result<CreateRedeemBatchOutcome, DataError> {
+        self.create_redeem_batch_in_pool(input, None).await
+    }
+
+    pub async fn create_redeem_batch_in_pool(
+        &self,
+        input: CreateRedeemBatchInput,
+        pool_id: Option<&str>,
+    ) -> Result<CreateRedeemBatchOutcome, DataError> {
+        let pool_id = self.resolve_account_pool_id(pool_id, true).await?;
         let now = unix_now_secs() as i64;
         let batch_id = Uuid::new_v4().to_string();
         let plan_filter_json = input
@@ -788,12 +950,13 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = ex
         sqlx::query(
             r#"
 INSERT INTO redeem_code_batches (
-  id, name, status, total_count, redeemed_count, accounts_per_code, after_sale_limit,
+  id, pool_id, name, status, total_count, redeemed_count, accounts_per_code, after_sale_limit,
   plan_filter_json, expires_at, created_at, updated_at
-) VALUES (?, ?, 'active', ?, 0, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, 'active', ?, 0, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&batch_id)
+        .bind(&pool_id)
         .bind(input.name.trim())
         .bind(input.total_count as i64)
         .bind(input.accounts_per_code as i64)
@@ -857,16 +1020,26 @@ INSERT OR IGNORE INTO redeem_codes (
     }
 
     pub async fn list_redeem_batches(&self) -> Result<Vec<RedeemBatchSummary>, DataError> {
-        let rows = sqlx::query(
+        self.list_redeem_batches_scoped(None).await
+    }
+
+    pub async fn list_redeem_batches_scoped(
+        &self,
+        pool_id: Option<&str>,
+    ) -> Result<Vec<RedeemBatchSummary>, DataError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-SELECT id, name, status, total_count, redeemed_count, accounts_per_code, after_sale_limit,
-       plan_filter_json, expires_at, created_at, updated_at
-FROM redeem_code_batches
-ORDER BY created_at DESC
+SELECT b.id, b.pool_id, p.name AS pool_name, b.name, b.status, b.total_count, b.redeemed_count, b.accounts_per_code, b.after_sale_limit,
+       b.plan_filter_json, b.expires_at, b.created_at, b.updated_at
+FROM redeem_code_batches b
+LEFT JOIN account_pools p ON p.id = b.pool_id
 "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        if let Some(pool_id) = normalize_optional_pool_id(pool_id) {
+            builder.push(" WHERE b.pool_id = ").push_bind(pool_id);
+        }
+        builder.push(" ORDER BY b.created_at DESC");
+        let rows = builder.build().fetch_all(&self.pool).await?;
         rows.into_iter().map(batch_summary_from_row).collect()
     }
 
@@ -977,7 +1150,7 @@ ORDER BY codes.created_at ASC
                 r#"
 SELECT codes.status AS code_status, codes.redemption_id,
        batches.status AS batch_status, batches.accounts_per_code,
-       batches.plan_filter_json, batches.expires_at
+       batches.pool_id, batches.plan_filter_json, batches.expires_at
 FROM redeem_codes AS codes
 JOIN redeem_code_batches AS batches ON batches.id = codes.batch_id
 WHERE codes.code_hash = ?
@@ -1021,11 +1194,13 @@ WHERE codes.code_hash = ?
                 .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
                 .unwrap_or_default();
             let accounts_per_code: i64 = row.try_get("accounts_per_code")?;
+            let pool_id: String = row.try_get("pool_id")?;
             if accounts_per_code > 0 {
                 estimated_account_count =
                     estimated_account_count.saturating_add(accounts_per_code as usize);
                 demands.push(RedeemAccountDemand {
                     count: accounts_per_code as usize,
+                    pool_id,
                     plan_filter,
                 });
             }
@@ -1040,7 +1215,7 @@ WHERE codes.code_hash = ?
 
         let rows = sqlx::query(
             r#"
-SELECT id, plan_type, status, expires_at
+SELECT id, pool_id, plan_type, status, expires_at
 FROM accounts
 WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
 ORDER BY created_at ASC
@@ -1053,6 +1228,7 @@ ORDER BY created_at ASC
             .map(|row| {
                 Ok(RedeemCandidateAccount {
                     id: row.try_get("id")?,
+                    pool_id: row.try_get("pool_id")?,
                     plan_type: row.try_get("plan_type")?,
                     status: row.try_get("status")?,
                     expires_at: optional_i64(&row, "expires_at")?,
@@ -1069,7 +1245,7 @@ ORDER BY created_at ASC
                 if remaining == 0 {
                     break;
                 }
-                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
+                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
                     continue;
                 }
                 if candidate.is_usable(now) {
@@ -1082,7 +1258,7 @@ ORDER BY created_at ASC
                 if remaining == 0 {
                     break;
                 }
-                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
+                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
                     continue;
                 }
                 if candidate.needs_refresh(now) {
@@ -1122,7 +1298,7 @@ ORDER BY created_at ASC
                 r#"
 SELECT codes.id AS code_id, codes.status AS code_status, codes.redemption_id,
        batches.status AS batch_status, batches.accounts_per_code,
-       batches.plan_filter_json, batches.expires_at, batches.after_sale_limit,
+       batches.pool_id, batches.plan_filter_json, batches.expires_at, batches.after_sale_limit,
        COALESCE((
          SELECT COUNT(*)
          FROM redeem_after_sales AS after_sales
@@ -1183,11 +1359,13 @@ WHERE codes.code_hash = ?
                 .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
                 .unwrap_or_default();
             let accounts_per_code: i64 = row.try_get("accounts_per_code")?;
+            let pool_id: String = row.try_get("pool_id")?;
             if accounts_per_code > 0 {
                 estimated_account_count =
                     estimated_account_count.saturating_add(accounts_per_code as usize);
                 demands.push(RedeemAccountDemand {
                     count: accounts_per_code as usize,
+                    pool_id,
                     plan_filter,
                 });
             }
@@ -1218,7 +1396,7 @@ WHERE codes.code_hash = ?
         }
         let rows = sqlx::query(
             r#"
-SELECT id, plan_type, status, expires_at
+SELECT id, pool_id, plan_type, status, expires_at
 FROM accounts
 WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
 ORDER BY created_at ASC
@@ -1231,6 +1409,7 @@ ORDER BY created_at ASC
             .map(|row| {
                 Ok(RedeemCandidateAccount {
                     id: row.try_get("id")?,
+                    pool_id: row.try_get("pool_id")?,
                     plan_type: row.try_get("plan_type")?,
                     status: row.try_get("status")?,
                     expires_at: optional_i64(&row, "expires_at")?,
@@ -1248,7 +1427,7 @@ ORDER BY created_at ASC
                 if selected_for_demand >= target_count {
                     break;
                 }
-                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
+                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
                     continue;
                 }
                 if candidate.is_usable(now) {
@@ -1261,7 +1440,7 @@ ORDER BY created_at ASC
                 if selected_for_demand >= demand.count {
                     break;
                 }
-                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand.plan_filter) {
+                if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
                     continue;
                 }
                 if candidate.needs_refresh(now) {
@@ -1320,7 +1499,7 @@ ORDER BY created_at ASC
                 r#"
 SELECT codes.id AS code_id, codes.batch_id, codes.status AS code_status,
        codes.redemption_id, batches.status AS batch_status,
-       batches.accounts_per_code, batches.plan_filter_json, batches.expires_at
+       batches.accounts_per_code, batches.pool_id, batches.plan_filter_json, batches.expires_at
 FROM redeem_codes AS codes
 JOIN redeem_code_batches AS batches ON batches.id = codes.batch_id
 WHERE codes.code_hash = ?
@@ -1342,6 +1521,7 @@ WHERE codes.code_hash = ?
             let code_status: String = code_row.try_get("code_status")?;
             let batch_status: String = code_row.try_get("batch_status")?;
             let accounts_per_code: i64 = code_row.try_get("accounts_per_code")?;
+            let pool_id: String = code_row.try_get("pool_id")?;
             let expires_at: Option<i64> = code_row.try_get("expires_at")?;
             let plan_filter: Option<String> = code_row.try_get("plan_filter_json")?;
 
@@ -1385,9 +1565,11 @@ WHERE codes.code_hash = ?
                     r#"
 SELECT id, plan_type
 FROM accounts
-WHERE redeemed_at IS NULL AND status = 'available' AND expires_at IS NOT NULL AND expires_at >
+WHERE redeemed_at IS NULL AND status = 'available' AND pool_id =
 "#,
                 );
+                account_query.push_bind(&pool_id);
+                account_query.push(" AND expires_at IS NOT NULL AND expires_at > ");
                 account_query.push_bind(usable_after);
                 if let Some(verified_account_ids) = verified_account_ids {
                     if verified_account_ids.is_empty() {
@@ -1564,7 +1746,7 @@ WHERE id = ? AND redeemed_at IS NULL
                 r#"
 SELECT codes.id AS code_id, codes.batch_id, codes.status AS code_status,
        codes.redemption_id, batches.status AS batch_status,
-       batches.accounts_per_code, batches.plan_filter_json, batches.expires_at,
+       batches.accounts_per_code, batches.pool_id, batches.plan_filter_json, batches.expires_at,
        batches.after_sale_limit,
        COALESCE((
          SELECT COUNT(*)
@@ -1591,6 +1773,7 @@ WHERE codes.code_hash = ?
             let batch_id: String = code_row.try_get("batch_id")?;
             let code_status: String = code_row.try_get("code_status")?;
             let batch_status: String = code_row.try_get("batch_status")?;
+            let pool_id: String = code_row.try_get("pool_id")?;
             let expires_at: Option<i64> = code_row.try_get("expires_at")?;
             if batch_status != "active" || code_status == "disabled" {
                 failures.push(RedeemFailure {
@@ -1726,9 +1909,11 @@ WHERE codes.code_hash = ?
                 r#"
 SELECT id, plan_type
 FROM accounts
-WHERE redeemed_at IS NULL AND status = 'available' AND expires_at IS NOT NULL AND expires_at >
+WHERE redeemed_at IS NULL AND status = 'available' AND pool_id =
 "#,
             );
+            account_query.push_bind(&pool_id);
+            account_query.push(" AND expires_at IS NOT NULL AND expires_at > ");
             account_query.push_bind(usable_after);
             if let Some(verified_ids) = &verified_current_account_ids {
                 if verified_ids.is_empty() {
@@ -1881,10 +2066,21 @@ INSERT INTO redeem_after_sales (
         include_redeemed: bool,
         format: ExportFormat,
     ) -> Result<Value, DataError> {
+        self.export_admin_accounts_scoped(ids, include_redeemed, format, None)
+            .await
+    }
+
+    pub async fn export_admin_accounts_scoped(
+        &self,
+        ids: Option<&[String]>,
+        include_redeemed: bool,
+        format: ExportFormat,
+        pool_id: Option<&str>,
+    ) -> Result<Value, DataError> {
         let accounts = if let Some(ids) = ids {
             self.load_auth_files_for_ids(ids, include_redeemed).await?
         } else {
-            self.load_all_auth_files()
+            self.load_all_auth_files_scoped(pool_id)
                 .await?
                 .into_iter()
                 .filter(|(summary, _)| include_redeemed || summary.redeemed_at.is_none())
@@ -1936,20 +2132,26 @@ ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = ex
         Ok(settings)
     }
 
-    async fn load_all_auth_files(&self) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
-        let rows = sqlx::query(
+    async fn load_all_auth_files_scoped(
+        &self,
+        pool_id: Option<&str>,
+    ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
        a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
+LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
-ORDER BY a.created_at ASC
 "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        if let Some(pool_id) = normalize_optional_pool_id(pool_id) {
+            builder.push(" WHERE a.pool_id = ").push_bind(pool_id);
+        }
+        builder.push(" ORDER BY a.created_at ASC");
+        let rows = builder.build().fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| self.auth_pair_from_row(row))
             .collect()
@@ -1974,11 +2176,12 @@ ORDER BY a.created_at ASC
         for id in ids {
             let row = sqlx::query(
                 r#"
-SELECT a.id, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
+SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
        a.quota_snapshot, a.redeem_code_id, rc.masked_code AS redeem_code_masked, a.redemption_id,
        a.redeemed_at, a.created_at, a.updated_at, a.auth_file_ciphertext
 FROM accounts a
+LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
 WHERE a.id = ?
 "#,
@@ -2043,9 +2246,10 @@ WHERE a.id = ?
         for chunk in unique_ids.chunks(500) {
             let mut builder = QueryBuilder::<Sqlite>::new(
                 r#"
-SELECT id, email, name, account_id, plan_type, status, last_probe_at, quota_snapshot
-FROM accounts
-WHERE id IN (
+SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.last_probe_at, a.quota_snapshot
+FROM accounts a
+LEFT JOIN account_pools p ON p.id = a.pool_id
+WHERE a.id IN (
 "#,
             );
             {
@@ -2134,6 +2338,21 @@ WHERE code_id IN (
 }
 
 async fn ensure_schema_upgrades(pool: &SqlitePool) -> Result<(), DataError> {
+    ensure_default_account_pool(pool).await?;
+    ensure_sqlite_column(
+        pool,
+        "accounts",
+        "pool_id",
+        "ALTER TABLE accounts ADD COLUMN pool_id TEXT NOT NULL DEFAULT 'default'",
+    )
+    .await?;
+    ensure_sqlite_column(
+        pool,
+        "redeem_code_batches",
+        "pool_id",
+        "ALTER TABLE redeem_code_batches ADD COLUMN pool_id TEXT NOT NULL DEFAULT 'default'",
+    )
+    .await?;
     ensure_sqlite_column(
         pool,
         "redeem_codes",
@@ -2177,6 +2396,73 @@ CREATE TABLE IF NOT EXISTS redeem_after_sales (
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_accounts_pool_status ON accounts(pool_id, status, updated_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_redeem_code_batches_pool ON redeem_code_batches(pool_id, status, created_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE accounts SET pool_id = ? WHERE pool_id IS NULL OR trim(pool_id) = ''")
+        .bind(DEFAULT_ACCOUNT_POOL_ID)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE redeem_code_batches SET pool_id = ? WHERE pool_id IS NULL OR trim(pool_id) = ''",
+    )
+    .bind(DEFAULT_ACCOUNT_POOL_ID)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_default_account_pool(pool: &SqlitePool) -> Result<(), DataError> {
+    sqlx::query(
+        r#"
+CREATE TABLE IF NOT EXISTS account_pools (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  workspace_label TEXT,
+  account_type TEXT,
+  description TEXT,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)
+"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_pools_default ON account_pools(is_default) WHERE is_default = 1",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_account_pools_active ON account_pools(is_active, updated_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+INSERT OR IGNORE INTO account_pools (
+  id, name, workspace_label, account_type, description, is_default, is_active, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+"#,
+    )
+    .bind(DEFAULT_ACCOUNT_POOL_ID)
+    .bind(DEFAULT_ACCOUNT_POOL_NAME)
+    .bind(DEFAULT_ACCOUNT_POOL_WORKSPACE_LABEL)
+    .bind(DEFAULT_ACCOUNT_POOL_TYPE)
+    .bind(DEFAULT_ACCOUNT_POOL_DESCRIPTION)
+    .bind(unix_now_secs() as i64)
+    .bind(unix_now_secs() as i64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2204,8 +2490,48 @@ pub struct ImportAccountsOutcome {
     pub updated: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountPoolSummary {
+    pub id: String,
+    pub name: String,
+    pub workspace_label: Option<String>,
+    pub account_type: Option<String>,
+    pub description: Option<String>,
+    pub is_default: bool,
+    pub is_active: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccountPoolUpsertInput {
+    pub name: String,
+    pub workspace_label: Option<String>,
+    pub account_type: Option<String>,
+    pub description: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+impl AccountPoolUpsertInput {
+    fn normalized(self) -> Result<Self, DataError> {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err(DataError::InvalidInput("号池名称不能为空".to_string()));
+        }
+        Ok(Self {
+            name,
+            workspace_label: normalize_optional_text(self.workspace_label),
+            account_type: normalize_optional_text(self.account_type)
+                .or_else(|| Some(DEFAULT_ACCOUNT_POOL_TYPE.to_string())),
+            description: normalize_optional_text(self.description),
+            is_active: self.is_active,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AccountListQuery {
+    pub pool_id: Option<String>,
     pub search: Option<String>,
     pub status: Option<String>,
     pub redeemed: Option<bool>,
@@ -2248,6 +2574,8 @@ pub struct DeleteAccountResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountSummary {
     pub id: String,
+    pub pool_id: String,
+    pub pool_name: Option<String>,
     pub email: Option<String>,
     pub name: Option<String>,
     pub account_id: Option<String>,
@@ -2473,10 +2801,15 @@ fn push_account_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &AccountL
             builder.push("a.redeemed_at IS NULL");
         }
     }
+    if let Some(pool_id) = normalize_optional_pool_id(query.pool_id.as_deref()) {
+        push_and(builder);
+        builder.push("a.pool_id = ").push_bind(pool_id);
+    }
 }
 
 struct RedeemAccountDemand {
     count: usize,
+    pool_id: String,
     plan_filter: Vec<String>,
 }
 
@@ -2486,19 +2819,22 @@ fn redeem_probe_target_count(required: usize) -> usize {
 
 struct RedeemCandidateAccount {
     id: String,
+    pool_id: String,
     plan_type: Option<String>,
     status: String,
     expires_at: Option<u64>,
 }
 
 impl RedeemCandidateAccount {
-    fn matches(&self, plan_filter: &[String]) -> bool {
-        plan_filter.is_empty()
-            || self.plan_type.as_ref().is_some_and(|value| {
-                plan_filter
-                    .iter()
-                    .any(|plan| plan.eq_ignore_ascii_case(value))
-            })
+    fn matches(&self, demand: &RedeemAccountDemand) -> bool {
+        self.pool_id == demand.pool_id
+            && (demand.plan_filter.is_empty()
+                || self.plan_type.as_ref().is_some_and(|value| {
+                    demand
+                        .plan_filter
+                        .iter()
+                        .any(|plan| plan.eq_ignore_ascii_case(value))
+                }))
     }
 
     fn is_usable(&self, now: u64) -> bool {
@@ -2522,6 +2858,10 @@ impl RedeemCandidateAccount {
 fn account_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountSummary, DataError> {
     Ok(AccountSummary {
         id: row.try_get("id")?,
+        pool_id: row
+            .try_get("pool_id")
+            .unwrap_or_else(|_| DEFAULT_ACCOUNT_POOL_ID.to_string()),
+        pool_name: row.try_get("pool_name").ok(),
         email: row.try_get("email")?,
         name: row.try_get("name")?,
         account_id: row.try_get("account_id")?,
@@ -2546,6 +2886,38 @@ fn optional_i64(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<u64>
     Ok(row
         .try_get::<Option<i64>, _>(name)?
         .and_then(|value| u64::try_from(value).ok()))
+}
+
+fn account_pool_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AccountPoolSummary, DataError> {
+    Ok(AccountPoolSummary {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        workspace_label: row.try_get("workspace_label")?,
+        account_type: row.try_get("account_type")?,
+        description: row.try_get("description")?,
+        is_default: row.try_get::<i64, _>("is_default").unwrap_or(0) != 0,
+        is_active: row.try_get::<i64, _>("is_active").unwrap_or(0) != 0,
+        created_at: optional_i64(&row, "created_at")?.unwrap_or_default(),
+        updated_at: optional_i64(&row, "updated_at")?.unwrap_or_default(),
+    })
+}
+
+fn normalize_required_pool_id(value: &str) -> Result<String, DataError> {
+    normalize_optional_pool_id(Some(value))
+        .ok_or_else(|| DataError::InvalidInput("pool_id is required".to_string()))
+}
+
+fn normalize_optional_pool_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn optional_json(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<Value>, DataError> {
@@ -2614,6 +2986,8 @@ pub struct RedeemCodeCreated {
 #[derive(Debug, Clone, Serialize)]
 pub struct RedeemBatchSummary {
     pub id: String,
+    pub pool_id: String,
+    pub pool_name: Option<String>,
     pub name: String,
     pub status: String,
     pub total_count: u64,
@@ -2633,6 +3007,10 @@ fn batch_summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RedeemBatchSum
         .unwrap_or_default();
     Ok(RedeemBatchSummary {
         id: row.try_get("id")?,
+        pool_id: row
+            .try_get("pool_id")
+            .unwrap_or_else(|_| DEFAULT_ACCOUNT_POOL_ID.to_string()),
+        pool_name: row.try_get("pool_name").ok(),
         name: row.try_get("name")?,
         status: row.try_get("status")?,
         total_count: optional_i64(&row, "total_count")?.unwrap_or_default(),
@@ -2675,6 +3053,8 @@ pub struct RedeemAfterSaleSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct RedeemCodeAccountSummary {
     pub id: String,
+    pub pool_id: String,
+    pub pool_name: Option<String>,
     pub email: Option<String>,
     pub name: Option<String>,
     pub account_id: Option<String>,
@@ -2732,6 +3112,10 @@ fn redeem_code_account_from_row(
 ) -> Result<RedeemCodeAccountSummary, DataError> {
     Ok(RedeemCodeAccountSummary {
         id: row.try_get("id")?,
+        pool_id: row
+            .try_get("pool_id")
+            .unwrap_or_else(|_| DEFAULT_ACCOUNT_POOL_ID.to_string()),
+        pool_name: row.try_get("pool_name").ok(),
         email: row.try_get("email")?,
         name: row.try_get("name")?,
         account_id: row.try_get("account_id")?,
@@ -2745,6 +3129,8 @@ fn redeem_code_account_from_row(
 fn deleted_redeem_code_account(account_id: String) -> RedeemCodeAccountSummary {
     RedeemCodeAccountSummary {
         id: account_id,
+        pool_id: DEFAULT_ACCOUNT_POOL_ID.to_string(),
+        pool_name: Some(DEFAULT_ACCOUNT_POOL_NAME.to_string()),
         email: None,
         name: None,
         account_id: None,
@@ -2888,6 +3274,319 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn pool_input(name: &str) -> AccountPoolUpsertInput {
+        AccountPoolUpsertInput {
+            name: name.to_string(),
+            workspace_label: Some(name.to_string()),
+            account_type: Some("codex".to_string()),
+            description: None,
+            is_active: Some(true),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_creates_default_pool_and_backfills_legacy_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "aether-pool-legacy-test-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let database_url = format!("sqlite://{}", path.display());
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+CREATE TABLE accounts (
+  id TEXT PRIMARY KEY,
+  email TEXT,
+  name TEXT,
+  account_id TEXT,
+  plan_type TEXT,
+  status TEXT NOT NULL DEFAULT 'available',
+  auth_fingerprint TEXT NOT NULL UNIQUE,
+  auth_file_ciphertext TEXT NOT NULL,
+  access_token_preview TEXT,
+  refresh_token_preview TEXT,
+  expires_at INTEGER,
+  last_refresh_at INTEGER,
+  last_probe_at INTEGER,
+  quota_snapshot TEXT,
+  redeem_code_id TEXT,
+  redemption_id TEXT,
+  redeemed_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+CREATE TABLE redeem_code_batches (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  total_count INTEGER NOT NULL,
+  redeemed_count INTEGER NOT NULL DEFAULT 0,
+  accounts_per_code INTEGER NOT NULL,
+  after_sale_limit INTEGER NOT NULL DEFAULT 1,
+  plan_filter_json TEXT,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (id, auth_fingerprint, auth_file_ciphertext, created_at, updated_at) VALUES ('legacy-account', 'legacy-fp', 'legacy-cipher', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO redeem_code_batches (id, name, total_count, accounts_per_code, created_at, updated_at) VALUES ('legacy-batch', 'legacy', 1, 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        let pools = repo.list_account_pools().await.unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].id, DEFAULT_ACCOUNT_POOL_ID);
+        assert!(pools[0].is_default);
+
+        let account_pool_id: String =
+            sqlx::query("SELECT pool_id FROM accounts WHERE id = 'legacy-account'")
+                .fetch_one(repo.pool())
+                .await
+                .unwrap()
+                .try_get("pool_id")
+                .unwrap();
+        let batch_pool_id: String =
+            sqlx::query("SELECT pool_id FROM redeem_code_batches WHERE id = 'legacy-batch'")
+                .fetch_one(repo.pool())
+                .await
+                .unwrap()
+                .try_get("pool_id")
+                .unwrap();
+        assert_eq!(account_pool_id, DEFAULT_ACCOUNT_POOL_ID);
+        assert_eq!(batch_pool_id, DEFAULT_ACCOUNT_POOL_ID);
+    }
+
+    #[tokio::test]
+    async fn pools_scope_account_listing_stats_and_admin_exports() {
+        let repo = temp_repo().await;
+        let left = repo.create_account_pool(pool_input("left")).await.unwrap();
+        let right = repo.create_account_pool(pool_input("right")).await.unwrap();
+        repo.import_accounts_into_pool(
+            &[parsed_account("left-acct", "left-access")],
+            Some(&left.id),
+        )
+        .await
+        .unwrap();
+        repo.import_accounts_into_pool(
+            &[parsed_account("right-acct", "right-access")],
+            Some(&right.id),
+        )
+        .await
+        .unwrap();
+
+        let left_page = repo
+            .list_accounts(AccountListQuery {
+                pool_id: Some(left.id.clone()),
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(left_page.total, 1);
+        assert_eq!(left_page.stats.total, 1);
+        assert_eq!(left_page.items[0].pool_id, left.id);
+
+        let right_export = repo
+            .export_admin_accounts_scoped(None, false, ExportFormat::Sub2api, Some(&right.id))
+            .await
+            .unwrap();
+        let accounts = right_export
+            .get("accounts")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0]
+                .get("credentials")
+                .and_then(|value| value.get("access_token"))
+                .and_then(Value::as_str),
+            Some("right-access")
+        );
+    }
+
+    #[tokio::test]
+    async fn redeem_and_after_sale_replacements_stay_in_batch_pool() {
+        let repo = temp_repo().await;
+        let left = repo.create_account_pool(pool_input("left")).await.unwrap();
+        let right = repo.create_account_pool(pool_input("right")).await.unwrap();
+        repo.import_accounts_into_pool(
+            &[
+                parsed_account("left-old", "left-old-access"),
+                parsed_account("left-fresh", "left-fresh-access"),
+            ],
+            Some(&left.id),
+        )
+        .await
+        .unwrap();
+        repo.import_accounts_into_pool(
+            &[parsed_account("right-fresh", "right-fresh-access")],
+            Some(&right.id),
+        )
+        .await
+        .unwrap();
+
+        let right_only_batch = repo
+            .create_redeem_batch_in_pool(
+                CreateRedeemBatchInput {
+                    name: "left-empty".to_string(),
+                    total_count: 1,
+                    accounts_per_code: 3,
+                    after_sale_limit: None,
+                    expires_at: None,
+                    plan_filter: None,
+                },
+                Some(&left.id),
+            )
+            .await
+            .unwrap();
+        let insufficient = repo
+            .redeem_codes_for_export(&[right_only_batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        assert!(insufficient.successes.is_empty());
+        assert_eq!(insufficient.failures[0].reason, "可兑换账号库存不足");
+
+        let batch = repo
+            .create_redeem_batch_in_pool(
+                CreateRedeemBatchInput {
+                    name: "left-after-sale".to_string(),
+                    total_count: 1,
+                    accounts_per_code: 1,
+                    after_sale_limit: Some(1),
+                    expires_at: None,
+                    plan_filter: None,
+                },
+                Some(&left.id),
+            )
+            .await
+            .unwrap();
+        let original = repo
+            .redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        assert_eq!(document_access_token(&original.document), "left-old-access");
+        let page = repo
+            .list_accounts(AccountListQuery {
+                pool_id: Some(left.id.clone()),
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let old_account = page
+            .items
+            .iter()
+            .find(|account| account.email.as_deref() == Some("left-old@example.com"))
+            .unwrap()
+            .clone();
+        set_account_status(&repo, &old_account.id, AccountStatus::AuthInvalid).await;
+        let prep = repo
+            .prepare_after_sale_export(&[batch.codes[0].code.clone()])
+            .await
+            .unwrap();
+        let after_sale = repo
+            .redeem_after_sale_for_export_with_verified_accounts(
+                &[batch.codes[0].code.clone()],
+                ExportFormat::Cpa,
+                Some(&prep.probe_account_ids),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            document_access_token(&after_sale.document),
+            "left-fresh-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn reimport_moves_only_unredeemed_accounts_between_pools() {
+        let repo = temp_repo().await;
+        let left = repo.create_account_pool(pool_input("left")).await.unwrap();
+        let right = repo.create_account_pool(pool_input("right")).await.unwrap();
+        repo.import_accounts_into_pool(&[parsed_account("moving", "left-access")], Some(&left.id))
+            .await
+            .unwrap();
+        repo.import_accounts_into_pool(
+            &[parsed_account("moving", "right-access")],
+            Some(&right.id),
+        )
+        .await
+        .unwrap();
+        let moved = repo
+            .list_accounts(AccountListQuery {
+                pool_id: Some(right.id.clone()),
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(moved.total, 1);
+        assert_eq!(moved.items[0].pool_id, right.id);
+
+        let batch = repo
+            .create_redeem_batch_in_pool(
+                CreateRedeemBatchInput {
+                    name: "redeemed".to_string(),
+                    total_count: 1,
+                    accounts_per_code: 1,
+                    after_sale_limit: None,
+                    expires_at: None,
+                    plan_filter: None,
+                },
+                Some(&right.id),
+            )
+            .await
+            .unwrap();
+        repo.redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        repo.import_accounts_into_pool(&[parsed_account("moving", "left-again")], Some(&left.id))
+            .await
+            .unwrap();
+        let all = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.total, 1);
+        assert_eq!(all.items[0].pool_id, right.id);
+        assert!(all.items[0].redeemed_at.is_some());
     }
 
     #[tokio::test]
