@@ -14,8 +14,7 @@ use account_pool_data::{
     AccountListQuery, AccountPoolRepository, AccountSummary, AutoProbeSettings,
     CreateRedeemBatchInput, DataError, RedeemRateLimitSettings,
 };
-use axum::extract::DefaultBodyLimit;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -51,6 +50,7 @@ struct AppState {
     chatgpt_session_url: Arc<String>,
     wham_usage_url: Arc<String>,
     ip_check_url: Arc<String>,
+    trust_proxy_headers: bool,
     auto_probe_lock: Arc<Mutex<()>>,
     redeem_rate_limiter: Arc<Mutex<RedeemRateLimiter>>,
 }
@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("AETHER_POOL_IP_CHECK_URL")
                 .unwrap_or_else(|_| "https://api.ipify.org?format=json".to_string()),
         ),
+        trust_proxy_headers: env_flag("AETHER_POOL_TRUST_PROXY_HEADERS"),
         auto_probe_lock: Arc::new(Mutex::new(())),
         redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
     };
@@ -130,7 +131,11 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     tracing::info!(%addr, "starting AetherPool API");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -761,10 +766,11 @@ struct RedeemAfterSaleRequest {
 
 async fn redeem_export(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<RedeemExportRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    enforce_redeem_rate_limit(&state, &headers).await?;
+    enforce_redeem_rate_limit(&state, &headers, peer_addr.ip()).await?;
     validate_redeem_export_limits(payload.codes.len(), 0)?;
     let format = payload
         .format
@@ -812,10 +818,11 @@ async fn redeem_export(
 
 async fn redeem_after_sale_export(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<RedeemAfterSaleRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    enforce_redeem_rate_limit(&state, &headers).await?;
+    enforce_redeem_rate_limit(&state, &headers, peer_addr.ip()).await?;
     validate_redeem_export_limits(payload.codes.len(), 0)?;
     let format = payload
         .format
@@ -1098,18 +1105,8 @@ async fn probe_one_account(
         if needs_diagnosis {
             let lifecycle = diagnose_lifecycle(&state, &probe_http, &auth_file).await;
             if let Some(ref refreshed) = lifecycle.auth_file {
-                if summary.redeemed_at.is_none() {
-                    state
-                        .repo
-                        .update_account_auth(
-                            &summary.id,
-                            refreshed,
-                            lifecycle_account_status(&lifecycle.status),
-                            Some(unix_now_secs()),
-                        )
-                        .await?;
-                    auth_updated = true;
-                }
+                persist_refreshed_auth(&state, &summary, refreshed, &lifecycle).await?;
+                auth_updated = true;
             }
             action = if lifecycle.ok {
                 "diagnosed".to_string()
@@ -1135,18 +1132,8 @@ async fn probe_one_account(
     } else if settings.deep_check_enabled {
         let lifecycle = diagnose_lifecycle(&state, &probe_http, &auth_file).await;
         if let Some(ref refreshed) = lifecycle.auth_file {
-            if summary.redeemed_at.is_none() {
-                state
-                    .repo
-                    .update_account_auth(
-                        &summary.id,
-                        refreshed,
-                        lifecycle_account_status(&lifecycle.status),
-                        Some(unix_now_secs()),
-                    )
-                    .await?;
-                auth_updated = true;
-            }
+            persist_refreshed_auth(&state, &summary, refreshed, &lifecycle).await?;
+            auth_updated = true;
         }
         action = lifecycle.status.clone();
         probe_source = "direct_lifecycle".to_string();
@@ -1224,6 +1211,32 @@ async fn probe_one_account(
         "wham": wham_snapshot,
         "diagnosis": diagnosis.map(|value| value.public_payload()),
     }))
+}
+
+async fn persist_refreshed_auth(
+    state: &AppState,
+    summary: &AccountSummary,
+    refreshed: &CodexAuthFile,
+    lifecycle: &LifecycleDiagnosis,
+) -> Result<(), ApiError> {
+    let refreshed_at = Some(unix_now_secs());
+    if summary.redeemed_at.is_some() {
+        state
+            .repo
+            .update_redeemed_account_auth_snapshot(&summary.id, refreshed, refreshed_at)
+            .await?;
+        return Ok(());
+    }
+    state
+        .repo
+        .update_account_auth(
+            &summary.id,
+            refreshed,
+            lifecycle_account_status(&lifecycle.status),
+            refreshed_at,
+        )
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2478,12 +2491,16 @@ impl RedeemRateLimiter {
     }
 }
 
-async fn enforce_redeem_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+async fn enforce_redeem_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+) -> Result<(), ApiError> {
     let settings = state.repo.get_redeem_rate_limit_settings().await?;
     if !settings.enabled {
         return Ok(());
     }
-    let ip = client_ip_from_headers(headers).unwrap_or_else(|| "unknown".to_string());
+    let ip = redeem_rate_limit_client_ip(headers, peer_ip, state.trust_proxy_headers);
     if redeem_rate_limit_ip_whitelisted(&ip, &settings.whitelist_ips) {
         return Ok(());
     }
@@ -2501,6 +2518,19 @@ async fn enforce_redeem_rate_limit(state: &AppState, headers: &HeaderMap) -> Res
             format!("兑换请求过于频繁，请 {retry_after_seconds} 秒后重试"),
         )),
     }
+}
+
+fn redeem_rate_limit_client_ip(
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+    trust_proxy_headers: bool,
+) -> String {
+    if trust_proxy_headers {
+        if let Some(ip) = client_ip_from_headers(headers) {
+            return ip;
+        }
+    }
+    peer_ip.to_string()
 }
 
 fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -2785,6 +2815,7 @@ mod tests {
             chatgpt_session_url: Arc::new(format!("{base_url}/api/auth/session")),
             wham_usage_url: Arc::new(format!("{base_url}/backend-api/wham/usage")),
             ip_check_url: Arc::new(format!("{base_url}/ip")),
+            trust_proxy_headers: false,
             auto_probe_lock: Arc::new(Mutex::new(())),
             redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
         }
@@ -3276,6 +3307,25 @@ mod tests {
             "203.0.113.10",
             &["203.0.113.10".to_string()]
         ));
+    }
+
+    #[test]
+    fn redeem_rate_limit_uses_peer_ip_unless_proxy_headers_are_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.10, 10.0.0.2"),
+        );
+        let peer_ip = "198.51.100.20".parse::<IpAddr>().unwrap();
+
+        assert_eq!(
+            redeem_rate_limit_client_ip(&headers, peer_ip, false),
+            "198.51.100.20"
+        );
+        assert_eq!(
+            redeem_rate_limit_client_ip(&headers, peer_ip, true),
+            "203.0.113.10"
+        );
     }
 
     #[test]

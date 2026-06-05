@@ -44,6 +44,7 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-admin-token`.
 By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. The API refuses known example admin tokens and empty/example encryption secrets unless `AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1` is explicitly set for isolated local development. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
 Cross-origin browser access is restricted by `AETHER_POOL_CORS_ORIGINS`, defaulting to local Vite origins.
+Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`.
 
 The public web entry is `/` and only shows the redeem/export page. The management console is available at `/alalalateam` and is not linked from the public page.
 

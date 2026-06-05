@@ -520,6 +520,89 @@ WHERE id = ? AND redeemed_at IS NULL
         Ok(())
     }
 
+    pub async fn update_redeemed_account_auth_snapshot(
+        &self,
+        account_id: &str,
+        auth_file: &CodexAuthFile,
+        refreshed_at: Option<u64>,
+    ) -> Result<(), DataError> {
+        let now = unix_now_secs() as i64;
+        let mut tx = self.pool.begin().await?;
+        let account_row = sqlx::query(
+            r#"
+SELECT redemption_id
+FROM accounts
+WHERE id = ? AND redeemed_at IS NOT NULL
+"#,
+        )
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(account_row) = account_row else {
+            tx.commit().await?;
+            return Ok(());
+        };
+
+        sqlx::query(
+            r#"
+UPDATE accounts
+SET auth_file_ciphertext = ?, access_token_preview = ?, refresh_token_preview = ?,
+    expires_at = ?, last_refresh_at = COALESCE(?, last_refresh_at),
+    updated_at = ?
+WHERE id = ? AND redeemed_at IS NOT NULL
+"#,
+        )
+        .bind(self.secrets.encrypt_json(&auth_file.clone().normalized())?)
+        .bind(secret_preview(auth_file.access_token.as_deref()))
+        .bind(secret_preview(auth_file.refresh_token.as_deref()))
+        .bind(auth_file.expires_at_epoch().map(|value| value as i64))
+        .bind(refreshed_at.map(|value| value as i64))
+        .bind(now)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let redemption_id: Option<String> = account_row.try_get("redemption_id")?;
+        let Some(redemption_id) = redemption_id.filter(|value| !value.trim().is_empty()) else {
+            tx.commit().await?;
+            return Ok(());
+        };
+        let Some(redemption_row) =
+            sqlx::query("SELECT account_ids_json FROM redeem_redemptions WHERE id = ?")
+                .bind(&redemption_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            tx.commit().await?;
+            return Ok(());
+        };
+        let account_ids = serde_json::from_str::<Vec<String>>(
+            redemption_row
+                .try_get::<String, _>("account_ids_json")?
+                .as_str(),
+        )
+        .unwrap_or_default();
+        if account_ids.is_empty() {
+            tx.commit().await?;
+            return Ok(());
+        }
+        if let Some(auth_files) = self
+            .load_existing_auth_snapshots_for_ids_tx(&mut tx, &account_ids)
+            .await?
+        {
+            let snapshot = self.secrets.encrypt_json(&auth_files)?;
+            sqlx::query(
+                "UPDATE redeem_redemptions SET export_snapshot_ciphertext = ? WHERE id = ?",
+            )
+            .bind(snapshot)
+            .bind(&redemption_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn mark_account_status(
         &self,
         account_id: &str,
@@ -1543,8 +1626,9 @@ WHERE codes.code_hash = ?
                 continue;
             }
 
-            let Some(redemption_row) =
-                sqlx::query("SELECT account_ids_json FROM redeem_redemptions WHERE id = ?")
+            let Some(redemption_row) = sqlx::query(
+                "SELECT account_ids_json, export_snapshot_ciphertext FROM redeem_redemptions WHERE id = ?",
+            )
                     .bind(&original_redemption_id)
                     .fetch_optional(&mut *tx)
                     .await?
@@ -1587,6 +1671,26 @@ WHERE codes.code_hash = ?
                     code: formatted_code,
                     reason: "当前绑定账号状态不支持自助售后".to_string(),
                 });
+                continue;
+            }
+            if old_account_ids.iter().all(|account_id| {
+                old_statuses
+                    .get(account_id)
+                    .is_some_and(|status| status == AccountStatus::Available.as_str())
+            }) {
+                let snapshot_ciphertext: String =
+                    redemption_row.try_get("export_snapshot_ciphertext")?;
+                let auth_files = self
+                    .secrets
+                    .decrypt_json::<Vec<CodexAuthFile>>(&snapshot_ciphertext)?;
+                successes.push(RedeemSuccess {
+                    code: formatted_code,
+                    account_count: old_account_ids.len(),
+                    after_sale_count: Some(after_sale_count.max(0) as usize),
+                    replacement_account_count: Some(0),
+                });
+                all_account_ids.extend(old_account_ids);
+                all_auth_files.extend(auth_files.into_iter().map(CodexAuthFile::normalized));
                 continue;
             }
             if old_account_ids.iter().any(|account_id| {
@@ -1890,6 +1994,30 @@ WHERE a.id = ?
             ));
         }
         Ok(out)
+    }
+
+    async fn load_existing_auth_snapshots_for_ids_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        ids: &[String],
+    ) -> Result<Option<Vec<CodexAuthFile>>, DataError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row = sqlx::query("SELECT auth_file_ciphertext FROM accounts WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let ciphertext: String = row.try_get("auth_file_ciphertext")?;
+            out.push(
+                self.secrets
+                    .decrypt_json::<CodexAuthFile>(&ciphertext)?
+                    .normalized(),
+            );
+        }
+        Ok(Some(out))
     }
 
     async fn load_redeem_code_account_map(
@@ -3580,7 +3708,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_sale_rejects_when_current_binding_is_still_available() {
+    async fn after_sale_reexports_refreshed_current_binding_without_consuming_reissue() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("old-1", "old-access")])
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "after sale restored current".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: Some(1),
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let original = repo
+            .redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        assert_eq!(document_access_token(&original.document), "old-access");
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let old_account = page
+            .items
+            .iter()
+            .find(|account| account.email.as_deref() == Some("old-1@example.com"))
+            .unwrap()
+            .clone();
+        let refreshed_auth = parsed_account("old-1", "old-access-refreshed").auth_file;
+        repo.update_redeemed_account_auth_snapshot(&old_account.id, &refreshed_auth, Some(123))
+            .await
+            .unwrap();
+        set_account_status(&repo, &old_account.id, AccountStatus::Available).await;
+
+        let after_sale = repo
+            .redeem_after_sale_for_export_with_verified_accounts(
+                &[batch.codes[0].code.clone()],
+                ExportFormat::Cpa,
+                Some(std::slice::from_ref(&old_account.id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_sale.successes.len(), 1);
+        assert!(after_sale.failures.is_empty());
+        assert_eq!(after_sale.successes[0].account_count, 1);
+        assert_eq!(after_sale.successes[0].after_sale_count, Some(0));
+        assert_eq!(after_sale.successes[0].replacement_account_count, Some(0));
+        assert_eq!(
+            document_access_token(&after_sale.document),
+            "old-access-refreshed"
+        );
+
+        let repeat_export = repo
+            .redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        assert_eq!(
+            document_access_token(&repeat_export.document),
+            "old-access-refreshed"
+        );
+        let codes = repo.list_redeem_codes(&batch.batch_id).await.unwrap();
+        assert_eq!(codes[0].after_sale_count, 0);
+        assert!(codes[0].after_sales.is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_sale_reexports_when_current_binding_is_still_available() {
         let repo = temp_repo().await;
         repo.import_accounts(&[
             parsed_account("old-1", "old-access"),
@@ -3611,8 +3813,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(outcome.successes.is_empty());
-        assert_eq!(outcome.failures[0].reason, "当前绑定账号仍可用");
+        assert_eq!(outcome.successes.len(), 1);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.successes[0].after_sale_count, Some(0));
+        assert_eq!(outcome.successes[0].replacement_account_count, Some(0));
+        assert_eq!(document_access_token(&outcome.document), "old-access");
     }
 
     #[tokio::test]
