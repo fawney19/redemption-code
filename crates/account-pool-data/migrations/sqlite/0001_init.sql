@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS redeem_code_batches (
   total_count INTEGER NOT NULL,
   redeemed_count INTEGER NOT NULL DEFAULT 0,
   accounts_per_code INTEGER NOT NULL,
+  after_sale_limit INTEGER NOT NULL DEFAULT 1,
   plan_filter_json TEXT,
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
@@ -94,6 +95,27 @@ CREATE TABLE IF NOT EXISTS redeem_redemptions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_redeem_redemptions_code ON redeem_redemptions(code_id, created_at);
+
+CREATE TABLE IF NOT EXISTS redeem_after_sales (
+  id TEXT PRIMARY KEY,
+  code_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  original_redemption_id TEXT NOT NULL,
+  replacement_redemption_id TEXT NOT NULL,
+  old_account_ids_json TEXT NOT NULL,
+  new_account_ids_json TEXT NOT NULL,
+  export_format TEXT NOT NULL,
+  export_snapshot_ciphertext TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(code_id) REFERENCES redeem_codes(id) ON DELETE CASCADE,
+  FOREIGN KEY(batch_id) REFERENCES redeem_code_batches(id) ON DELETE CASCADE,
+  FOREIGN KEY(original_redemption_id) REFERENCES redeem_redemptions(id) ON DELETE CASCADE,
+  FOREIGN KEY(replacement_redemption_id) REFERENCES redeem_redemptions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_redeem_after_sales_code ON redeem_after_sales(code_id, created_at);
 
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,

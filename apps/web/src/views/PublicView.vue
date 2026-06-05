@@ -20,11 +20,31 @@
           <div class="panel redeem-panel">
             <div class="panel-header">
               <div>
-                <h2>兑换码</h2>
-                <p>每行一个兑换码，支持批量兑换</p>
+                <h2>{{ modeTitle }}</h2>
+                <p>{{ modeSubtitle }}</p>
               </div>
             </div>
             <div class="panel-body grid">
+              <div class="mode-tabs" role="tablist" aria-label="兑换模式">
+                <button
+                  class="mode-tab"
+                  :class="{ active: redeemMode === 'redeem' }"
+                  type="button"
+                  @click="redeemMode = 'redeem'"
+                >
+                  <Download :size="15" />
+                  <span>兑换导出</span>
+                </button>
+                <button
+                  class="mode-tab"
+                  :class="{ active: redeemMode === 'afterSale' }"
+                  type="button"
+                  @click="redeemMode = 'afterSale'"
+                >
+                  <RefreshCw :size="15" />
+                  <span>售后补发</span>
+                </button>
+              </div>
               <textarea
                 v-model="redeemText"
                 class="textarea redeem-textarea"
@@ -37,8 +57,8 @@
                   <option value="sub2api">Sub2API JSON</option>
                 </select>
                 <button class="button primary" :disabled="busy || !redeemText.trim()" @click="handleRedeem">
-                  <Download :size="15" />
-                  <span>兑换并导出</span>
+                  <component :is="redeemMode === 'afterSale' ? RefreshCw : Download" :size="15" />
+                  <span>{{ actionLabel }}</span>
                 </button>
               </div>
             </div>
@@ -66,11 +86,11 @@
                 </div>
                 <div class="result-metrics">
                   <div>
-                    <span>成功兑换</span>
+                    <span>{{ successMetricLabel }}</span>
                     <strong>{{ redeemSuccesses.length }}</strong>
                   </div>
                   <div>
-                    <span>导出账号</span>
+                    <span>{{ accountMetricLabel }}</span>
                     <strong>{{ redeemedAccountCount }}</strong>
                   </div>
                   <div>
@@ -114,7 +134,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { CircleAlert, CircleCheck, Download, FileCode, FileJson, ShieldCheck } from 'lucide-vue-next'
+import { CircleAlert, CircleCheck, Download, FileCode, FileJson, RefreshCw, ShieldCheck } from 'lucide-vue-next'
 import { api, type EncodedDownload, type ExportFormat, type RedeemFailure, type RedeemSuccess } from '../api/client'
 import { downloadEncodedFile, downloadJson, normalizeDownloadFileName, timestamp } from '../composables/useAdmin'
 import { useToast } from '../composables/useToast'
@@ -123,6 +143,7 @@ import BrandMark from '../components/BrandMark.vue'
 const { success, error: showError } = useToast()
 
 const busy = ref(false)
+const redeemMode = ref<'redeem' | 'afterSale'>('redeem')
 const redeemText = ref('')
 const redeemFormat = ref<ExportFormat>('cpa')
 const redeemStatus = ref<'idle' | 'success' | 'error'>('idle')
@@ -135,9 +156,17 @@ const redeemFailures = ref<RedeemFailure[]>([])
 const maxRedeemCodes = 500
 
 const formatLabel = computed(() => redeemFormat.value === 'cpa' ? 'CPA JSON / ZIP' : 'Sub2API JSON')
-const previewText = computed(() => redeemFormat.value === 'cpa'
-  ? 'CPA 单账号会导出 JSON，多账号会导出 ZIP 包。'
-  : 'Sub2API 会导出包含 accounts 的 JSON。')
+const modeTitle = computed(() => redeemMode.value === 'afterSale' ? '售后补发' : '兑换码')
+const modeSubtitle = computed(() => redeemMode.value === 'afterSale' ? '提交已兑换码，失效后自动补发' : '每行一个兑换码，支持批量兑换')
+const actionLabel = computed(() => redeemMode.value === 'afterSale' ? '售后并导出' : '兑换并导出')
+const successMetricLabel = computed(() => redeemMode.value === 'afterSale' ? '成功售后' : '成功兑换')
+const accountMetricLabel = computed(() => redeemMode.value === 'afterSale' ? '补发账号' : '导出账号')
+const previewText = computed(() => {
+  if (redeemMode.value === 'afterSale') return '仅认证失效类账号会自动补发。'
+  return redeemFormat.value === 'cpa'
+    ? 'CPA 单账号会导出 JSON，多账号会导出 ZIP 包。'
+    : 'Sub2API 会导出包含 accounts 的 JSON。'
+})
 const redeemedAccountCount = computed(() => redeemSuccesses.value.reduce((sum, item) => sum + Number(item.account_count || 0), 0))
 
 async function handleRedeem() {
@@ -147,8 +176,11 @@ async function handleRedeem() {
     if (codes.length > maxRedeemCodes) {
       throw new Error(`单次最多提交 ${maxRedeemCodes} 个兑换码`)
     }
-    const result = await api.redeemExport({ codes, format: redeemFormat.value })
-    const fallbackFileName = `account-pool-redeem-${result.format}-${timestamp()}.json`
+    const result = redeemMode.value === 'afterSale'
+      ? await api.redeemAfterSale({ codes, format: redeemFormat.value })
+      : await api.redeemExport({ codes, format: redeemFormat.value })
+    const prefix = redeemMode.value === 'afterSale' ? 'after-sale' : 'redeem'
+    const fallbackFileName = `account-pool-${prefix}-${result.format}-${timestamp()}.json`
     redeemDocument.value = result.document
     redeemDownload.value = result.download || null
     redeemFileName.value = result.download?.filename
@@ -160,7 +192,7 @@ async function handleRedeem() {
     redeemErrorText.value = ''
     if (result.download) downloadEncodedFile(result.download)
     else downloadJson(fallbackFileName, result.document)
-    success('兑换成功，文件已开始下载')
+    success(redeemMode.value === 'afterSale' ? '售后成功，文件已开始下载' : '兑换成功，文件已开始下载')
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     redeemStatus.value = 'error'

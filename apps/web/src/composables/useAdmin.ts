@@ -7,6 +7,8 @@ import {
   type DeleteAccountsResponse,
   type EncodedDownload,
   type ExportFormat,
+  type CpaTestResponse,
+  type ProbeMode,
   type ProxyTestResponse,
   type RedeemBatch,
   type RedeemCode,
@@ -35,6 +37,8 @@ const redeemRateLimitSettings = ref<RedeemRateLimitSettings | null>(null)
 const redeemRateLimitResult = ref('')
 const proxyTestResult = ref<ProxyTestResponse | null>(null)
 const proxyTestError = ref('')
+const cpaTestResult = ref<CpaTestResponse | null>(null)
+const cpaTestError = ref('')
 const activeView = ref<'accounts' | 'codes'>('accounts')
 const filters = reactive({ search: '', status: '', redeemed: '' })
 const accountPagination = reactive({
@@ -52,6 +56,7 @@ const batchForm = reactive({
   name: '',
   total_count: 10,
   accounts_per_code: 1,
+  after_sale_limit: 1,
   expires_at_text: '',
 })
 const autoProbeForm = reactive({
@@ -60,6 +65,11 @@ const autoProbeForm = reactive({
   max_accounts_per_run: 100,
   concurrency: 4,
   refresh_before_probe: false,
+  probe_mode: 'hybrid' as ProbeMode,
+  deep_check_enabled: true,
+  cpa_base_url: '',
+  cpa_management_key: '',
+  cpa_management_key_set: false,
   proxy_enabled: false,
   proxy_mode: 'fixed' as 'fixed' | 'api',
   proxy_url: '',
@@ -92,6 +102,15 @@ const proxyTestDisabled = computed(() => {
   if (autoProbeForm.proxy_mode === 'api') return !autoProbeForm.proxy_api_url.trim()
   return !autoProbeForm.proxy_url.trim()
 })
+const cpaTestDisabled = computed(() => {
+  if (busy.value) return true
+  return !autoProbeForm.cpa_base_url.trim()
+    || (!autoProbeForm.cpa_management_key.trim() && !autoProbeForm.cpa_management_key_set)
+})
+const cpaScanDisabled = computed(() => {
+  if (busy.value) return true
+  return !autoProbeForm.cpa_base_url.trim() || !autoProbeForm.cpa_management_key_set
+})
 const batchCodesText = computed(() => batchCodes.value.length ? JSON.stringify(batchCodes.value, null, 2) : '选择批次查看兑换码状态')
 const selectedBatch = computed(() => batches.value.find((batch) => batch.id === selectedBatchId.value) || null)
 const redeemStats = computed(() => {
@@ -118,9 +137,11 @@ const redeemStats = computed(() => {
 const selectedBatchStats = computed(() => {
   const totalCodes = batchCodes.value.length
   const redeemedCodes = batchCodes.value.filter((code) => code.status === 'redeemed' || code.redeemed_at).length
+  const afterSaleCount = batchCodes.value.reduce((sum, code) => sum + Number(code.after_sale_count || 0), 0)
   return {
     totalCodes,
     redeemedCodes,
+    afterSaleCount,
     activeCodes: batchCodes.value.filter((code) => code.status === 'active' && !code.redeemed_at).length,
     disabledCodes: batchCodes.value.filter((code) => code.status === 'disabled').length,
     redemptionRate: totalCodes ? Math.round((redeemedCodes / totalCodes) * 100) : 0,
@@ -155,6 +176,8 @@ export function useAdmin() {
     redeemRateLimitResult,
     proxyTestResult,
     proxyTestError,
+    cpaTestResult,
+    cpaTestError,
     autoProbeForm,
     autoProbeIntervalMinutes,
     redeemRateLimitForm,
@@ -176,6 +199,8 @@ export function useAdmin() {
     canPrevAccountsPage,
     canNextAccountsPage,
     proxyTestDisabled,
+    cpaTestDisabled,
+    cpaScanDisabled,
     batchCodesText,
     selectedBatch,
     redeemStats,
@@ -221,6 +246,10 @@ export function logoutAdmin() {
   autoProbeResult.value = ''
   redeemRateLimitSettings.value = null
   redeemRateLimitResult.value = ''
+  proxyTestResult.value = null
+  proxyTestError.value = ''
+  cpaTestResult.value = null
+  cpaTestError.value = ''
   accountPagination.total = 0
   accountPagination.offset = 0
   applyAccountStats()
@@ -368,6 +397,10 @@ export async function saveAutoProbeSettings() {
       max_accounts_per_run: Number(autoProbeForm.max_accounts_per_run || 1),
       concurrency: Number(autoProbeForm.concurrency || 1),
       refresh_before_probe: false,
+      probe_mode: autoProbeForm.probe_mode,
+      deep_check_enabled: autoProbeForm.deep_check_enabled,
+      cpa_base_url: autoProbeForm.cpa_base_url.trim() || null,
+      cpa_management_key: autoProbeForm.cpa_management_key.trim() || null,
       proxy_enabled: autoProbeForm.proxy_enabled,
       proxy_mode: autoProbeForm.proxy_mode,
       proxy_url: autoProbeForm.proxy_url.trim() || null,
@@ -375,6 +408,7 @@ export async function saveAutoProbeSettings() {
       proxy_default_scheme: autoProbeForm.proxy_default_scheme,
     })
     applyAutoProbeSettings(result.settings, result.next_run_at ?? null)
+    autoProbeForm.cpa_management_key = ''
     autoProbeResult.value = JSON.stringify({ saved: true, settings: result.settings }, null, 2)
   })
 }
@@ -409,6 +443,9 @@ export async function testProxyEgress() {
         max_accounts_per_run: Number(autoProbeForm.max_accounts_per_run || 1),
         concurrency: Number(autoProbeForm.concurrency || 1),
         refresh_before_probe: false,
+        probe_mode: autoProbeForm.probe_mode,
+        deep_check_enabled: autoProbeForm.deep_check_enabled,
+        cpa_base_url: autoProbeForm.cpa_base_url.trim() || null,
         proxy_enabled: autoProbeForm.proxy_enabled,
         proxy_mode: autoProbeForm.proxy_mode,
         proxy_url: autoProbeForm.proxy_url.trim() || null,
@@ -418,6 +455,37 @@ export async function testProxyEgress() {
     },
     (message) => {
       proxyTestError.value = message
+    },
+  )
+}
+
+export async function testCpaConnection() {
+  await withBusy(
+    async () => {
+      cpaTestResult.value = null
+      cpaTestError.value = ''
+      cpaTestResult.value = await api.testCpaConnection(apiState.value, {
+        probe_mode: autoProbeForm.probe_mode,
+        deep_check_enabled: autoProbeForm.deep_check_enabled,
+        cpa_base_url: autoProbeForm.cpa_base_url.trim() || null,
+        cpa_management_key: autoProbeForm.cpa_management_key.trim() || null,
+      })
+    },
+    (message) => {
+      cpaTestError.value = message
+    },
+  )
+}
+
+export async function scanCpa401() {
+  await withBusy(
+    async () => {
+      cpaTestError.value = ''
+      const result = await api.scanCpa401(apiState.value, 20)
+      autoProbeResult.value = JSON.stringify(result, null, 2)
+    },
+    (message) => {
+      cpaTestError.value = message
     },
   )
 }
@@ -458,6 +526,7 @@ export async function createBatch() {
       name: batchForm.name || `兑换码批次 ${new Date().toLocaleString()}`,
       total_count: Number(batchForm.total_count || 1),
       accounts_per_code: Number(batchForm.accounts_per_code || 1),
+      after_sale_limit: Number(batchForm.after_sale_limit ?? 1),
       expires_at: Number.isFinite(expiresAt) ? expiresAt : null,
       plan_filter: null,
     })
@@ -485,6 +554,11 @@ function applyAutoProbeSettings(settings: AutoProbeSettings, nextRunAt: number |
   autoProbeForm.max_accounts_per_run = settings.max_accounts_per_run
   autoProbeForm.concurrency = settings.concurrency
   autoProbeForm.refresh_before_probe = false
+  autoProbeForm.probe_mode = settings.probe_mode || 'hybrid'
+  autoProbeForm.deep_check_enabled = settings.deep_check_enabled !== false
+  autoProbeForm.cpa_base_url = settings.cpa_base_url || ''
+  autoProbeForm.cpa_management_key = ''
+  autoProbeForm.cpa_management_key_set = Boolean(settings.cpa_management_key_set)
   autoProbeForm.proxy_enabled = Boolean(settings.proxy_enabled)
   autoProbeForm.proxy_mode = settings.proxy_mode || 'fixed'
   autoProbeForm.proxy_url = settings.proxy_url || ''

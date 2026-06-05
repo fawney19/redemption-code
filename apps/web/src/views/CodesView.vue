@@ -31,6 +31,7 @@
           <input v-model="batchForm.name" class="input" placeholder="批次名称" />
           <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="5000" placeholder="兑换码数量" />
           <input v-model.number="batchForm.accounts_per_code" class="input" type="number" min="1" max="100" placeholder="每码账号数" />
+          <input v-model.number="batchForm.after_sale_limit" class="input" type="number" min="0" max="10" placeholder="每码售后次数" />
           <input v-model="batchForm.expires_at_text" class="input" placeholder="过期时间，可选：2026-07-01T00:00:00+08:00" />
           <button class="button primary" :disabled="busy" @click="createBatch">
             <Plus :size="15" />生成
@@ -103,6 +104,7 @@
                   <th>批次</th>
                   <th>兑换进度</th>
                   <th>每码</th>
+                  <th>售后</th>
                   <th>状态</th>
                   <th>操作</th>
                 </tr>
@@ -126,6 +128,7 @@
                     </div>
                   </td>
                   <td>{{ batch.accounts_per_code }} 账号</td>
+                  <td>{{ batch.after_sale_limit }} 次</td>
                   <td>
                     <span class="badge" :class="batchStatusClass(batch)">{{ batchStatusLabel(batch) }}</span>
                   </td>
@@ -138,7 +141,7 @@
                   </td>
                 </tr>
                 <tr v-if="!batches.length">
-                  <td colspan="5" class="empty-row">
+                  <td colspan="6" class="empty-row">
                     <Ticket :size="20" />
                     <span>暂无批次</span>
                   </td>
@@ -156,6 +159,7 @@
               <div class="detail-stats">
                 <span>{{ selectedBatchStats.redeemedCodes }} 已兑</span>
                 <span>{{ selectedBatchStats.activeCodes }} 可兑</span>
+                <span>{{ selectedBatchStats.afterSaleCount }} 售后</span>
                 <span>{{ selectedBatchStats.redemptionRate }}%</span>
               </div>
             </div>
@@ -169,6 +173,7 @@
                     <th>绑定账号</th>
                     <th>兑换时间</th>
                     <th>兑换记录</th>
+                    <th>售后</th>
                     <th>操作</th>
                   </tr>
                 </thead>
@@ -194,6 +199,20 @@
                     <td>{{ formatTime(code.redeemed_at) }}</td>
                     <td class="mono">{{ code.redemption_id || '-' }}</td>
                     <td>
+                      <div class="after-sale-cell">
+                        <span class="badge" :class="code.after_sale_count ? 'redeemed' : 'disabled'">
+                          {{ code.after_sale_count }} 次
+                        </span>
+                        <div v-if="code.after_sales.length" class="after-sale-list">
+                          <div v-for="afterSale in code.after_sales" :key="afterSale.id" class="after-sale-item">
+                            <strong>{{ formatTime(afterSale.created_at) }}</strong>
+                            <span>{{ afterSale.reason || statusLabel(afterSale.status) }}</span>
+                            <small>{{ formatAfterSaleAccounts(afterSale) }}</small>
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td>
                       <button
                         class="button ghost tiny"
                         :disabled="busy || probingCodeId === code.id || !boundAccountIds(code).length"
@@ -204,7 +223,7 @@
                     </td>
                   </tr>
                   <tr v-if="!batchCodes.length">
-                    <td colspan="6" class="empty-row">
+                    <td colspan="7" class="empty-row">
                       <Ticket :size="20" />
                       <span>暂无兑换码明细</span>
                     </td>
@@ -240,7 +259,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { Activity, Copy, Download, Plus, RefreshCw, Ticket } from 'lucide-vue-next'
-import type { RedeemBatch, RedeemCode } from '../api/client'
+import type { RedeemAfterSale, RedeemBatch, RedeemCode } from '../api/client'
 import { api } from '../api/client'
 import {
   useAdmin,
@@ -354,6 +373,7 @@ function buildBatchCsv(batch: RedeemBatch) {
       batch.total_count,
       batch.redeemed_count,
       batch.accounts_per_code,
+      batch.after_sale_limit,
       formatCsvTime(batch.expires_at),
       code.id,
       displayCode(code),
@@ -362,6 +382,8 @@ function buildBatchCsv(batch: RedeemBatch) {
       formatBoundAccounts(code),
       formatCsvTime(code.redeemed_at),
       code.redemption_id || '',
+      code.after_sale_count || 0,
+      formatAfterSales(code),
       formatCsvTime(code.created_at),
       formatCsvTime(code.updated_at),
     ])
@@ -373,7 +395,10 @@ function buildBatchCsv(batch: RedeemBatch) {
       batch.total_count,
       batch.redeemed_count,
       batch.accounts_per_code,
+      batch.after_sale_limit,
       formatCsvTime(batch.expires_at),
+      '',
+      '',
       '',
       '',
       '',
@@ -392,6 +417,7 @@ function buildBatchCsv(batch: RedeemBatch) {
     'total_count',
     'redeemed_count',
     'accounts_per_code',
+    'after_sale_limit',
     'batch_expires_at',
     'code_id',
     'code',
@@ -400,6 +426,8 @@ function buildBatchCsv(batch: RedeemBatch) {
     'bound_accounts',
     'code_redeemed_at',
     'redemption_id',
+    'after_sale_count',
+    'after_sales',
     'code_created_at',
     'code_updated_at',
   ]
@@ -430,6 +458,18 @@ function accountDetailText(account: RedeemCode['accounts'][number]) {
 function formatBoundAccounts(code: RedeemCode) {
   return code.accounts
     .map((account) => `${accountDisplayName(account)} (${account.status})`)
+    .join('; ')
+}
+
+function formatAfterSaleAccounts(afterSale: RedeemAfterSale) {
+  const oldAccounts = afterSale.old_accounts.map(accountDisplayName).join('、') || '-'
+  const newAccounts = afterSale.new_accounts.map(accountDisplayName).join('、') || '-'
+  return `${oldAccounts} -> ${newAccounts}`
+}
+
+function formatAfterSales(code: RedeemCode) {
+  return code.after_sales
+    .map((afterSale) => `${formatTime(afterSale.created_at)} ${formatAfterSaleAccounts(afterSale)}`)
     .join('; ')
 }
 

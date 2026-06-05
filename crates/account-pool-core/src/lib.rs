@@ -6,6 +6,14 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const CHATGPT_ACCOUNTS_CHECK_URL: &str =
+    "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480";
+pub const CHATGPT_SESSION_URL: &str = "https://chatgpt.com/api/auth/session";
+pub const OPENAI_OAUTH_REFRESH_SCOPE: &str = "openid profile email";
+pub const OPENAI_BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+pub const CPA_PROBE_USER_AGENT: &str =
+    "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal";
 pub const CODEX_DEFAULT_USER_AGENT: &str =
     "codex-tui/0.122.0 (Mac OS 15.2.0; arm64) vscode/2.6.11 (codex-tui; 0.122.0)";
 pub const CODEX_DEFAULT_ORIGINATOR: &str = "codex-tui";

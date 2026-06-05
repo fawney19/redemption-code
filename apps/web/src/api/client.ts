@@ -43,8 +43,29 @@ export interface RedeemBatch {
   total_count: number
   redeemed_count: number
   accounts_per_code: number
+  after_sale_limit: number
   plan_filter: string[]
   expires_at?: number | null
+  created_at: number
+}
+
+export interface RedeemCodeAccount {
+  id: string
+  email?: string | null
+  name?: string | null
+  account_id?: string | null
+  plan_type?: string | null
+  status: string
+  last_probe_at?: number | null
+  quota_snapshot?: Record<string, unknown> | null
+}
+
+export interface RedeemAfterSale {
+  id: string
+  status: string
+  reason?: string | null
+  old_accounts: RedeemCodeAccount[]
+  new_accounts: RedeemCodeAccount[]
   created_at: number
 }
 
@@ -56,16 +77,9 @@ export interface RedeemCode {
   status: string
   redemption_id?: string | null
   redeemed_at?: number | null
-  accounts: Array<{
-    id: string
-    email?: string | null
-    name?: string | null
-    account_id?: string | null
-    plan_type?: string | null
-    status: string
-    last_probe_at?: number | null
-    quota_snapshot?: Record<string, unknown> | null
-  }>
+  after_sale_count: number
+  after_sales: RedeemAfterSale[]
+  accounts: RedeemCodeAccount[]
   created_at: number
   updated_at: number
 }
@@ -90,6 +104,8 @@ export interface ExportResponse {
 export interface RedeemSuccess {
   code: string
   account_count: number
+  after_sale_count?: number | null
+  replacement_account_count?: number | null
 }
 
 export interface RedeemFailure {
@@ -102,12 +118,18 @@ export interface RedeemExportResponse extends ExportResponse {
   failures: RedeemFailure[]
 }
 
+export type ProbeMode = 'hybrid' | 'direct' | 'cpa'
+
 export interface AutoProbeSettings {
   enabled: boolean
   interval_seconds: number
   max_accounts_per_run: number
   concurrency: number
   refresh_before_probe: boolean
+  probe_mode: ProbeMode
+  deep_check_enabled: boolean
+  cpa_base_url?: string | null
+  cpa_management_key_set: boolean
   proxy_enabled: boolean
   proxy_mode: 'fixed' | 'api'
   proxy_url?: string | null
@@ -146,6 +168,27 @@ export interface ProxyTestResponse {
   mode: 'direct' | 'fixed' | 'api' | string
   url: string
   elapsed_ms: number
+}
+
+export interface CpaTestResponse {
+  success: boolean
+  base_url: string
+  auth_file_count: number
+  elapsed_ms: number
+}
+
+export interface CpaScanResponse {
+  success: boolean
+  total: number
+  max_items: number
+  results: unknown[]
+  diagnostics: unknown[]
+  summary: {
+    total: number
+    ready: number
+    error_accounts: number
+    failed: number
+  }
 }
 
 export interface DeleteAccountsResponse {
@@ -249,6 +292,7 @@ export const api = {
     name: string
     total_count: number
     accounts_per_code: number
+    after_sale_limit?: number | null
     expires_at?: number | null
     plan_filter?: string[] | null
   }) {
@@ -286,12 +330,15 @@ export const api = {
     | 'max_accounts_per_run'
     | 'concurrency'
     | 'refresh_before_probe'
+    | 'probe_mode'
+    | 'deep_check_enabled'
+    | 'cpa_base_url'
     | 'proxy_enabled'
     | 'proxy_mode'
     | 'proxy_url'
     | 'proxy_api_url'
     | 'proxy_default_scheme'
-  >>) {
+  >> & { cpa_management_key?: string | null }) {
     return request<AutoProbeSettingsResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe`, state, {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -304,6 +351,9 @@ export const api = {
     | 'max_accounts_per_run'
     | 'concurrency'
     | 'refresh_before_probe'
+    | 'probe_mode'
+    | 'deep_check_enabled'
+    | 'cpa_base_url'
     | 'proxy_enabled'
     | 'proxy_mode'
     | 'proxy_url'
@@ -315,6 +365,23 @@ export const api = {
       body: JSON.stringify(payload),
     })
   },
+  testCpaConnection(state: ApiState, payload: Partial<Pick<
+    AutoProbeSettings,
+    | 'probe_mode'
+    | 'deep_check_enabled'
+    | 'cpa_base_url'
+  >> & { cpa_management_key?: string | null }) {
+    return request<CpaTestResponse>(`${MANAGEMENT_API_PREFIX}/settings/cpa/test`, state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  scanCpa401(state: ApiState, maxItems = 20) {
+    return request<CpaScanResponse>(`${MANAGEMENT_API_PREFIX}/cpa/scan-401`, state, {
+      method: 'POST',
+      body: JSON.stringify({ max_items: maxItems }),
+    })
+  },
   runAutoProbeNow(state: ApiState) {
     return request<AutoProbeRunResponse>(`${MANAGEMENT_API_PREFIX}/settings/auto-probe/run`, state, {
       method: 'POST',
@@ -324,6 +391,13 @@ export const api = {
   redeemExport(payload: { codes: string[]; format: ExportFormat }) {
     return request<RedeemExportResponse>(
       '/api/redeem/export',
+      { token: '' },
+      { method: 'POST', body: JSON.stringify(payload) },
+    )
+  },
+  redeemAfterSale(payload: { codes: string[]; format: ExportFormat }) {
+    return request<RedeemExportResponse>(
+      '/api/redeem/after-sale',
       { token: '' },
       { method: 'POST', body: JSON.stringify(payload) },
     )

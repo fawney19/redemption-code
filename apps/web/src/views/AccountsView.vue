@@ -196,6 +196,72 @@
               </label>
             </div>
 
+            <div class="settings-grid">
+              <label class="field-label">
+                <span>测活模式</span>
+                <select v-model="autoProbeForm.probe_mode" class="select">
+                  <option value="hybrid">Hybrid：CPA 优先</option>
+                  <option value="direct">仅本服务直连</option>
+                  <option value="cpa">仅 CPA 代打</option>
+                </select>
+              </label>
+              <label class="setting-toggle compact-toggle">
+                <input v-model="autoProbeForm.deep_check_enabled" type="checkbox" />
+                <span>
+                  <strong>深度诊断</strong>
+                  <small>失败时检测 RT、session 与 accounts/check</small>
+                </span>
+              </label>
+            </div>
+
+            <div v-if="autoProbeForm.probe_mode !== 'direct'" class="proxy-settings">
+              <div class="settings-grid">
+                <label class="field-label full">
+                  <span>CPA Base URL</span>
+                  <input
+                    v-model="autoProbeForm.cpa_base_url"
+                    class="input"
+                    placeholder="http://localhost:8317"
+                  />
+                </label>
+                <label class="field-label full">
+                  <span>CPA 管理密钥</span>
+                  <input
+                    v-model="autoProbeForm.cpa_management_key"
+                    class="input"
+                    type="password"
+                    :placeholder="autoProbeForm.cpa_management_key_set ? '已保存，留空不修改' : '粘贴 X-Management-Key'"
+                  />
+                </label>
+              </div>
+              <div class="toolbar proxy-test-actions">
+                <button class="button" :disabled="cpaTestDisabled" @click="testCpaConnection">
+                  <Globe :size="15" />测试 CPA
+                </button>
+                <button class="button" :disabled="cpaScanDisabled" @click="scanCpa401">
+                  <Activity :size="15" />CPA scan-401
+                </button>
+                <span class="form-note">{{ autoProbeForm.cpa_management_key_set ? 'CPA 密钥已保存' : 'CPA 密钥未保存' }}</span>
+              </div>
+              <div v-if="cpaTestResult" class="proxy-test-result">
+                <div>
+                  <span>CPA</span>
+                  <strong class="mono">{{ cpaTestResult.base_url }}</strong>
+                </div>
+                <div>
+                  <span>Auth 文件</span>
+                  <strong>{{ cpaTestResult.auth_file_count }} 个</strong>
+                </div>
+                <div>
+                  <span>耗时</span>
+                  <strong>{{ cpaTestResult.elapsed_ms }} ms</strong>
+                </div>
+              </div>
+              <div v-if="cpaTestError" class="inline-error">
+                {{ cpaTestError }}
+              </div>
+            </div>
+
             <label class="setting-toggle compact-toggle">
               <input v-model="autoProbeForm.proxy_enabled" type="checkbox" />
               <span>
@@ -425,6 +491,8 @@ import {
   saveAutoProbeSettings,
   saveRedeemRateLimitSettings,
   testProxyEgress,
+  testCpaConnection,
+  scanCpa401,
   runAutoProbeNow,
   toggleAll,
   statusLabel,
@@ -449,6 +517,8 @@ const {
   redeemRateLimitResult,
   proxyTestResult,
   proxyTestError,
+  cpaTestResult,
+  cpaTestError,
   autoProbeForm,
   autoProbeIntervalMinutes,
   redeemRateLimitForm,
@@ -467,6 +537,8 @@ const {
   canPrevAccountsPage,
   canNextAccountsPage,
   proxyTestDisabled,
+  cpaTestDisabled,
+  cpaScanDisabled,
 } = useAdmin()
 
 const autoProbeDisplayResult = computed(() => {

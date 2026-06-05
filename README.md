@@ -18,6 +18,9 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 - Automatic health probing can be enabled from the admin console. It uses the unredeemed account loading path, supports interval/concurrency/batch-size settings, supports fixed or dynamic proxy egress, and only calls the `wham/usage` quota endpoint. It does not refresh access tokens.
 - Public redeem export pre-refreshes only the expired unredeemed accounts that may be needed by the submitted codes, then allocates only accounts whose access token expiry is outside the refresh grace window. It never refreshes redeemed accounts.
 - Public redeem export is capped at 500 codes and 1,000 exported accounts per request to keep anonymous downloads bounded.
+- Public after-sale reissue accepts already redeemed codes, probes the current bound accounts, and only reissues when every current account is in an auth-failure state: `at_expired`, `refresh_failed`, `auth_invalid`, or `forbidden`. `quota_exhausted` is not eligible for self-service reissue.
+- After-sale reissue is limited per redeem-code batch by `after_sale_limit`; existing databases are upgraded with a default limit of `1` per code. A limit of `0` disables after-sale for that batch.
+- After-sale reissue appends `redeem_after_sales` history and creates a new redemption snapshot for the replacement account. Original redeemed accounts and original redemption snapshots are retained for audit.
 - Admin exports default to unredeemed accounts. CPA single-account export returns one auth JSON object; CPA multi-account export downloads a ZIP package with one auth JSON file per account. Sub2API export returns `{ exported_at, proxies, accounts }`.
 - Redeem-code batch status exports from the admin console are CSV files. Full redeem codes are encrypted at rest and can be copied/exported again from the admin console for newly generated batches; legacy batches without stored ciphertext can only show the masked fallback.
 
@@ -36,6 +39,7 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 - `GET /api/alalalateam/redeem-code-batches`
 - `GET /api/alalalateam/redeem-code-batches/{batch_id}/codes`
 - `POST /api/redeem/export`
+- `POST /api/redeem/after-sale`
 
 Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-admin-token`.
 By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. The API refuses known example admin tokens and empty/example encryption secrets unless `AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1` is explicitly set for isolated local development. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
@@ -119,6 +123,8 @@ docker compose up -d --build api
 ```
 
 Then set Baota's site root to `/absolute/path/to/aether-pool/deploy/web` and proxy `/api/` to `http://127.0.0.1:8318`.
+
+SQLite schema upgrades are applied automatically at API startup. The after-sale upgrade adds `redeem_code_batches.after_sale_limit` and `redeem_after_sales`; no manual migration command is required for existing deployments.
 
 ## Verification
 
