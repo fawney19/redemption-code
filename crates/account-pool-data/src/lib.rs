@@ -638,9 +638,21 @@ WHERE id =
         ids: &[String],
         include_redeemed: bool,
     ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
-        let mut out = Vec::new();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
         for id in ids {
-            let row = sqlx::query(
+            if seen_ids.insert(id.clone()) {
+                unique_ids.push(id.clone());
+            }
+        }
+
+        let mut pairs = HashMap::new();
+        for chunk in unique_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
                 r#"
 SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
@@ -649,15 +661,30 @@ SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.pl
 FROM accounts a
 LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
-WHERE a.id = ? AND (? = 1 OR a.redeemed_at IS NULL)
+WHERE a.id IN (
 "#,
-            )
-            .bind(id)
-            .bind(if include_redeemed { 1_i64 } else { 0_i64 })
-            .fetch_optional(&self.pool)
-            .await?;
-            if let Some(row) = row {
-                out.push(self.auth_pair_from_row(row)?);
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for id in chunk {
+                    separated.push_bind(id);
+                }
+                separated.push_unseparated(")");
+            }
+            if !include_redeemed {
+                builder.push(" AND a.redeemed_at IS NULL");
+            }
+            let rows = builder.build().fetch_all(&self.pool).await?;
+            for row in rows {
+                let pair = self.auth_pair_from_row(row)?;
+                pairs.insert(pair.0.id.clone(), pair);
+            }
+        }
+
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some((summary, auth_file)) = pairs.get(id) {
+                out.push((summary.clone(), auth_file.clone()));
             }
         }
         Ok(out)
@@ -1026,52 +1053,107 @@ INSERT INTO redeem_code_batches (
         .execute(&mut *tx)
         .await?;
 
-        let mut codes = Vec::new();
+        struct RedeemCodeCandidate {
+            id: String,
+            hash: String,
+            prefix: String,
+            suffix: String,
+            masked_code: String,
+            code_ciphertext: String,
+            created: RedeemCodeCreated,
+        }
+
+        let mut codes = Vec::with_capacity(input.total_count);
+        let mut seen_hashes = HashSet::new();
         while codes.len() < input.total_count {
-            let formatted = generate_redeem_code();
-            let Some(normalized) = normalize_redeem_code(&formatted) else {
-                continue;
-            };
-            let hash = redeem_code_hash(&normalized);
-            let code = format_redeem_code(&normalized);
-            let code_ciphertext = self.secrets.encrypt_json(&code)?;
-            let code_id = Uuid::new_v4().to_string();
-            let prefix = normalized.chars().take(4).collect::<String>();
-            let suffix = normalized
-                .chars()
-                .rev()
-                .take(4)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>();
-            let masked_code = mask_redeem_code(&normalized);
-            let inserted = sqlx::query(
+            let remaining = input.total_count - codes.len();
+            let target_count = remaining.min(500);
+            let mut candidates = Vec::with_capacity(target_count);
+            while candidates.len() < target_count {
+                let formatted = generate_redeem_code();
+                let Some(normalized) = normalize_redeem_code(&formatted) else {
+                    continue;
+                };
+                let hash = redeem_code_hash(&normalized);
+                if !seen_hashes.insert(hash.clone()) {
+                    continue;
+                }
+                let code = format_redeem_code(&normalized);
+                let code_ciphertext = self.secrets.encrypt_json(&code)?;
+                let code_id = Uuid::new_v4().to_string();
+                let prefix = normalized.chars().take(4).collect::<String>();
+                let suffix = normalized
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>();
+                let masked_code = mask_redeem_code(&normalized);
+                candidates.push(RedeemCodeCandidate {
+                    id: code_id.clone(),
+                    hash,
+                    prefix,
+                    suffix,
+                    masked_code: masked_code.clone(),
+                    code_ciphertext,
+                    created: RedeemCodeCreated {
+                        id: code_id,
+                        code,
+                        masked_code,
+                    },
+                });
+            }
+
+            let mut insert = QueryBuilder::<Sqlite>::new(
                 r#"
 INSERT OR IGNORE INTO redeem_codes (
   id, batch_id, code_hash, code_prefix, code_suffix, masked_code, code_ciphertext,
-  status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  created_at, updated_at
+)
 "#,
-            )
-            .bind(&code_id)
-            .bind(&batch_id)
-            .bind(hash)
-            .bind(prefix)
-            .bind(suffix)
-            .bind(&masked_code)
-            .bind(code_ciphertext)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            if inserted.rows_affected() == 1 {
-                codes.push(RedeemCodeCreated {
-                    id: code_id,
-                    code,
-                    masked_code,
-                });
+            );
+            insert.push_values(&candidates, |mut row, candidate| {
+                row.push_bind(&candidate.id)
+                    .push_bind(&batch_id)
+                    .push_bind(&candidate.hash)
+                    .push_bind(&candidate.prefix)
+                    .push_bind(&candidate.suffix)
+                    .push_bind(&candidate.masked_code)
+                    .push_bind(&candidate.code_ciphertext)
+                    .push_bind(now)
+                    .push_bind(now);
+            });
+            let inserted = insert.build().execute(&mut *tx).await?;
+            if inserted.rows_affected() == candidates.len() as u64 {
+                codes.extend(candidates.into_iter().map(|candidate| candidate.created));
+                continue;
             }
+
+            let mut id_query =
+                QueryBuilder::<Sqlite>::new("SELECT id FROM redeem_codes WHERE batch_id = ");
+            id_query.push_bind(&batch_id);
+            id_query.push(" AND id IN (");
+            {
+                let mut separated = id_query.separated(", ");
+                for candidate in &candidates {
+                    separated.push_bind(&candidate.id);
+                }
+                separated.push_unseparated(")");
+            }
+            let inserted_ids = id_query
+                .build()
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>("id"))
+                .collect::<Result<HashSet<_>, _>>()?;
+            codes.extend(candidates.into_iter().filter_map(|candidate| {
+                inserted_ids
+                    .contains(&candidate.id)
+                    .then_some(candidate.created)
+            }));
         }
         tx.commit().await?;
         Ok(CreateRedeemBatchOutcome { batch_id, codes })
@@ -1279,74 +1361,134 @@ ORDER BY codes.created_at ASC
         &self,
         raw_codes: &[String],
     ) -> Result<RedeemExportPreparation, DataError> {
+        struct CodePreparation {
+            code_status: String,
+            batch_status: String,
+            accounts_per_code: usize,
+            pool_id: String,
+            plan_filter: Vec<String>,
+            expires_at: Option<i64>,
+            redemption_id: Option<String>,
+        }
+
         let now = unix_now_secs();
-        let mut demands = Vec::new();
+        let mut hashes = Vec::new();
         let mut seen_hashes = HashSet::new();
-        let mut estimated_account_count = 0_usize;
         for raw_code in raw_codes {
             let Some(normalized) = normalize_redeem_code(raw_code) else {
                 continue;
             };
             let hash = redeem_code_hash(&normalized);
-            if !seen_hashes.insert(hash.clone()) {
-                continue;
+            if seen_hashes.insert(hash.clone()) {
+                hashes.push(hash);
             }
-            let Some(row) = sqlx::query(
+        }
+
+        let mut code_rows = HashMap::new();
+        for chunk in hashes.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
                 r#"
-SELECT codes.status AS code_status, codes.redemption_id,
+SELECT codes.code_hash, codes.status AS code_status, codes.redemption_id,
        batches.status AS batch_status, batches.accounts_per_code,
        batches.pool_id, batches.plan_filter_json, batches.expires_at
 FROM redeem_codes AS codes
 JOIN redeem_code_batches AS batches ON batches.id = codes.batch_id
-WHERE codes.code_hash = ?
+WHERE codes.code_hash IN (
 "#,
-            )
-            .bind(hash)
-            .fetch_optional(&self.pool)
-            .await?
-            else {
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for hash in chunk {
+                    separated.push_bind(hash);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&self.pool).await?;
+            for row in rows {
+                let hash: String = row.try_get("code_hash")?;
+                let plan_filter = row
+                    .try_get::<Option<String>, _>("plan_filter_json")?
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                    .unwrap_or_default();
+                code_rows.insert(
+                    hash,
+                    CodePreparation {
+                        code_status: row.try_get("code_status")?,
+                        batch_status: row.try_get("batch_status")?,
+                        accounts_per_code: usize_from_i64(row.try_get("accounts_per_code")?),
+                        pool_id: row.try_get("pool_id")?,
+                        plan_filter,
+                        expires_at: row.try_get("expires_at")?,
+                        redemption_id: row.try_get("redemption_id")?,
+                    },
+                );
+            }
+        }
+
+        let redemption_ids = hashes
+            .iter()
+            .filter_map(|hash| {
+                let row = code_rows.get(hash)?;
+                if row.code_status != "active"
+                    || row.batch_status != "active"
+                    || row.expires_at.is_some_and(|value| value <= now as i64)
+                {
+                    return None;
+                }
+                row.redemption_id.clone()
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut redemption_account_counts = HashMap::new();
+        for chunk in redemption_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT id, account_ids_json FROM redeem_redemptions WHERE id IN (",
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for redemption_id in chunk {
+                    separated.push_bind(redemption_id);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&self.pool).await?;
+            for row in rows {
+                let redemption_id: String = row.try_get("id")?;
+                let account_ids = serde_json::from_str::<Vec<String>>(
+                    row.try_get::<String, _>("account_ids_json")?.as_str(),
+                )
+                .unwrap_or_default();
+                redemption_account_counts.insert(redemption_id, account_ids.len());
+            }
+        }
+
+        let mut demands = Vec::new();
+        let mut estimated_account_count = 0_usize;
+        for hash in hashes {
+            let Some(row) = code_rows.get(&hash) else {
                 continue;
             };
-
-            let code_status: String = row.try_get("code_status")?;
-            let batch_status: String = row.try_get("batch_status")?;
-            let redemption_id: Option<String> = row.try_get("redemption_id")?;
-            let expires_at: Option<i64> = row.try_get("expires_at")?;
-            if code_status != "active"
-                || batch_status != "active"
-                || expires_at.is_some_and(|value| value <= now as i64)
+            if row.code_status != "active"
+                || row.batch_status != "active"
+                || row.expires_at.is_some_and(|value| value <= now as i64)
             {
                 continue;
             }
-            if let Some(redemption_id) = redemption_id {
-                if let Some(row) =
-                    sqlx::query("SELECT account_ids_json FROM redeem_redemptions WHERE id = ?")
-                        .bind(redemption_id)
-                        .fetch_optional(&self.pool)
-                        .await?
-                {
-                    let account_ids = serde_json::from_str::<Vec<String>>(
-                        row.try_get::<String, _>("account_ids_json")?.as_str(),
-                    )
-                    .unwrap_or_default();
+            if let Some(redemption_id) = &row.redemption_id {
+                if let Some(account_count) = redemption_account_counts.get(redemption_id) {
                     estimated_account_count =
-                        estimated_account_count.saturating_add(account_ids.len());
+                        estimated_account_count.saturating_add(*account_count);
                 }
                 continue;
             }
-            let plan_filter = row
-                .try_get::<Option<String>, _>("plan_filter_json")?
-                .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-                .unwrap_or_default();
-            let accounts_per_code: i64 = row.try_get("accounts_per_code")?;
-            let pool_id: String = row.try_get("pool_id")?;
-            if accounts_per_code > 0 {
+            if row.accounts_per_code > 0 {
                 estimated_account_count =
-                    estimated_account_count.saturating_add(accounts_per_code as usize);
+                    estimated_account_count.saturating_add(row.accounts_per_code);
                 demands.push(RedeemAccountDemand {
-                    count: accounts_per_code as usize,
-                    pool_id,
-                    plan_filter,
+                    count: row.accounts_per_code,
+                    pool_id: row.pool_id.clone(),
+                    plan_filter: row.plan_filter.clone(),
                 });
             }
         }
@@ -1425,23 +1567,36 @@ ORDER BY created_at ASC
         &self,
         raw_codes: &[String],
     ) -> Result<RedeemAfterSalePreparation, DataError> {
+        struct AfterSalePreparationCode {
+            code_status: String,
+            batch_status: String,
+            redemption_id: Option<String>,
+            accounts_per_code: usize,
+            pool_id: String,
+            plan_filter: Vec<String>,
+            expires_at: Option<i64>,
+            after_sale_limit: i64,
+            after_sale_count: i64,
+        }
+
         let now = unix_now_secs();
-        let mut demands = Vec::new();
+        let mut hashes = Vec::new();
         let mut seen_hashes = HashSet::new();
-        let mut seen_probe_ids = HashSet::new();
-        let mut probe_ids = Vec::new();
-        let mut estimated_account_count = 0_usize;
         for raw_code in raw_codes {
             let Some(normalized) = normalize_redeem_code(raw_code) else {
                 continue;
             };
             let hash = redeem_code_hash(&normalized);
-            if !seen_hashes.insert(hash.clone()) {
-                continue;
+            if seen_hashes.insert(hash.clone()) {
+                hashes.push(hash);
             }
-            let Some(row) = sqlx::query(
+        }
+
+        let mut code_rows = HashMap::new();
+        for chunk in hashes.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
                 r#"
-SELECT codes.id AS code_id, codes.status AS code_status, codes.redemption_id,
+SELECT codes.code_hash, codes.status AS code_status, codes.redemption_id,
        batches.status AS batch_status, batches.accounts_per_code,
        batches.pool_id, batches.plan_filter_json, batches.expires_at, batches.after_sale_limit,
        COALESCE((
@@ -1451,67 +1606,116 @@ SELECT codes.id AS code_id, codes.status AS code_status, codes.redemption_id,
        ), 0) AS after_sale_count
 FROM redeem_codes AS codes
 JOIN redeem_code_batches AS batches ON batches.id = codes.batch_id
-WHERE codes.code_hash = ?
+WHERE codes.code_hash IN (
 "#,
-            )
-            .bind(hash)
-            .fetch_optional(&self.pool)
-            .await?
-            else {
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for hash in chunk {
+                    separated.push_bind(hash);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&self.pool).await?;
+            for row in rows {
+                let hash: String = row.try_get("code_hash")?;
+                let plan_filter = row
+                    .try_get::<Option<String>, _>("plan_filter_json")?
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                    .unwrap_or_default();
+                code_rows.insert(
+                    hash,
+                    AfterSalePreparationCode {
+                        code_status: row.try_get("code_status")?,
+                        batch_status: row.try_get("batch_status")?,
+                        redemption_id: row.try_get("redemption_id")?,
+                        accounts_per_code: usize_from_i64(row.try_get("accounts_per_code")?),
+                        pool_id: row.try_get("pool_id")?,
+                        plan_filter,
+                        expires_at: row.try_get("expires_at")?,
+                        after_sale_limit: row.try_get("after_sale_limit")?,
+                        after_sale_count: row.try_get("after_sale_count")?,
+                    },
+                );
+            }
+        }
+
+        let redemption_ids = hashes
+            .iter()
+            .filter_map(|hash| {
+                let row = code_rows.get(hash)?;
+                if row.code_status == "disabled"
+                    || row.batch_status != "active"
+                    || row.expires_at.is_some_and(|value| value <= now as i64)
+                    || row.after_sale_limit <= 0
+                    || row.after_sale_count >= row.after_sale_limit
+                {
+                    return None;
+                }
+                row.redemption_id.clone()
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut redemption_account_ids = HashMap::new();
+        for chunk in redemption_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT id, account_ids_json FROM redeem_redemptions WHERE id IN (",
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for redemption_id in chunk {
+                    separated.push_bind(redemption_id);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&self.pool).await?;
+            for row in rows {
+                let redemption_id: String = row.try_get("id")?;
+                let account_ids = serde_json::from_str::<Vec<String>>(
+                    row.try_get::<String, _>("account_ids_json")?.as_str(),
+                )
+                .unwrap_or_default();
+                redemption_account_ids.insert(redemption_id, account_ids);
+            }
+        }
+
+        let mut demands = Vec::new();
+        let mut seen_probe_ids = HashSet::new();
+        let mut probe_ids = Vec::new();
+        let mut estimated_account_count = 0_usize;
+        for hash in hashes {
+            let Some(row) = code_rows.get(&hash) else {
                 continue;
             };
-
-            let code_status: String = row.try_get("code_status")?;
-            let batch_status: String = row.try_get("batch_status")?;
-            let redemption_id: Option<String> = row.try_get("redemption_id")?;
-            let expires_at: Option<i64> = row.try_get("expires_at")?;
-            let after_sale_limit: i64 = row.try_get("after_sale_limit")?;
-            let after_sale_count: i64 = row.try_get("after_sale_count")?;
-            if code_status == "disabled"
-                || batch_status != "active"
-                || expires_at.is_some_and(|value| value <= now as i64)
-                || redemption_id.is_none()
-                || after_sale_limit <= 0
-                || after_sale_count >= after_sale_limit
+            if row.code_status == "disabled"
+                || row.batch_status != "active"
+                || row.expires_at.is_some_and(|value| value <= now as i64)
+                || row.redemption_id.is_none()
+                || row.after_sale_limit <= 0
+                || row.after_sale_count >= row.after_sale_limit
             {
                 continue;
             }
 
-            let Some(redemption_id) = redemption_id else {
+            let Some(redemption_id) = &row.redemption_id else {
                 continue;
             };
-            if let Some(redemption_row) =
-                sqlx::query("SELECT account_ids_json FROM redeem_redemptions WHERE id = ?")
-                    .bind(redemption_id)
-                    .fetch_optional(&self.pool)
-                    .await?
-            {
-                let account_ids = serde_json::from_str::<Vec<String>>(
-                    redemption_row
-                        .try_get::<String, _>("account_ids_json")?
-                        .as_str(),
-                )
-                .unwrap_or_default();
+            if let Some(account_ids) = redemption_account_ids.get(redemption_id) {
                 for account_id in account_ids {
                     if seen_probe_ids.insert(account_id.clone()) {
-                        probe_ids.push(account_id);
+                        probe_ids.push(account_id.clone());
                     }
                 }
             }
 
-            let plan_filter = row
-                .try_get::<Option<String>, _>("plan_filter_json")?
-                .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-                .unwrap_or_default();
-            let accounts_per_code: i64 = row.try_get("accounts_per_code")?;
-            let pool_id: String = row.try_get("pool_id")?;
-            if accounts_per_code > 0 {
+            if row.accounts_per_code > 0 {
                 estimated_account_count =
-                    estimated_account_count.saturating_add(accounts_per_code as usize);
+                    estimated_account_count.saturating_add(row.accounts_per_code);
                 demands.push(RedeemAccountDemand {
-                    count: accounts_per_code as usize,
-                    pool_id,
-                    plan_filter,
+                    count: row.accounts_per_code,
+                    pool_id: row.pool_id.clone(),
+                    plan_filter: row.plan_filter.clone(),
                 });
             }
         }
@@ -1614,6 +1818,11 @@ ORDER BY created_at ASC
         format: ExportFormat,
         verified_account_ids: Option<&[String]>,
     ) -> Result<RedeemExportOutcome, DataError> {
+        if verified_account_ids.is_none() || raw_codes.len() > 1 {
+            return self
+                .redeem_codes_for_export_batch(raw_codes, format, verified_account_ids)
+                .await;
+        }
         let _redeem_guard = self.redemption_lock.lock().await;
         let mut successes = Vec::new();
         let mut failures = Vec::new();
@@ -1736,7 +1945,8 @@ WHERE redeemed_at IS NULL AND status = 'available' AND pool_id =
                         separated.push_unseparated(")");
                     }
                 }
-                account_query.push(" ORDER BY created_at ASC");
+                account_query.push(" ORDER BY created_at ASC LIMIT ");
+                account_query.push_bind(accounts_per_code);
                 let rows = account_query.build().fetch_all(&mut *tx).await?;
                 let account_ids = rows
                     .into_iter()
@@ -1842,6 +2052,507 @@ WHERE id = ? AND redeemed_at IS NULL
         .bind(export_id)
         .bind(format.as_str())
         .bind(account_ids_json)
+        .bind(all_auth_files.len() as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(RedeemExportOutcome {
+            format,
+            document,
+            successes,
+            failures,
+        })
+    }
+
+    async fn redeem_codes_for_export_batch(
+        &self,
+        raw_codes: &[String],
+        format: ExportFormat,
+        verified_account_ids: Option<&[String]>,
+    ) -> Result<RedeemExportOutcome, DataError> {
+        struct CodeInput {
+            code: String,
+            hash: String,
+        }
+
+        struct CodeLookup {
+            code_id: String,
+            batch_id: String,
+            code_status: String,
+            batch_status: String,
+            accounts_per_code: usize,
+            pool_id: String,
+            plan_filter: Vec<String>,
+            expires_at: Option<i64>,
+            redemption_id: Option<String>,
+        }
+
+        struct ExistingRedemption {
+            code: String,
+            redemption_id: String,
+        }
+
+        struct AccountDemand {
+            code: String,
+            code_id: String,
+            batch_id: String,
+            pool_id: String,
+            plan_filter: Vec<String>,
+            count: usize,
+        }
+
+        struct CandidateAccount {
+            id: String,
+            pool_id: String,
+            plan_type: Option<String>,
+        }
+
+        impl CandidateAccount {
+            fn matches(&self, demand: &AccountDemand) -> bool {
+                self.pool_id == demand.pool_id
+                    && (demand.plan_filter.is_empty()
+                        || self.plan_type.as_ref().is_some_and(|value| {
+                            demand
+                                .plan_filter
+                                .iter()
+                                .any(|plan| plan.eq_ignore_ascii_case(value))
+                        }))
+            }
+        }
+
+        struct RedemptionInsert {
+            id: String,
+            code_id: String,
+            batch_id: String,
+            account_ids_json: String,
+            export_snapshot_ciphertext: String,
+        }
+
+        struct AccountUpdate {
+            account_id: String,
+            code_id: String,
+            redemption_id: String,
+        }
+
+        struct CodeUpdate {
+            code_id: String,
+            redemption_id: String,
+        }
+
+        let _redeem_guard = self.redemption_lock.lock().await;
+        let verified_account_ids = verified_account_ids.map(|ids| {
+            ids.iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        });
+        let now = unix_now_secs() as i64;
+        let usable_after = now.saturating_add(ACCESS_TOKEN_REFRESH_GRACE_SECONDS as i64);
+        let mut inputs = Vec::new();
+        let mut failures = Vec::new();
+        let mut seen_hashes = HashSet::new();
+        for raw_code in raw_codes {
+            let Some(normalized) = normalize_redeem_code(raw_code) else {
+                failures.push(RedeemFailure {
+                    code: raw_code.clone(),
+                    reason: "兑换码格式无效".to_string(),
+                });
+                continue;
+            };
+            let hash = redeem_code_hash(&normalized);
+            let code = format_redeem_code(&normalized);
+            if !seen_hashes.insert(hash.clone()) {
+                failures.push(RedeemFailure {
+                    code,
+                    reason: "兑换码重复提交".to_string(),
+                });
+                continue;
+            }
+            inputs.push(CodeInput { code, hash });
+        }
+
+        let mut successes = Vec::new();
+        let mut all_auth_files = Vec::new();
+        let mut all_account_ids = Vec::new();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let mut code_rows = HashMap::new();
+        for chunk in inputs.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                r#"
+SELECT codes.code_hash, codes.id AS code_id, codes.batch_id, codes.status AS code_status,
+       codes.redemption_id, batches.status AS batch_status,
+       batches.accounts_per_code, batches.pool_id, batches.plan_filter_json, batches.expires_at
+FROM redeem_codes AS codes
+JOIN redeem_code_batches AS batches ON batches.id = codes.batch_id
+WHERE codes.code_hash IN (
+"#,
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for input in chunk {
+                    separated.push_bind(&input.hash);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&mut *tx).await?;
+            for row in rows {
+                let hash: String = row.try_get("code_hash")?;
+                let plan_filter = row
+                    .try_get::<Option<String>, _>("plan_filter_json")?
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                    .unwrap_or_default();
+                code_rows.insert(
+                    hash.clone(),
+                    CodeLookup {
+                        code_id: row.try_get("code_id")?,
+                        batch_id: row.try_get("batch_id")?,
+                        code_status: row.try_get("code_status")?,
+                        batch_status: row.try_get("batch_status")?,
+                        accounts_per_code: usize_from_i64(row.try_get("accounts_per_code")?),
+                        pool_id: row.try_get("pool_id")?,
+                        plan_filter,
+                        expires_at: row.try_get("expires_at")?,
+                        redemption_id: row.try_get("redemption_id")?,
+                    },
+                );
+            }
+        }
+
+        let mut existing_redemptions = Vec::new();
+        let mut demands = Vec::new();
+        for input in &inputs {
+            let Some(row) = code_rows.get(&input.hash) else {
+                failures.push(RedeemFailure {
+                    code: input.code.clone(),
+                    reason: "兑换码不存在".to_string(),
+                });
+                continue;
+            };
+            if row.batch_status != "active" || row.code_status == "disabled" {
+                failures.push(RedeemFailure {
+                    code: input.code.clone(),
+                    reason: "兑换码已停用".to_string(),
+                });
+                continue;
+            }
+            if row.expires_at.is_some_and(|value| value <= now) {
+                failures.push(RedeemFailure {
+                    code: input.code.clone(),
+                    reason: "兑换码已过期".to_string(),
+                });
+                continue;
+            }
+            if let Some(redemption_id) = row.redemption_id.clone() {
+                existing_redemptions.push(ExistingRedemption {
+                    code: input.code.clone(),
+                    redemption_id,
+                });
+                continue;
+            }
+            demands.push(AccountDemand {
+                code: input.code.clone(),
+                code_id: row.code_id.clone(),
+                batch_id: row.batch_id.clone(),
+                pool_id: row.pool_id.clone(),
+                plan_filter: row.plan_filter.clone(),
+                count: row.accounts_per_code,
+            });
+        }
+
+        let mut redemption_snapshots = HashMap::new();
+        let redemption_ids = existing_redemptions
+            .iter()
+            .map(|item| item.redemption_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in redemption_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT id, account_ids_json, export_snapshot_ciphertext FROM redeem_redemptions WHERE id IN (",
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for redemption_id in chunk {
+                    separated.push_bind(redemption_id);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&mut *tx).await?;
+            for row in rows {
+                let redemption_id: String = row.try_get("id")?;
+                let account_ids = serde_json::from_str::<Vec<String>>(
+                    row.try_get::<String, _>("account_ids_json")?.as_str(),
+                )
+                .unwrap_or_default();
+                let snapshot_ciphertext: String = row.try_get("export_snapshot_ciphertext")?;
+                let auth_files = self
+                    .secrets
+                    .decrypt_json::<Vec<CodexAuthFile>>(&snapshot_ciphertext)?;
+                redemption_snapshots.insert(redemption_id, (account_ids, auth_files));
+            }
+        }
+        for existing in existing_redemptions {
+            if let Some((account_ids, auth_files)) =
+                redemption_snapshots.get(&existing.redemption_id)
+            {
+                successes.push(RedeemSuccess {
+                    code: existing.code,
+                    account_count: account_ids.len(),
+                    after_sale_count: None,
+                    replacement_account_count: None,
+                });
+                all_account_ids.extend(account_ids.clone());
+                all_auth_files.extend(auth_files.clone());
+            }
+        }
+
+        let mut allocations: Vec<Option<Vec<String>>> = vec![None; demands.len()];
+        if !demands.is_empty() {
+            let pool_ids = demands
+                .iter()
+                .map(|demand| demand.pool_id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                r#"
+SELECT id, pool_id, plan_type
+FROM accounts
+WHERE redeemed_at IS NULL AND status = 'available'
+  AND expires_at IS NOT NULL AND expires_at >
+"#,
+            );
+            builder.push_bind(usable_after);
+            builder.push(" AND pool_id IN (");
+            {
+                let mut separated = builder.separated(", ");
+                for pool_id in &pool_ids {
+                    separated.push_bind(pool_id);
+                }
+                separated.push_unseparated(")");
+            }
+            if let Some(verified_account_ids) = &verified_account_ids {
+                if verified_account_ids.is_empty() {
+                    builder.push(" AND 1 = 0");
+                } else if verified_account_ids.len() <= 5_000 {
+                    // Keep SQLite bind counts bounded; larger verified sets are filtered in memory below.
+                    builder.push(" AND id IN (");
+                    let mut separated = builder.separated(", ");
+                    for account_id in verified_account_ids {
+                        separated.push_bind(account_id);
+                    }
+                    separated.push_unseparated(")");
+                }
+            }
+            builder.push(" ORDER BY created_at ASC");
+            let candidates = builder
+                .build()
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    Ok(CandidateAccount {
+                        id: row.try_get("id")?,
+                        pool_id: row.try_get("pool_id")?,
+                        plan_type: row.try_get("plan_type")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DataError>>()?;
+            let mut selected_ids = HashSet::new();
+            for (index, demand) in demands.iter().enumerate() {
+                let mut account_ids = Vec::with_capacity(demand.count);
+                for candidate in &candidates {
+                    if account_ids.len() >= demand.count {
+                        break;
+                    }
+                    if selected_ids.contains(&candidate.id)
+                        || !candidate.matches(demand)
+                        || verified_account_ids
+                            .as_ref()
+                            .is_some_and(|ids| !ids.contains(&candidate.id))
+                    {
+                        continue;
+                    }
+                    account_ids.push(candidate.id.clone());
+                }
+                if account_ids.len() < demand.count {
+                    failures.push(RedeemFailure {
+                        code: demand.code.clone(),
+                        reason: "可兑换账号库存不足".to_string(),
+                    });
+                    continue;
+                }
+                selected_ids.extend(account_ids.iter().cloned());
+                allocations[index] = Some(account_ids);
+            }
+        }
+
+        let selected_account_ids = allocations
+            .iter()
+            .flatten()
+            .flat_map(|account_ids| account_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let auth_files = self
+            .load_auth_files_for_ids_tx(&mut tx, &selected_account_ids)
+            .await?
+            .into_iter()
+            .map(|(summary, auth)| (summary.id, auth.normalized()))
+            .collect::<HashMap<_, _>>();
+
+        let mut redemptions = Vec::new();
+        let mut account_updates = Vec::new();
+        let mut code_updates = Vec::new();
+        let mut batch_counts: HashMap<String, i64> = HashMap::new();
+        for (index, demand) in demands.into_iter().enumerate() {
+            let Some(account_ids) = allocations[index].clone() else {
+                continue;
+            };
+            let auth_snapshot = account_ids
+                .iter()
+                .filter_map(|account_id| auth_files.get(account_id).cloned())
+                .collect::<Vec<_>>();
+            if auth_snapshot.len() != account_ids.len() {
+                return Err(DataError::NotFound);
+            }
+            let redemption_id = Uuid::new_v4().to_string();
+            let snapshot_ciphertext = self.secrets.encrypt_json(&auth_snapshot)?;
+            redemptions.push(RedemptionInsert {
+                id: redemption_id.clone(),
+                code_id: demand.code_id.clone(),
+                batch_id: demand.batch_id.clone(),
+                account_ids_json: serde_json::to_string(&account_ids)
+                    .unwrap_or_else(|_| "[]".to_string()),
+                export_snapshot_ciphertext: snapshot_ciphertext,
+            });
+            for account_id in &account_ids {
+                account_updates.push(AccountUpdate {
+                    account_id: account_id.clone(),
+                    code_id: demand.code_id.clone(),
+                    redemption_id: redemption_id.clone(),
+                });
+            }
+            code_updates.push(CodeUpdate {
+                code_id: demand.code_id,
+                redemption_id,
+            });
+            *batch_counts.entry(demand.batch_id).or_default() += 1;
+            successes.push(RedeemSuccess {
+                code: demand.code,
+                account_count: account_ids.len(),
+                after_sale_count: None,
+                replacement_account_count: None,
+            });
+            all_account_ids.extend(account_ids);
+            all_auth_files.extend(auth_snapshot);
+        }
+
+        for chunk in redemptions.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                r#"
+INSERT INTO redeem_redemptions (
+  id, code_id, batch_id, export_format, account_ids_json, export_snapshot_ciphertext, created_at
+)
+"#,
+            );
+            builder.push_values(chunk, |mut row, redemption| {
+                row.push_bind(&redemption.id)
+                    .push_bind(&redemption.code_id)
+                    .push_bind(&redemption.batch_id)
+                    .push_bind(format.as_str())
+                    .push_bind(&redemption.account_ids_json)
+                    .push_bind(&redemption.export_snapshot_ciphertext)
+                    .push_bind(now);
+            });
+            builder.build().execute(&mut *tx).await?;
+        }
+
+        for chunk in account_updates.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new("UPDATE accounts SET redeemed_at = ");
+            builder
+                .push_bind(now)
+                .push(", updated_at = ")
+                .push_bind(now)
+                .push(", redeem_code_id = CASE id ");
+            for update in chunk {
+                builder
+                    .push(" WHEN ")
+                    .push_bind(&update.account_id)
+                    .push(" THEN ")
+                    .push_bind(&update.code_id);
+            }
+            builder.push(" END, redemption_id = CASE id ");
+            for update in chunk {
+                builder
+                    .push(" WHEN ")
+                    .push_bind(&update.account_id)
+                    .push(" THEN ")
+                    .push_bind(&update.redemption_id);
+            }
+            builder.push(" END WHERE redeemed_at IS NULL AND id IN (");
+            {
+                let mut separated = builder.separated(", ");
+                for update in chunk {
+                    separated.push_bind(&update.account_id);
+                }
+                separated.push_unseparated(")");
+            }
+            let updated = builder.build().execute(&mut *tx).await?;
+            if updated.rows_affected() != chunk.len() as u64 {
+                return Err(DataError::NotFound);
+            }
+        }
+
+        for chunk in code_updates.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "UPDATE redeem_codes SET status = 'redeemed', redeemed_at = ",
+            );
+            builder
+                .push_bind(now)
+                .push(", updated_at = ")
+                .push_bind(now)
+                .push(", redemption_id = CASE id ");
+            for update in chunk {
+                builder
+                    .push(" WHEN ")
+                    .push_bind(&update.code_id)
+                    .push(" THEN ")
+                    .push_bind(&update.redemption_id);
+            }
+            builder.push(" END WHERE id IN (");
+            {
+                let mut separated = builder.separated(", ");
+                for update in chunk {
+                    separated.push_bind(&update.code_id);
+                }
+                separated.push_unseparated(")");
+            }
+            let updated = builder.build().execute(&mut *tx).await?;
+            if updated.rows_affected() != chunk.len() as u64 {
+                return Err(DataError::NotFound);
+            }
+        }
+
+        for (batch_id, count) in batch_counts {
+            sqlx::query(
+                "UPDATE redeem_code_batches SET redeemed_count = redeemed_count + ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(count)
+            .bind(now)
+            .bind(batch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let document = export_accounts(format, &all_auth_files);
+        sqlx::query(
+            "INSERT INTO account_exports (id, format, source, account_ids_json, account_count, created_at) VALUES (?, ?, 'redeem', ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(format.as_str())
+        .bind(json!(all_account_ids).to_string())
         .bind(all_auth_files.len() as i64)
         .bind(now)
         .execute(&mut *tx)
@@ -2088,7 +2799,8 @@ WHERE redeemed_at IS NULL AND status = 'available' AND pool_id =
                     separated.push_unseparated(")");
                 }
             }
-            account_query.push(" ORDER BY created_at ASC");
+            account_query.push(" ORDER BY created_at ASC LIMIT ");
+            account_query.push_bind(accounts_per_code.max(0));
             let rows = account_query.build().fetch_all(&mut *tx).await?;
             let new_account_ids = rows
                 .into_iter()
@@ -2333,9 +3045,21 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         ids: &[String],
     ) -> Result<Vec<(AccountSummary, CodexAuthFile)>, DataError> {
-        let mut out = Vec::new();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
         for id in ids {
-            let row = sqlx::query(
+            if seen_ids.insert(id.clone()) {
+                unique_ids.push(id.clone());
+            }
+        }
+
+        let mut pairs = HashMap::new();
+        for chunk in unique_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
                 r#"
 SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.plan_type, a.status, a.access_token_preview,
        a.refresh_token_preview, a.expires_at, a.last_refresh_at, a.last_probe_at,
@@ -2344,18 +3068,36 @@ SELECT a.id, a.pool_id, p.name AS pool_name, a.email, a.name, a.account_id, a.pl
 FROM accounts a
 LEFT JOIN account_pools p ON p.id = a.pool_id
 LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
-WHERE a.id = ?
+WHERE a.id IN (
 "#,
-            )
-            .bind(id)
-            .fetch_one(&mut **tx)
-            .await?;
-            let summary = account_summary_from_row(&row)?;
-            let ciphertext: String = row.try_get("auth_file_ciphertext")?;
-            out.push((
-                summary,
-                self.secrets.decrypt_json::<CodexAuthFile>(&ciphertext)?,
-            ));
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for id in chunk {
+                    separated.push_bind(id);
+                }
+                separated.push_unseparated(")");
+            }
+            let rows = builder.build().fetch_all(&mut **tx).await?;
+            for row in rows {
+                let summary = account_summary_from_row(&row)?;
+                let ciphertext: String = row.try_get("auth_file_ciphertext")?;
+                pairs.insert(
+                    summary.id.clone(),
+                    (
+                        summary,
+                        self.secrets.decrypt_json::<CodexAuthFile>(&ciphertext)?,
+                    ),
+                );
+            }
+        }
+
+        let mut out = Vec::new();
+        for id in ids {
+            let Some((summary, auth_file)) = pairs.get(id) else {
+                return Err(DataError::NotFound);
+            };
+            out.push((summary.clone(), auth_file.clone()));
         }
         Ok(out)
     }
@@ -5225,6 +5967,56 @@ CREATE TABLE redeem_code_batches (
         assert_eq!(outcome.successes.len(), 1);
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].reason, "兑换码重复提交");
+        assert_eq!(document_access_token(&outcome.document), "access-1");
+    }
+
+    #[tokio::test]
+    async fn failed_large_demand_does_not_reserve_accounts_for_later_codes() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("acct-1", "access-1"),
+            parsed_account("acct-2", "access-2"),
+        ])
+        .await
+        .unwrap();
+        let large_batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "large demand".to_string(),
+                total_count: 1,
+                accounts_per_code: 3,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let small_batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "small demand".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = repo
+            .redeem_codes_for_export(
+                &[
+                    large_batch.codes[0].code.clone(),
+                    small_batch.codes[0].code.clone(),
+                ],
+                ExportFormat::Cpa,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.successes.len(), 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].reason, "可兑换账号库存不足");
+        assert_eq!(outcome.successes[0].code, small_batch.codes[0].code);
         assert_eq!(document_access_token(&outcome.document), "access-1");
     }
 

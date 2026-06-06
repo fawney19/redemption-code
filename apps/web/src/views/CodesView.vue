@@ -37,7 +37,7 @@
             </select>
           </label>
           <input v-model="batchForm.name" class="input" placeholder="批次名称" />
-          <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="5000" placeholder="兑换码数量" />
+          <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="10000" placeholder="兑换码数量" />
           <input v-model.number="batchForm.accounts_per_code" class="input" type="number" min="1" max="100" placeholder="每码账号数" />
           <input v-model.number="batchForm.after_sale_limit" class="input" type="number" min="0" max="10" placeholder="每码售后次数" />
           <input v-model="batchForm.expires_at_text" class="input" placeholder="过期时间，可选：2026-07-01T00:00:00+08:00" />
@@ -61,7 +61,7 @@
                 </div>
               </div>
               <div class="terminal-bar"><span></span><span></span><span></span></div>
-              <pre class="result mono dark-result generated-codes-result">{{ generatedCodes }}</pre>
+              <pre class="result mono dark-result generated-codes-result">{{ generatedCodesPreview }}</pre>
             </div>
           </Transition>
         </div>
@@ -310,7 +310,17 @@ const manualCopyTitle = ref('')
 const manualCopyText = ref('')
 const probingCodeId = ref('')
 
-const generatedCodeCount = computed(() => generatedCodes.value.split(/\r?\n/).filter(Boolean).length)
+const generatedCodePreviewLimit = 200
+const generatedCodeLines = computed(() => generatedCodes.value.split(/\r?\n/).filter(Boolean))
+const generatedCodeCount = computed(() => generatedCodeLines.value.length)
+const generatedCodesPreview = computed(() => {
+  const lines = generatedCodeLines.value
+  if (lines.length <= generatedCodePreviewLimit) return generatedCodes.value
+  return [
+    ...lines.slice(0, generatedCodePreviewLimit),
+    `... 已隐藏 ${lines.length - generatedCodePreviewLimit} 个，复制/导出会包含全部`,
+  ].join('\n')
+})
 const selectedCodes = computed(() => batchCodes.value.map(displayCode).join('\n'))
 
 function batchRate(batch: RedeemBatch) {
@@ -351,14 +361,16 @@ async function copySelectedBatchCodes() {
     toast.info('请先选择一个批次')
     return
   }
+  await ensureSelectedBatchCodesLoaded()
   await copyText(selectedCodes.value, '已复制该批次兑换码')
 }
 
-function exportSelectedBatchCodes() {
+async function exportSelectedBatchCodes() {
   if (!selectedBatch.value) {
     toast.info('请先选择一个批次')
     return
   }
+  await ensureSelectedBatchCodesLoaded()
   exportBatchSnapshot(selectedBatch.value)
 }
 
@@ -370,6 +382,12 @@ async function copyBatchCodes(batch: RedeemBatch) {
 async function exportBatchCodes(batch: RedeemBatch) {
   await loadCodes(batch.id)
   exportBatchSnapshot(batch)
+}
+
+async function ensureSelectedBatchCodesLoaded() {
+  if (selectedBatch.value && !batchCodes.value.length) {
+    await loadCodes(selectedBatch.value.id)
+  }
 }
 
 function exportBatchSnapshot(batch: RedeemBatch) {

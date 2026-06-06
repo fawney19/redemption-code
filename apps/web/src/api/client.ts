@@ -144,6 +144,29 @@ export interface RedeemExportResponse extends ExportResponse {
   failures: RedeemFailure[]
 }
 
+export interface RedeemJob {
+  id: string
+  mode: 'redeem' | 'after_sale' | string
+  format: ExportFormat
+  status: 'queued' | 'running' | 'completed' | 'failed' | string
+  total_codes: number
+  processed_codes: number
+  progress: number
+  success_count: number
+  failure_count: number
+  account_count: number
+  network_total: number
+  network_done: number
+  message?: string | null
+  error?: string | null
+  result?: RedeemExportResponse | null
+}
+
+export interface RedeemJobResponse {
+  success: boolean
+  job: RedeemJob
+}
+
 export type ProbeMode = 'hybrid' | 'direct' | 'cpa'
 
 export interface AutoProbeSettings {
@@ -471,5 +494,22 @@ export const api = {
       { token: '' },
       { method: 'POST', body: JSON.stringify(payload) },
     )
+  },
+  startRedeemExportJob(payload: { codes: string[]; format: ExportFormat }) {
+    return request<RedeemJobResponse>(
+      '/api/redeem/export-jobs',
+      { token: '' },
+      { method: 'POST', body: JSON.stringify(payload) },
+    )
+  },
+  startRedeemAfterSaleJob(payload: { codes: string[]; format: ExportFormat }) {
+    return request<RedeemJobResponse>(
+      '/api/redeem/after-sale-jobs',
+      { token: '' },
+      { method: 'POST', body: JSON.stringify(payload) },
+    )
+  },
+  getRedeemJob(jobId: string) {
+    return request<RedeemJobResponse>(`/api/redeem/jobs/${encodeURIComponent(jobId)}`, { token: '' })
   },
 }

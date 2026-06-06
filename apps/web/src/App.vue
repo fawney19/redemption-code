@@ -14,6 +14,7 @@ import {
   loadBatches,
   loadAutoProbeSettings,
   loadRedeemRateLimitSettings,
+  logoutAdmin,
 } from './composables/useAdmin'
 import PublicView from './views/PublicView.vue'
 import AdminLogin from './views/AdminLogin.vue'
@@ -45,7 +46,13 @@ onMounted(() => {
         loadRedeemRateLimitSettings(),
       ]))
       .catch((e) => {
-        adminResult.value = e instanceof Error ? e.message : String(e)
+        const message = e instanceof Error ? e.message : String(e)
+        if (message.toLowerCase().includes('unauthorized')) {
+          logoutAdmin()
+          adminResult.value = '登录已失效，请重新输入密码'
+          return
+        }
+        adminResult.value = message
       })
   }
 })

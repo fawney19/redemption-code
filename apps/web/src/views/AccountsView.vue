@@ -201,7 +201,7 @@
               </label>
             </div>
 
-            <div class="settings-grid">
+            <div class="settings-grid probe-mode-grid">
               <label class="field-label">
                 <span>测活模式</span>
                 <select v-model="autoProbeForm.probe_mode" class="select">

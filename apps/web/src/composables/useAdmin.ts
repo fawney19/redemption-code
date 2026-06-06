@@ -258,13 +258,25 @@ export async function withBusy(task: () => Promise<void>, onError?: (msg: string
 export async function loginAdmin() {
   await withBusy(async () => {
     adminResult.value = ''
-    adminToken.value = adminTokenDraft.value.trim()
-    sessionStorage.setItem(adminTokenStorageKey, adminToken.value)
-    await loadPools()
-    await loadAccounts()
-    await loadBatches()
-    await loadAutoProbeSettings()
-    await loadRedeemRateLimitSettings()
+    const nextToken = adminTokenDraft.value.trim()
+    const previousToken = adminToken.value
+    adminToken.value = nextToken
+    sessionStorage.setItem(adminTokenStorageKey, nextToken)
+    try {
+      await loadPools()
+      await loadAccounts()
+      await loadBatches()
+      await loadAutoProbeSettings()
+      await loadRedeemRateLimitSettings()
+    } catch (error) {
+      adminToken.value = previousToken
+      if (previousToken) {
+        sessionStorage.setItem(adminTokenStorageKey, previousToken)
+      } else {
+        sessionStorage.removeItem(adminTokenStorageKey)
+      }
+      throw error
+    }
   })
 }
 
@@ -610,7 +622,10 @@ export async function createBatch() {
     })
     generatedCodes.value = result.codes.map((c) => c.code).join('\n')
     await loadBatches()
-    await fetchCodes(result.batch_id)
+    selectedBatchId.value = result.batch_id
+    if (result.codes.length <= 500) await fetchCodes(result.batch_id)
+    else batchCodes.value = []
+    adminResult.value = `已生成 ${result.codes.length} 个兑换码`
   })
 }
 

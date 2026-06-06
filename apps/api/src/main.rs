@@ -4,15 +4,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use account_pool_core::{
-    access_token_needs_refresh, export_cpa_zip_from_document, normalize_wham_usage_response,
-    parse_codex_accounts, unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat,
-    HealthCheckResult, ACCESS_TOKEN_REFRESH_GRACE_SECONDS, CHATGPT_ACCOUNTS_CHECK_URL,
-    CHATGPT_SESSION_URL, CODEX_WHAM_USAGE_URL, CPA_PROBE_USER_AGENT, OPENAI_BROWSER_USER_AGENT,
+    access_token_needs_refresh, export_cpa_zip_from_document, format_redeem_code,
+    normalize_redeem_code, normalize_wham_usage_response, parse_codex_accounts, redeem_code_hash,
+    unix_now_secs, AccountStatus, CodexAuthFile, ExportFormat, HealthCheckResult,
+    ACCESS_TOKEN_REFRESH_GRACE_SECONDS, CHATGPT_ACCOUNTS_CHECK_URL, CHATGPT_SESSION_URL,
+    CODEX_WHAM_USAGE_URL, CPA_PROBE_USER_AGENT, OPENAI_BROWSER_USER_AGENT,
     OPENAI_OAUTH_REFRESH_SCOPE,
 };
 use account_pool_data::{
     AccountListQuery, AccountPoolRepository, AccountPoolUpsertInput, AccountSummary,
-    AutoProbeSettings, CreateRedeemBatchInput, DataError, RedeemRateLimitSettings,
+    AutoProbeSettings, CreateRedeemBatchInput, DataError, RedeemExportOutcome, RedeemFailure,
+    RedeemRateLimitSettings, RedeemSuccess,
 };
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -27,10 +29,17 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
-const MAX_JSON_BODY_BYTES: usize = 10 * 1024 * 1024;
-const MAX_REDEEM_CODES_PER_REQUEST: usize = 500;
-const MAX_REDEEM_ACCOUNTS_PER_REQUEST: usize = 1_000;
+const MAX_JSON_BODY_BYTES: usize = 100 * 1024 * 1024;
+const MAX_REDEEM_CODES_PER_REQUEST: usize = 10_000;
+const MAX_REDEEM_ACCOUNTS_PER_REQUEST: usize = 100_000;
+const MAX_ACTIVE_REDEEM_JOBS: usize = 4;
+const MAX_COMPLETED_REDEEM_JOBS: usize = 12;
+const REDEEM_JOB_CHUNK_SIZE: usize = 500;
+const REDEEM_JOB_RETENTION_SECONDS: u64 = 60 * 60;
+const REDEEM_JOB_PRUNE_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_REDEEM_PROBE_CONCURRENCY: usize = 16;
 const ADMIN_TOKEN_PLACEHOLDERS: &[&str] = &["change-this-admin-password"];
 const SECRET_KEY_PLACEHOLDERS: &[&str] = &[
     "change-this-long-random-secret",
@@ -51,8 +60,10 @@ struct AppState {
     wham_usage_url: Arc<String>,
     ip_check_url: Arc<String>,
     trust_proxy_headers: bool,
+    skip_redeem_probe: bool,
     auto_probe_lock: Arc<Mutex<()>>,
     redeem_rate_limiter: Arc<Mutex<RedeemRateLimiter>>,
+    redeem_jobs: Arc<Mutex<HashMap<String, RedeemJob>>>,
 }
 
 #[tokio::main]
@@ -115,11 +126,14 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "https://api.ipify.org?format=json".to_string()),
         ),
         trust_proxy_headers: env_flag("AETHER_POOL_TRUST_PROXY_HEADERS"),
+        skip_redeem_probe: env_flag("AETHER_POOL_SKIP_REDEEM_PROBE"),
         auto_probe_lock: Arc::new(Mutex::new(())),
         redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
+        redeem_jobs: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let _auto_probe_worker = spawn_auto_probe_worker(state.clone());
+    let _redeem_job_prune_worker = spawn_redeem_job_prune_worker(state.clone());
 
     let app = router(state)
         .layer(TraceLayer::new_for_http())
@@ -260,6 +274,12 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/redeem/export", post(redeem_export))
         .route("/api/redeem/after-sale", post(redeem_after_sale_export))
+        .route("/api/redeem/export-jobs", post(start_redeem_export_job))
+        .route(
+            "/api/redeem/after-sale-jobs",
+            post(start_redeem_after_sale_job),
+        )
+        .route("/api/redeem/jobs/{job_id}", get(get_redeem_job))
         .with_state(state)
 }
 
@@ -823,8 +843,8 @@ async fn create_redeem_batch(
     if payload.name.trim().is_empty() {
         return Err(ApiError::bad_request("batch name is required"));
     }
-    if payload.total_count == 0 || payload.total_count > 5000 {
-        return Err(ApiError::bad_request("total_count must be 1..=5000"));
+    if payload.total_count == 0 || payload.total_count > 10_000 {
+        return Err(ApiError::bad_request("total_count must be 1..=10000"));
     }
     if payload.accounts_per_code == 0 || payload.accounts_per_code > 100 {
         return Err(ApiError::bad_request("accounts_per_code must be 1..=100"));
@@ -910,6 +930,88 @@ struct RedeemAfterSaleRequest {
     format: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RedeemJobKind {
+    Redeem,
+    AfterSale,
+}
+
+impl RedeemJobKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redeem => "redeem",
+            Self::AfterSale => "after_sale",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RedeemJob {
+    id: String,
+    kind: RedeemJobKind,
+    format: ExportFormat,
+    status: String,
+    total_codes: usize,
+    processed_codes: usize,
+    success_count: usize,
+    failure_count: usize,
+    account_count: usize,
+    network_total: usize,
+    network_done: usize,
+    message: Option<String>,
+    error: Option<String>,
+    result: Option<RedeemJobResult>,
+    created_at: u64,
+    updated_at: u64,
+    finished_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RedeemJobResult {
+    document: Value,
+    download: Option<Value>,
+    successes: Vec<RedeemSuccess>,
+    failures: Vec<RedeemFailure>,
+}
+
+#[derive(Clone)]
+struct RedeemJobProgress {
+    state: AppState,
+    job_id: String,
+}
+
+impl RedeemJobProgress {
+    async fn add_network_total(&self, amount: usize, message: impl Into<String>) {
+        if amount == 0 {
+            return;
+        }
+        let message = message.into();
+        update_redeem_job(&self.state, &self.job_id, |job| {
+            job.network_total = job.network_total.saturating_add(amount);
+            job.message = Some(message);
+        })
+        .await;
+    }
+
+    async fn increment_network_done(&self, message: impl Into<String>) {
+        let message = message.into();
+        update_redeem_job(&self.state, &self.job_id, |job| {
+            job.network_done = job.network_done.saturating_add(1).min(job.network_total);
+            job.message = Some(message);
+        })
+        .await;
+    }
+
+    async fn complete_network(&self, message: impl Into<String>) {
+        let message = message.into();
+        update_redeem_job(&self.state, &self.job_id, |job| {
+            job.network_done = job.network_total;
+            job.message = Some(message);
+        })
+        .await;
+    }
+}
+
 async fn redeem_export(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -922,43 +1024,14 @@ async fn redeem_export(
         .format
         .parse::<ExportFormat>()
         .map_err(|_| ApiError::bad_request("unsupported export format"))?;
-    let preparation = state.repo.prepare_redeem_export(&payload.codes).await?;
-    validate_redeem_export_limits(payload.codes.len(), preparation.estimated_account_count)?;
-    if !preparation.refresh_account_ids.is_empty() {
-        let _ =
-            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), None, true)
-                .await?;
-    }
-    if !preparation.probe_account_ids.is_empty() {
-        let settings = state.repo.get_auto_probe_settings().await?;
-        let probe_summary = run_probe_accounts(
-            &state,
-            Some(&preparation.probe_account_ids),
-            ProbeRunOptions {
-                max_accounts: None,
-                concurrency: settings.concurrency as usize,
-                include_redeemed: false,
-                pool_id: None,
-            },
-        )
-        .await?;
-        if probe_summary.failed > 0 {
-            return Err(ApiError::bad_request("兑换前测活失败，请稍后重试"));
-        }
-    }
-    let outcome = state
-        .repo
-        .redeem_codes_for_export_with_verified_accounts(
-            &payload.codes,
-            format,
-            Some(&preparation.probe_account_ids),
-        )
-        .await?;
+    let outcome = run_redeem_export_chunk(&state, &payload.codes, format, None).await?;
+    let download = export_download(outcome.format, &outcome.document, "aether-pool-redeem");
+    let document = redeem_response_document(outcome.document, download.is_some());
     Ok(Json(json!({
         "success": true,
         "format": outcome.format.as_str(),
-        "document": outcome.document,
-        "download": export_download(outcome.format, &outcome.document, "aether-pool-redeem"),
+        "document": document,
+        "download": download,
         "successes": outcome.successes,
         "failures": outcome.failures,
     })))
@@ -976,46 +1049,551 @@ async fn redeem_after_sale_export(
         .format
         .parse::<ExportFormat>()
         .map_err(|_| ApiError::bad_request("unsupported export format"))?;
-    let preparation = state.repo.prepare_after_sale_export(&payload.codes).await?;
-    validate_redeem_export_limits(payload.codes.len(), preparation.estimated_account_count)?;
-    if !preparation.refresh_account_ids.is_empty() {
-        let _ =
-            refresh_expired_accounts(&state, Some(&preparation.refresh_account_ids), None, true)
-                .await?;
+    let outcome = run_redeem_after_sale_chunk(&state, &payload.codes, format, None).await?;
+    let download = export_download(outcome.format, &outcome.document, "aether-pool-after-sale");
+    let document = redeem_response_document(outcome.document, download.is_some());
+    Ok(Json(json!({
+        "success": true,
+        "format": outcome.format.as_str(),
+        "document": document,
+        "download": download,
+        "successes": outcome.successes,
+        "failures": outcome.failures,
+    })))
+}
+
+async fn start_redeem_export_job(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<RedeemExportRequest>,
+) -> Result<Json<Value>, ApiError> {
+    start_redeem_job(
+        state,
+        headers,
+        peer_addr.ip(),
+        payload.codes,
+        payload.format,
+        RedeemJobKind::Redeem,
+    )
+    .await
+}
+
+async fn start_redeem_after_sale_job(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<RedeemAfterSaleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    start_redeem_job(
+        state,
+        headers,
+        peer_addr.ip(),
+        payload.codes,
+        payload.format,
+        RedeemJobKind::AfterSale,
+    )
+    .await
+}
+
+async fn start_redeem_job(
+    state: AppState,
+    headers: HeaderMap,
+    peer_ip: IpAddr,
+    codes: Vec<String>,
+    format: String,
+    kind: RedeemJobKind,
+) -> Result<Json<Value>, ApiError> {
+    enforce_redeem_rate_limit(&state, &headers, peer_ip).await?;
+    validate_redeem_export_limits(codes.len(), 0)?;
+    let format = format
+        .parse::<ExportFormat>()
+        .map_err(|_| ApiError::bad_request("unsupported export format"))?;
+    let estimated_account_count = estimate_redeem_job_account_count(&state, kind, &codes).await?;
+    validate_redeem_export_limits(codes.len(), estimated_account_count)?;
+    prune_redeem_jobs(&state).await;
+    let job_id = Uuid::new_v4().to_string();
+    let now = unix_now_secs();
+    let job = RedeemJob {
+        id: job_id.clone(),
+        kind,
+        format,
+        status: "queued".to_string(),
+        total_codes: codes.len(),
+        processed_codes: 0,
+        success_count: 0,
+        failure_count: 0,
+        account_count: 0,
+        network_total: 0,
+        network_done: 0,
+        message: Some("任务已提交".to_string()),
+        error: None,
+        result: None,
+        created_at: now,
+        updated_at: now,
+        finished_at: None,
+    };
+    {
+        let mut jobs = state.redeem_jobs.lock().await;
+        let active_count = jobs.values().filter(|job| job.is_active()).count();
+        if active_count >= MAX_ACTIVE_REDEEM_JOBS {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "too many redeem jobs are running; try again after one finishes (limit {MAX_ACTIVE_REDEEM_JOBS})"
+                ),
+            ));
+        }
+        jobs.insert(job_id.clone(), job);
     }
-    if !preparation.probe_account_ids.is_empty() {
+    tokio::spawn(run_redeem_job(state.clone(), job_id.clone(), codes));
+    Ok(Json(json!({
+        "success": true,
+        "job": redeem_job_json(&state, &job_id).await,
+    })))
+}
+
+async fn get_redeem_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(job) = redeem_job_json(&state, &job_id).await else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "兑换任务不存在或已过期",
+        ));
+    };
+    Ok(Json(json!({
+        "success": true,
+        "job": job,
+    })))
+}
+
+async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>) {
+    update_redeem_job(&state, &job_id, |job| {
+        job.status = "running".to_string();
+        job.message = Some("正在兑换".to_string());
+    })
+    .await;
+
+    let (codes, initial_failures) = normalize_redeem_job_codes(raw_codes);
+    let initial_failure_count = initial_failures.len();
+    let mut all_failures = initial_failures;
+    let mut all_successes = Vec::new();
+    let mut export_items = Vec::new();
+    let mut account_count = 0_usize;
+    let progress = RedeemJobProgress {
+        state: state.clone(),
+        job_id: job_id.clone(),
+    };
+
+    update_redeem_job(&state, &job_id, |job| {
+        job.processed_codes = initial_failure_count;
+        job.failure_count = initial_failure_count;
+        job.message = Some("正在兑换".to_string());
+    })
+    .await;
+
+    for (chunk_index, chunk) in codes.chunks(REDEEM_JOB_CHUNK_SIZE).enumerate() {
+        let (kind, format) = {
+            let jobs = state.redeem_jobs.lock().await;
+            let Some(job) = jobs.get(&job_id) else {
+                return;
+            };
+            (job.kind, job.format)
+        };
+        let chunk_start = chunk_index * REDEEM_JOB_CHUNK_SIZE;
+        let chunk_codes = chunk.to_vec();
+        let next_processed = all_successes.len() + all_failures.len();
+        update_redeem_job(&state, &job_id, |job| {
+            job.processed_codes = next_processed.min(job.total_codes);
+            job.message = Some("正在兑换".to_string());
+        })
+        .await;
+        let outcome = match kind {
+            RedeemJobKind::Redeem => {
+                run_redeem_export_chunk(&state, &chunk_codes, format, Some(progress.clone())).await
+            }
+            RedeemJobKind::AfterSale => {
+                run_redeem_after_sale_chunk(&state, &chunk_codes, format, Some(progress.clone()))
+                    .await
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let reason = format!("兑换任务中断: {}", error.message);
+                all_failures.extend(codes[chunk_start..].iter().cloned().map(|code| {
+                    RedeemFailure {
+                        code,
+                        reason: reason.clone(),
+                    }
+                }));
+                let result = finalize_redeem_job_result(
+                    kind,
+                    format,
+                    export_items,
+                    all_successes,
+                    all_failures,
+                );
+                update_redeem_job(&state, &job_id, |job| {
+                    job.status = "completed".to_string();
+                    job.processed_codes = job.total_codes;
+                    job.success_count = result.successes.len();
+                    job.failure_count = result.failures.len();
+                    job.account_count = account_count;
+                    job.error = Some(error.message.clone());
+                    job.message = Some("兑换完成，部分失败".to_string());
+                    job.result = Some(result);
+                    job.updated_at = unix_now_secs();
+                    job.finished_at = Some(unix_now_secs());
+                })
+                .await;
+                return;
+            }
+        };
+        account_count += outcome
+            .successes
+            .iter()
+            .map(|success| success.account_count)
+            .sum::<usize>();
+        append_export_items(format, outcome.document, &mut export_items);
+        all_successes.extend(outcome.successes);
+        all_failures.extend(outcome.failures);
+        let processed = chunk_codes.len();
+        let success_count = all_successes.len();
+        let failure_count = all_failures.len();
+        update_redeem_job(&state, &job_id, |job| {
+            job.processed_codes = job.processed_codes.saturating_add(processed);
+            job.success_count = success_count;
+            job.failure_count = failure_count;
+            job.account_count = account_count;
+            job.message = Some(format!(
+                "已处理 {} / {}",
+                job.processed_codes, job.total_codes
+            ));
+        })
+        .await;
+    }
+
+    progress.complete_network("正在处理导出结果").await;
+
+    let (kind, format) = {
+        let jobs = state.redeem_jobs.lock().await;
+        let Some(job) = jobs.get(&job_id) else {
+            return;
+        };
+        (job.kind, job.format)
+    };
+    let result =
+        finalize_redeem_job_result(kind, format, export_items, all_successes, all_failures);
+    update_redeem_job(&state, &job_id, |job| {
+        job.status = "completed".to_string();
+        job.processed_codes = job.total_codes;
+        job.success_count = result.successes.len();
+        job.failure_count = result.failures.len();
+        job.account_count = account_count;
+        job.message = Some("兑换完成".to_string());
+        job.result = Some(result);
+        job.finished_at = Some(unix_now_secs());
+    })
+    .await;
+}
+
+impl RedeemJob {
+    fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "queued" | "running")
+    }
+}
+
+async fn estimate_redeem_job_account_count(
+    state: &AppState,
+    kind: RedeemJobKind,
+    codes: &[String],
+) -> Result<usize, ApiError> {
+    match kind {
+        RedeemJobKind::Redeem => Ok(state
+            .repo
+            .prepare_redeem_export(codes)
+            .await?
+            .estimated_account_count),
+        RedeemJobKind::AfterSale => Ok(state
+            .repo
+            .prepare_after_sale_export(codes)
+            .await?
+            .estimated_account_count),
+    }
+}
+
+fn finalize_redeem_job_result(
+    kind: RedeemJobKind,
+    format: ExportFormat,
+    export_items: Vec<Value>,
+    successes: Vec<RedeemSuccess>,
+    failures: Vec<RedeemFailure>,
+) -> RedeemJobResult {
+    let document = finalize_export_document(format, export_items);
+    let prefix = match kind {
+        RedeemJobKind::Redeem => "aether-pool-redeem",
+        RedeemJobKind::AfterSale => "aether-pool-after-sale",
+    };
+    let download = export_download(format, &document, prefix);
+    let document = redeem_response_document(document, download.is_some());
+    RedeemJobResult {
+        document,
+        download,
+        successes,
+        failures,
+    }
+}
+
+async fn update_redeem_job(state: &AppState, job_id: &str, update: impl FnOnce(&mut RedeemJob)) {
+    let mut jobs = state.redeem_jobs.lock().await;
+    if let Some(job) = jobs.get_mut(job_id) {
+        update(job);
+        job.updated_at = unix_now_secs();
+    }
+}
+
+async fn prune_redeem_jobs(state: &AppState) {
+    let cutoff = unix_now_secs().saturating_sub(REDEEM_JOB_RETENTION_SECONDS);
+    let mut jobs = state.redeem_jobs.lock().await;
+    jobs.retain(|_, job| {
+        job.finished_at
+            .is_none_or(|finished_at| finished_at >= cutoff)
+    });
+
+    let mut completed = jobs
+        .iter()
+        .filter_map(|(id, job)| job.finished_at.map(|finished_at| (id.clone(), finished_at)))
+        .collect::<Vec<_>>();
+    if completed.len() > MAX_COMPLETED_REDEEM_JOBS {
+        completed.sort_by_key(|(_, finished_at)| *finished_at);
+        let remove_count = completed.len() - MAX_COMPLETED_REDEEM_JOBS;
+        for (id, _) in completed.into_iter().take(remove_count) {
+            jobs.remove(&id);
+        }
+    }
+}
+
+async fn redeem_job_json(state: &AppState, job_id: &str) -> Option<Value> {
+    let job = state.redeem_jobs.lock().await.get(job_id).cloned()?;
+    let progress = if job.total_codes == 0 {
+        0
+    } else {
+        ((job.processed_codes.min(job.total_codes) * 100) / job.total_codes) as u64
+    };
+    let result = job.result.as_ref().map(|result| {
+        json!({
+            "format": job.format.as_str(),
+            "document": result.document.clone(),
+            "download": result.download.clone(),
+            "successes": result.successes.clone(),
+            "failures": result.failures.clone(),
+        })
+    });
+    Some(json!({
+        "id": job.id,
+        "mode": job.kind.as_str(),
+        "format": job.format.as_str(),
+        "status": job.status,
+        "total_codes": job.total_codes,
+        "processed_codes": job.processed_codes,
+        "progress": progress,
+        "success_count": job.success_count,
+        "failure_count": job.failure_count,
+        "account_count": job.account_count,
+        "network_total": job.network_total,
+        "network_done": job.network_done,
+        "message": job.message,
+        "error": job.error,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "finished_at": job.finished_at,
+        "result": result,
+    }))
+}
+
+fn normalize_redeem_job_codes(raw_codes: Vec<String>) -> (Vec<String>, Vec<RedeemFailure>) {
+    let mut codes = Vec::new();
+    let mut failures = Vec::new();
+    let mut seen_hashes = std::collections::HashSet::new();
+    for raw_code in raw_codes {
+        let Some(normalized) = normalize_redeem_code(&raw_code) else {
+            failures.push(RedeemFailure {
+                code: raw_code,
+                reason: "兑换码格式无效".to_string(),
+            });
+            continue;
+        };
+        let hash = redeem_code_hash(&normalized);
+        let code = format_redeem_code(&normalized);
+        if !seen_hashes.insert(hash) {
+            failures.push(RedeemFailure {
+                code,
+                reason: "兑换码重复提交".to_string(),
+            });
+            continue;
+        }
+        codes.push(code);
+    }
+    (codes, failures)
+}
+
+async fn run_redeem_export_chunk(
+    state: &AppState,
+    codes: &[String],
+    format: ExportFormat,
+    progress: Option<RedeemJobProgress>,
+) -> Result<RedeemExportOutcome, ApiError> {
+    let preparation = state.repo.prepare_redeem_export(codes).await?;
+    validate_redeem_export_limits(codes.len(), preparation.estimated_account_count)?;
+    if state.skip_redeem_probe {
+        return state
+            .repo
+            .redeem_codes_for_export_with_verified_accounts(codes, format, None)
+            .await
+            .map_err(ApiError::from);
+    }
+    if let Some(progress) = &progress {
+        progress
+            .add_network_total(
+                preparation.refresh_account_ids.len() + preparation.probe_account_ids.len(),
+                "正在兑换",
+            )
+            .await;
+    }
+    if !preparation.refresh_account_ids.is_empty() {
+        let _ = refresh_expired_accounts_with_progress(
+            state,
+            Some(&preparation.refresh_account_ids),
+            None,
+            true,
+            progress.clone(),
+        )
+        .await?;
+    }
+    if !state.skip_redeem_probe && !preparation.probe_account_ids.is_empty() {
         let settings = state.repo.get_auto_probe_settings().await?;
-        let probe_summary = run_probe_accounts(
-            &state,
+        let probe_summary = run_probe_accounts_with_progress(
+            state,
             Some(&preparation.probe_account_ids),
             ProbeRunOptions {
                 max_accounts: None,
-                concurrency: settings.concurrency as usize,
+                concurrency: redeem_probe_concurrency(&settings),
+                include_redeemed: false,
+                pool_id: None,
+            },
+            progress.clone(),
+        )
+        .await?;
+        if probe_summary.failed > 0 {
+            return Err(ApiError::bad_request("兑换前测活失败，请稍后重试"));
+        }
+    }
+    state
+        .repo
+        .redeem_codes_for_export_with_verified_accounts(
+            codes,
+            format,
+            Some(&preparation.probe_account_ids),
+        )
+        .await
+        .map_err(ApiError::from)
+}
+
+async fn run_redeem_after_sale_chunk(
+    state: &AppState,
+    codes: &[String],
+    format: ExportFormat,
+    progress: Option<RedeemJobProgress>,
+) -> Result<RedeemExportOutcome, ApiError> {
+    let preparation = state.repo.prepare_after_sale_export(codes).await?;
+    validate_redeem_export_limits(codes.len(), preparation.estimated_account_count)?;
+    if state.skip_redeem_probe {
+        return state
+            .repo
+            .redeem_after_sale_for_export_with_verified_accounts(codes, format, None)
+            .await
+            .map_err(ApiError::from);
+    }
+    if let Some(progress) = &progress {
+        progress
+            .add_network_total(
+                preparation.refresh_account_ids.len() + preparation.probe_account_ids.len(),
+                "正在兑换",
+            )
+            .await;
+    }
+    if !preparation.refresh_account_ids.is_empty() {
+        let _ = refresh_expired_accounts_with_progress(
+            state,
+            Some(&preparation.refresh_account_ids),
+            None,
+            true,
+            progress.clone(),
+        )
+        .await?;
+    }
+    if !state.skip_redeem_probe && !preparation.probe_account_ids.is_empty() {
+        let settings = state.repo.get_auto_probe_settings().await?;
+        let probe_summary = run_probe_accounts_with_progress(
+            state,
+            Some(&preparation.probe_account_ids),
+            ProbeRunOptions {
+                max_accounts: None,
+                concurrency: redeem_probe_concurrency(&settings),
                 include_redeemed: true,
                 pool_id: None,
             },
+            progress.clone(),
         )
         .await?;
         if probe_summary.failed > 0 {
             return Err(ApiError::bad_request("售后测活失败，请稍后重试"));
         }
     }
-    let outcome = state
+    state
         .repo
         .redeem_after_sale_for_export_with_verified_accounts(
-            &payload.codes,
+            codes,
             format,
             Some(&preparation.probe_account_ids),
         )
-        .await?;
-    Ok(Json(json!({
-        "success": true,
-        "format": outcome.format.as_str(),
-        "document": outcome.document,
-        "download": export_download(outcome.format, &outcome.document, "aether-pool-after-sale"),
-        "successes": outcome.successes,
-        "failures": outcome.failures,
-    })))
+        .await
+        .map_err(ApiError::from)
+}
+
+fn append_export_items(format: ExportFormat, document: Value, items: &mut Vec<Value>) {
+    match format {
+        ExportFormat::Cpa => match document {
+            Value::Array(values) => items.extend(values),
+            Value::Object(_) => items.push(document),
+            _ => {}
+        },
+        ExportFormat::Sub2api => {
+            if let Some(accounts) = document.get("accounts").and_then(Value::as_array) {
+                items.extend(accounts.iter().cloned());
+            }
+        }
+    }
+}
+
+fn finalize_export_document(format: ExportFormat, mut items: Vec<Value>) -> Value {
+    match format {
+        ExportFormat::Cpa => {
+            if items.len() == 1 {
+                items.pop().unwrap_or_else(|| json!({}))
+            } else {
+                Value::Array(items)
+            }
+        }
+        ExportFormat::Sub2api => json!({
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+            "proxies": [],
+            "accounts": items,
+        }),
+    }
 }
 
 fn validate_redeem_export_limits(
@@ -1050,6 +1628,25 @@ fn export_download(format: ExportFormat, document: &Value, prefix: &str) -> Opti
         }),
         ExportFormat::Sub2api => None,
     }
+}
+
+fn redeem_response_document(document: Value, has_download: bool) -> Value {
+    if has_download {
+        Value::Null
+    } else {
+        document
+    }
+}
+
+fn spawn_redeem_job_prune_worker(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(REDEEM_JOB_PRUNE_INTERVAL_SECONDS));
+        loop {
+            interval.tick().await;
+            prune_redeem_jobs(&state).await;
+        }
+    })
 }
 
 fn spawn_auto_probe_worker(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -1128,6 +1725,18 @@ struct ProbeRunOptions {
     pool_id: Option<String>,
 }
 
+fn redeem_probe_concurrency(settings: &AutoProbeSettings) -> usize {
+    if let Some(concurrency) = std::env::var("AETHER_POOL_REDEEM_PROBE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        return concurrency.clamp(1, 32);
+    }
+    (settings.concurrency as usize)
+        .max(DEFAULT_REDEEM_PROBE_CONCURRENCY)
+        .clamp(1, 32)
+}
+
 #[derive(Default)]
 struct ProbeRunSummary {
     checked: usize,
@@ -1139,6 +1748,15 @@ async fn run_probe_accounts(
     state: &AppState,
     account_ids: Option<&[String]>,
     options: ProbeRunOptions,
+) -> Result<ProbeRunSummary, ApiError> {
+    run_probe_accounts_with_progress(state, account_ids, options, None).await
+}
+
+async fn run_probe_accounts_with_progress(
+    state: &AppState,
+    account_ids: Option<&[String]>,
+    options: ProbeRunOptions,
+    progress: Option<RedeemJobProgress>,
 ) -> Result<ProbeRunSummary, ApiError> {
     let mut accounts = if options.include_redeemed {
         if let Some(account_ids) = account_ids {
@@ -1169,7 +1787,7 @@ async fn run_probe_accounts(
     let mut summary = ProbeRunSummary::default();
     for (account, auth_file) in accounts {
         while join_set.len() >= concurrency {
-            collect_probe_result(&mut join_set, &mut summary).await;
+            collect_probe_result(&mut join_set, &mut summary, progress.as_ref()).await;
         }
         let state = state.clone();
         let probe_http = probe_http.clone();
@@ -1190,7 +1808,7 @@ async fn run_probe_accounts(
         });
     }
     while !join_set.is_empty() {
-        collect_probe_result(&mut join_set, &mut summary).await;
+        collect_probe_result(&mut join_set, &mut summary, progress.as_ref()).await;
     }
     Ok(summary)
 }
@@ -1208,6 +1826,7 @@ fn pool_scope_for_ids(account_ids: Option<&[String]>, pool_id: Option<&str>) -> 
 async fn collect_probe_result(
     join_set: &mut JoinSet<Result<Value, ApiError>>,
     summary: &mut ProbeRunSummary,
+    progress: Option<&RedeemJobProgress>,
 ) {
     let Some(result) = join_set.join_next().await else {
         return;
@@ -1229,6 +1848,9 @@ async fn collect_probe_result(
                 "error": error.to_string(),
             }));
         }
+    }
+    if let Some(progress) = progress {
+        progress.increment_network_done("正在兑换").await;
     }
 }
 
@@ -2740,6 +3362,22 @@ async fn refresh_expired_accounts(
     pool_id: Option<&str>,
     force: bool,
 ) -> Result<RefreshOutcome, ApiError> {
+    refresh_expired_accounts_with_progress(state, account_ids, pool_id, force, None).await
+}
+
+struct RefreshTaskResult {
+    refreshed: bool,
+    failed: bool,
+    result: Value,
+}
+
+async fn refresh_expired_accounts_with_progress(
+    state: &AppState,
+    account_ids: Option<&[String]>,
+    pool_id: Option<&str>,
+    force: bool,
+    progress: Option<RedeemJobProgress>,
+) -> Result<RefreshOutcome, ApiError> {
     let now = unix_now_secs();
     let accounts = state
         .repo
@@ -2747,7 +3385,13 @@ async fn refresh_expired_accounts(
         .await?;
     let settings = state.repo.get_auto_probe_settings().await?;
     let (refresh_http, refresh_proxy) = resolve_probe_http_client(state, &settings).await?;
+    let concurrency = if progress.is_some() {
+        redeem_probe_concurrency(&settings)
+    } else {
+        (settings.concurrency as usize).clamp(1, 32)
+    };
     let mut outcome = RefreshOutcome::default();
+    let mut join_set = JoinSet::new();
     for (summary, auth_file) in accounts {
         let should_refresh = force
             || access_token_needs_refresh(
@@ -2759,40 +3403,90 @@ async fn refresh_expired_accounts(
             outcome.skipped += 1;
             continue;
         }
-        match refresh_codex_auth_file_with_client(state, &refresh_http, &auth_file).await {
-            Ok(refreshed) => {
-                state
-                    .repo
-                    .update_account_auth(
-                        &summary.id,
-                        &refreshed,
-                        AccountStatus::Available,
-                        Some(unix_now_secs()),
-                    )
-                    .await?;
-                outcome.refreshed += 1;
-                outcome.results.push(json!({
-                    "account_id": summary.id,
-                    "status": "refreshed",
-                    "proxy": refresh_proxy.clone()
-                }));
-            }
-            Err(error) => {
-                state
-                    .repo
-                    .mark_account_status(&summary.id, AccountStatus::RefreshFailed)
-                    .await?;
-                outcome.failed += 1;
-                outcome.results.push(json!({
-                    "account_id": summary.id,
-                    "status": "refresh_failed",
-                    "proxy": refresh_proxy.clone(),
-                    "error": error
-                }));
-            }
+        while join_set.len() >= concurrency {
+            collect_refresh_result(&mut join_set, &mut outcome, progress.as_ref()).await?;
         }
+        let state = state.clone();
+        let refresh_http = refresh_http.clone();
+        let refresh_proxy = refresh_proxy.clone();
+        join_set.spawn(async move {
+            let account_id = summary.id;
+            match refresh_codex_auth_file_with_client(&state, &refresh_http, &auth_file).await {
+                Ok(refreshed) => {
+                    state
+                        .repo
+                        .update_account_auth(
+                            &account_id,
+                            &refreshed,
+                            AccountStatus::Available,
+                            Some(unix_now_secs()),
+                        )
+                        .await?;
+                    Ok(RefreshTaskResult {
+                        refreshed: true,
+                        failed: false,
+                        result: json!({
+                            "account_id": account_id,
+                            "status": "refreshed",
+                            "proxy": refresh_proxy
+                        }),
+                    })
+                }
+                Err(error) => {
+                    state
+                        .repo
+                        .mark_account_status(&account_id, AccountStatus::RefreshFailed)
+                        .await?;
+                    Ok(RefreshTaskResult {
+                        refreshed: false,
+                        failed: true,
+                        result: json!({
+                            "account_id": account_id,
+                            "status": "refresh_failed",
+                            "proxy": refresh_proxy,
+                            "error": error
+                        }),
+                    })
+                }
+            }
+        });
+    }
+    while !join_set.is_empty() {
+        collect_refresh_result(&mut join_set, &mut outcome, progress.as_ref()).await?;
     }
     Ok(outcome)
+}
+
+async fn collect_refresh_result(
+    join_set: &mut JoinSet<Result<RefreshTaskResult, ApiError>>,
+    outcome: &mut RefreshOutcome,
+    progress: Option<&RedeemJobProgress>,
+) -> Result<(), ApiError> {
+    let Some(result) = join_set.join_next().await else {
+        return Ok(());
+    };
+    match result {
+        Ok(Ok(result)) => {
+            if result.refreshed {
+                outcome.refreshed += 1;
+            }
+            if result.failed {
+                outcome.failed += 1;
+            }
+            outcome.results.push(result.result);
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(error) => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("refresh task failed: {error}"),
+            ));
+        }
+    }
+    if let Some(progress) = progress {
+        progress.increment_network_done("正在兑换").await;
+    }
+    Ok(())
 }
 
 async fn refresh_codex_auth_file_with_client(
@@ -2988,8 +3682,10 @@ mod tests {
             wham_usage_url: Arc::new(format!("{base_url}/backend-api/wham/usage")),
             ip_check_url: Arc::new(format!("{base_url}/ip")),
             trust_proxy_headers: false,
+            skip_redeem_probe: false,
             auto_probe_lock: Arc::new(Mutex::new(())),
             redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
+            redeem_jobs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3453,7 +4149,7 @@ mod tests {
     }
 
     #[test]
-    fn redeem_export_limits_reject_empty_or_too_large_requests() {
+    fn redeem_export_limits_reject_empty_or_oversized_requests() {
         assert!(validate_redeem_export_limits(0, 0).is_err());
         assert!(validate_redeem_export_limits(MAX_REDEEM_CODES_PER_REQUEST + 1, 0).is_err());
         assert!(validate_redeem_export_limits(1, MAX_REDEEM_ACCOUNTS_PER_REQUEST + 1).is_err());

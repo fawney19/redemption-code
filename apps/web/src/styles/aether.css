@@ -295,6 +295,17 @@ button:disabled { cursor: not-allowed; }
 
 .dark-panel .panel-header p { color: var(--on-dark-soft); }
 
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.panel-actions .button {
+  white-space: nowrap;
+}
+
 .panel-body {
   padding: 22px;
 }
@@ -394,7 +405,7 @@ button:disabled { cursor: not-allowed; }
 
 .result-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
   gap: 10px;
 }
 
@@ -436,9 +447,27 @@ button:disabled { cursor: not-allowed; }
   font-weight: 500;
 }
 
+.redeem-progress-track {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border-radius: var(--rounded-pill);
+  background: rgba(250, 249, 245, 0.1);
+}
+
+.redeem-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: width 0.2s ease;
+}
+
 .failure-list {
   display: grid;
   gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .failure-item {
@@ -1211,11 +1240,16 @@ button:disabled { cursor: not-allowed; }
 }
 
 /* === Auto Probe Settings === */
+.auto-probe-panel {
+  container-type: inline-size;
+}
+
 .auto-probe-panel .panel-header {
   align-items: flex-start;
 }
 
 .setting-toggle {
+  min-width: 0;
   display: flex;
   align-items: flex-start;
   gap: 10px;
@@ -1236,6 +1270,7 @@ button:disabled { cursor: not-allowed; }
 .setting-toggle strong,
 .setting-toggle small {
   display: block;
+  min-width: 0;
 }
 
 .setting-toggle strong {
@@ -1249,6 +1284,7 @@ button:disabled { cursor: not-allowed; }
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .compact-toggle {
@@ -1262,8 +1298,28 @@ button:disabled { cursor: not-allowed; }
 }
 
 .field-label {
+  min-width: 0;
   display: grid;
   gap: 6px;
+}
+
+.probe-mode-grid {
+  grid-template-columns: minmax(160px, 0.44fr) minmax(0, 0.56fr);
+  align-items: stretch;
+}
+
+.probe-mode-grid .setting-toggle {
+  min-height: 65px;
+}
+
+@container (max-width: 420px) {
+  .probe-mode-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .probe-mode-grid .setting-toggle {
+    min-height: auto;
+  }
 }
 
 .field-label span {
@@ -1848,6 +1904,18 @@ button:disabled { cursor: not-allowed; }
     flex-direction: column;
     align-items: stretch;
     padding: 18px;
+  }
+
+  .panel-actions {
+    justify-content: stretch;
+  }
+
+  .panel-actions .button {
+    flex: 1 1 150px;
+  }
+
+  .failure-list {
+    max-height: 240px;
   }
 
   .panel-body {
