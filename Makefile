@@ -8,7 +8,7 @@ AETHER_POOL_DATABASE_URL ?= sqlite://data/aether-pool.sqlite3
 AETHER_POOL_ADMIN_TOKEN ?= dev-admin-token
 AETHER_POOL_SECRET_KEY ?= dev-only-secret-key
 AETHER_POOL_REDEEM_PROBE_CONCURRENCY ?= 16
-VITE_API_BASE ?= http://$(API_HOST):$(API_PORT)
+VITE_API_BASE ?=
 
 .PHONY: dev dev-api dev-web web-deps
 

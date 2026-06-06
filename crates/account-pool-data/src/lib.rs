@@ -555,11 +555,18 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
         &self,
         pool_id: Option<&str>,
     ) -> Result<AccountPoolStats, DataError> {
+        let usable_after =
+            (unix_now_secs() as i64).saturating_add(ACCESS_TOKEN_REFRESH_GRACE_SECONDS as i64);
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT
   COUNT(*) AS total,
-  COALESCE(SUM(CASE WHEN status = 'available' AND redeemed_at IS NULL THEN 1 ELSE 0 END), 0) AS available,
+  COALESCE(SUM(CASE WHEN status = 'available' AND redeemed_at IS NULL
+    AND expires_at IS NOT NULL AND expires_at > "#,
+        );
+        builder.push_bind(usable_after);
+        builder.push(
+            r#" THEN 1 ELSE 0 END), 0) AS available,
   COALESCE(SUM(CASE WHEN redeemed_at IS NOT NULL OR redeem_code_id IS NOT NULL OR redemption_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS redeemed,
   COALESCE(SUM(CASE WHEN status IN ('at_expired', 'refresh_failed', 'auth_invalid', 'forbidden', 'quota_exhausted') THEN 1 ELSE 0 END), 0) AS attention
 FROM accounts a
@@ -1568,18 +1575,32 @@ WHERE codes.code_hash IN (
             });
         }
 
-        let rows = sqlx::query(
+        let demand_pool_ids = demands
+            .iter()
+            .map(|demand| demand.pool_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT id, pool_id, plan_type, status, expires_at
 FROM accounts
 WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
-  AND (redeem_reservation_id IS NULL OR redeem_reserved_at IS NULL OR redeem_reserved_at <= ?)
-ORDER BY created_at ASC
+  AND (redeem_reservation_id IS NULL OR redeem_reserved_at IS NULL OR redeem_reserved_at <= 
 "#,
-        )
-        .bind(reservation_cutoff)
-        .fetch_all(&mut *tx)
-        .await?;
+        );
+        builder.push_bind(reservation_cutoff);
+        builder.push(")");
+        builder.push(" AND pool_id IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for pool_id in &demand_pool_ids {
+                separated.push_bind(pool_id);
+            }
+            separated.push_unseparated(")");
+        }
+        builder.push(" ORDER BY created_at ASC");
+        let rows = builder.build().fetch_all(&mut *tx).await?;
         let candidates = rows
             .into_iter()
             .map(|row| {
@@ -1598,9 +1619,14 @@ ORDER BY created_at ASC
         let mut probe_ids = Vec::new();
         let mut reserved_ids = Vec::new();
         for demand in demands {
-            let mut remaining = demand.count;
+            let target_count = if reserve_accounts {
+                redeem_probe_target_count(demand.count)
+            } else {
+                demand.count
+            };
+            let mut selected_for_demand = 0_usize;
             for candidate in &candidates {
-                if remaining == 0 {
+                if selected_for_demand >= target_count {
                     break;
                 }
                 if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
@@ -1611,11 +1637,11 @@ ORDER BY created_at ASC
                         probe_ids.push(candidate.id.clone());
                         reserved_ids.push(candidate.id.clone());
                     }
-                    remaining -= 1;
+                    selected_for_demand += 1;
                 }
             }
             for candidate in &candidates {
-                if remaining == 0 {
+                if selected_for_demand >= target_count {
                     break;
                 }
                 if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
@@ -1627,7 +1653,7 @@ ORDER BY created_at ASC
                         probe_ids.push(candidate.id.clone());
                         reserved_ids.push(candidate.id.clone());
                     }
-                    remaining -= 1;
+                    selected_for_demand += 1;
                 }
             }
         }
@@ -1867,18 +1893,32 @@ WHERE codes.code_hash IN (
         if demands.is_empty() {
             return Ok((Vec::new(), Vec::new(), None));
         }
-        let rows = sqlx::query(
+        let demand_pool_ids = demands
+            .iter()
+            .map(|demand| demand.pool_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT id, pool_id, plan_type, status, expires_at
 FROM accounts
 WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
-  AND (redeem_reservation_id IS NULL OR redeem_reserved_at IS NULL OR redeem_reserved_at <= ?)
-ORDER BY created_at ASC
+  AND (redeem_reservation_id IS NULL OR redeem_reserved_at IS NULL OR redeem_reserved_at <= 
 "#,
-        )
-        .bind(reservation_cutoff)
-        .fetch_all(&mut **tx)
-        .await?;
+        );
+        builder.push_bind(reservation_cutoff);
+        builder.push(")");
+        builder.push(" AND pool_id IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for pool_id in &demand_pool_ids {
+                separated.push_bind(pool_id);
+            }
+            separated.push_unseparated(")");
+        }
+        builder.push(" ORDER BY created_at ASC");
+        let rows = builder.build().fetch_all(&mut **tx).await?;
         let candidates = rows
             .into_iter()
             .map(|row| {
@@ -1897,11 +1937,7 @@ ORDER BY created_at ASC
         let mut probe_ids = Vec::new();
         let mut reserved_ids = Vec::new();
         for demand in demands {
-            let target_count = if reserve_accounts {
-                demand.count
-            } else {
-                redeem_probe_target_count(demand.count)
-            };
+            let target_count = redeem_probe_target_count(demand.count);
             let mut selected_for_demand = 0_usize;
             for candidate in &candidates {
                 if selected_for_demand >= target_count {
@@ -1919,7 +1955,7 @@ ORDER BY created_at ASC
                 }
             }
             for candidate in &candidates {
-                if selected_for_demand >= demand.count {
+                if selected_for_demand >= target_count {
                     break;
                 }
                 if selected_ids.contains(&candidate.id) || !candidate.matches(&demand) {
@@ -2115,8 +2151,28 @@ WHERE redeemed_at IS NULL AND status = 'available' AND pool_id =
                     .take(accounts_per_code as usize)
                     .collect::<Vec<_>>();
                 if account_ids.len() < accounts_per_code as usize {
+                    let formatted_code = format_redeem_code(&normalized);
+                    let verified_account_id_set = verified_account_ids.map(|ids| {
+                        ids.iter()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .collect::<HashSet<_>>()
+                    });
+                    log_redeem_stock_shortage_tx(
+                        &mut tx,
+                        "single_export",
+                        &formatted_code,
+                        &pool_id,
+                        &plan_filter,
+                        usize::try_from(accounts_per_code).unwrap_or_default(),
+                        account_ids.len(),
+                        usable_after,
+                        None,
+                        verified_account_id_set.as_ref(),
+                    )
+                    .await;
                     failures.push(RedeemFailure {
-                        code: format_redeem_code(&normalized),
+                        code: formatted_code,
                         reason: "可兑换账号库存不足".to_string(),
                     });
                     continue;
@@ -2531,6 +2587,7 @@ WHERE redeemed_at IS NULL AND status = 'available'
                 })
                 .collect::<Result<Vec<_>, DataError>>()?;
             let mut selected_ids = HashSet::new();
+            let mut shortage_log_keys = HashSet::new();
             for (index, demand) in demands.iter().enumerate() {
                 let mut account_ids = Vec::with_capacity(demand.count);
                 for candidate in &candidates {
@@ -2548,6 +2605,27 @@ WHERE redeemed_at IS NULL AND status = 'available'
                     account_ids.push(candidate.id.clone());
                 }
                 if account_ids.len() < demand.count {
+                    let shortage_log_key = redeem_stock_shortage_log_key(
+                        &demand.pool_id,
+                        &demand.plan_filter,
+                        reservation_id.as_deref(),
+                        verified_account_ids.as_ref(),
+                    );
+                    if shortage_log_keys.insert(shortage_log_key) {
+                        log_redeem_stock_shortage_tx(
+                            &mut tx,
+                            "batch_export",
+                            &demand.code,
+                            &demand.pool_id,
+                            &demand.plan_filter,
+                            demand.count,
+                            account_ids.len(),
+                            usable_after,
+                            reservation_id.as_deref(),
+                            verified_account_ids.as_ref(),
+                        )
+                        .await;
+                    }
                     failures.push(RedeemFailure {
                         code: demand.code.clone(),
                         reason: "可兑换账号库存不足".to_string(),
@@ -2789,6 +2867,7 @@ INSERT INTO redeem_redemptions (
         let usable_after = now.saturating_add(ACCESS_TOKEN_REFRESH_GRACE_SECONDS as i64);
         let mut seen_hashes = HashSet::new();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut shortage_log_keys = HashSet::new();
 
         for raw_code in raw_codes {
             let Some(normalized) = normalize_redeem_code(raw_code) else {
@@ -3030,6 +3109,27 @@ WHERE redeemed_at IS NULL AND status = 'available' AND pool_id =
                 .take(required_count)
                 .collect::<Vec<_>>();
             if new_account_ids.len() < required_count {
+                let shortage_log_key = redeem_stock_shortage_log_key(
+                    &pool_id,
+                    &plan_filter,
+                    reservation_id.as_deref(),
+                    verified_replacement_account_ids.as_ref(),
+                );
+                if shortage_log_keys.insert(shortage_log_key) {
+                    log_redeem_stock_shortage_tx(
+                        &mut tx,
+                        "after_sale_export",
+                        &formatted_code,
+                        &pool_id,
+                        &plan_filter,
+                        required_count,
+                        new_account_ids.len(),
+                        usable_after,
+                        reservation_id.as_deref(),
+                        verified_replacement_account_ids.as_ref(),
+                    )
+                    .await;
+                }
                 failures.push(RedeemFailure {
                     code: formatted_code,
                     reason: "可补发账号库存不足".to_string(),
@@ -3515,6 +3615,210 @@ async fn reserve_accounts_for_redeem_tx(
     Ok(())
 }
 
+struct RedeemStockShortageSnapshot {
+    unredeemed_in_pool: i64,
+    available_in_pool: i64,
+    redeemable_in_pool: i64,
+    available_without_expires_at: i64,
+    available_expired_or_in_grace: i64,
+    matching_redeemable: i64,
+    scoped_redeemable: i64,
+}
+
+fn redeem_stock_shortage_log_key(
+    pool_id: &str,
+    plan_filter: &[String],
+    reservation_id: Option<&str>,
+    verified_account_ids: Option<&HashSet<String>>,
+) -> String {
+    let mut normalized_plans = plan_filter
+        .iter()
+        .map(|plan| plan.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    normalized_plans.sort();
+    normalized_plans.dedup();
+    format!(
+        "{}|{}|{}|{}",
+        pool_id,
+        normalized_plans.join(","),
+        reservation_id.unwrap_or_default(),
+        verified_account_ids
+            .map(|account_ids| account_ids.len())
+            .unwrap_or_default()
+    )
+}
+
+async fn log_redeem_stock_shortage_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    context: &str,
+    code: &str,
+    pool_id: &str,
+    plan_filter: &[String],
+    required_count: usize,
+    selected_count: usize,
+    usable_after: i64,
+    reservation_id: Option<&str>,
+    verified_account_ids: Option<&HashSet<String>>,
+) {
+    let snapshot = match load_redeem_stock_shortage_snapshot_tx(
+        tx,
+        pool_id,
+        plan_filter,
+        usable_after,
+        reservation_id,
+        verified_account_ids,
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                context,
+                code = %mask_redeem_code(code),
+                pool_id,
+                plan_filter = ?plan_filter,
+                required_count,
+                selected_count,
+                usable_after,
+                reservation_id = %reservation_id.unwrap_or(""),
+                has_reservation = reservation_id.is_some(),
+                verified_scope_count = verified_account_ids
+                    .map(|account_ids| account_ids.len())
+                    .unwrap_or_default(),
+                error = %error,
+                "redeem stock shortage; failed to load stock snapshot"
+            );
+            return;
+        }
+    };
+    let verified_scope_count = verified_account_ids
+        .map(|account_ids| account_ids.len())
+        .unwrap_or_default();
+    tracing::warn!(
+        context,
+        code = %mask_redeem_code(code),
+        pool_id,
+        plan_filter = ?plan_filter,
+        required_count,
+        selected_count,
+        usable_after,
+        reservation_id = %reservation_id.unwrap_or(""),
+        has_reservation = reservation_id.is_some(),
+        verified_scope_count,
+        unredeemed_in_pool = snapshot.unredeemed_in_pool,
+        available_in_pool = snapshot.available_in_pool,
+        redeemable_in_pool = snapshot.redeemable_in_pool,
+        available_without_expires_at = snapshot.available_without_expires_at,
+        available_expired_or_in_grace = snapshot.available_expired_or_in_grace,
+        matching_redeemable = snapshot.matching_redeemable,
+        scoped_redeemable = snapshot.scoped_redeemable,
+        "redeem stock shortage"
+    );
+}
+
+async fn load_redeem_stock_shortage_snapshot_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool_id: &str,
+    plan_filter: &[String],
+    usable_after: i64,
+    reservation_id: Option<&str>,
+    verified_account_ids: Option<&HashSet<String>>,
+) -> Result<RedeemStockShortageSnapshot, DataError> {
+    let row = sqlx::query(
+        r#"
+SELECT
+  COUNT(*) AS unredeemed_in_pool,
+  COALESCE(SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END), 0) AS available_in_pool,
+  COALESCE(SUM(CASE WHEN status = 'available' AND expires_at IS NOT NULL AND expires_at > ? THEN 1 ELSE 0 END), 0) AS redeemable_in_pool,
+  COALESCE(SUM(CASE WHEN status = 'available' AND expires_at IS NULL THEN 1 ELSE 0 END), 0) AS available_without_expires_at,
+  COALESCE(SUM(CASE WHEN status = 'available' AND expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END), 0) AS available_expired_or_in_grace
+FROM accounts
+WHERE pool_id = ? AND redeemed_at IS NULL
+"#,
+    )
+    .bind(usable_after)
+    .bind(usable_after)
+    .bind(pool_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let matching_redeemable =
+        count_redeemable_accounts_tx(tx, pool_id, plan_filter, usable_after, None, None).await?;
+    let scoped_redeemable = if let Some(account_ids) = verified_account_ids {
+        if account_ids.is_empty() {
+            0
+        } else {
+            let account_ids = account_ids.iter().collect::<Vec<_>>();
+            let mut total = 0_i64;
+            for chunk in account_ids.chunks(500) {
+                total += count_redeemable_accounts_tx(
+                    tx,
+                    pool_id,
+                    plan_filter,
+                    usable_after,
+                    reservation_id,
+                    Some(chunk),
+                )
+                .await?;
+            }
+            total
+        }
+    } else {
+        count_redeemable_accounts_tx(tx, pool_id, plan_filter, usable_after, reservation_id, None)
+            .await?
+    };
+    Ok(RedeemStockShortageSnapshot {
+        unredeemed_in_pool: row.try_get("unredeemed_in_pool")?,
+        available_in_pool: row.try_get("available_in_pool")?,
+        redeemable_in_pool: row.try_get("redeemable_in_pool")?,
+        available_without_expires_at: row.try_get("available_without_expires_at")?,
+        available_expired_or_in_grace: row.try_get("available_expired_or_in_grace")?,
+        matching_redeemable,
+        scoped_redeemable,
+    })
+}
+
+async fn count_redeemable_accounts_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool_id: &str,
+    plan_filter: &[String],
+    usable_after: i64,
+    reservation_id: Option<&str>,
+    account_ids: Option<&[&String]>,
+) -> Result<i64, DataError> {
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT COUNT(*) AS count FROM accounts WHERE redeemed_at IS NULL AND status = 'available' AND pool_id = ",
+    );
+    builder.push_bind(pool_id);
+    builder.push(" AND expires_at IS NOT NULL AND expires_at > ");
+    builder.push_bind(usable_after);
+    if !plan_filter.is_empty() {
+        builder.push(" AND lower(plan_type) IN (");
+        let mut separated = builder.separated(", ");
+        for plan in plan_filter {
+            separated.push_bind(plan.to_ascii_lowercase());
+        }
+        separated.push_unseparated(")");
+    }
+    if let Some(reservation_id) = reservation_id {
+        builder.push(" AND redeem_reservation_id = ");
+        builder.push_bind(reservation_id);
+    }
+    if let Some(account_ids) = account_ids {
+        if account_ids.is_empty() {
+            builder.push(" AND 1 = 0");
+        } else {
+            builder.push(" AND id IN (");
+            let mut separated = builder.separated(", ");
+            for account_id in account_ids {
+                separated.push_bind((*account_id).as_str());
+            }
+            separated.push_unseparated(")");
+        }
+    }
+    let row = builder.build().fetch_one(&mut **tx).await?;
+    Ok(row.try_get("count")?)
+}
+
 async fn clear_redeem_reservation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     reservation_id: &str,
@@ -3624,6 +3928,20 @@ CREATE TABLE IF NOT EXISTS redeem_after_sales (
     .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_accounts_redeem_reservation ON accounts(redeem_reservation_id, redeem_reserved_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+CREATE INDEX IF NOT EXISTS idx_accounts_pool_reservation_candidates
+ON accounts(pool_id, status, redeemed_at, redeem_reserved_at, created_at)
+WHERE redeemed_at IS NULL AND status IN ('available', 'at_expired')
+"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_accounts_reservation_available ON accounts(redeem_reservation_id, status, redeemed_at, expires_at, pool_id, created_at)",
     )
     .execute(pool)
     .await?;
@@ -4193,9 +4511,14 @@ impl RedeemCandidateAccount {
     }
 
     fn needs_refresh(&self, now: u64) -> bool {
-        self.expires_at.is_none_or(|expires_at| {
-            access_token_needs_refresh(Some(expires_at), now, ACCESS_TOKEN_REFRESH_GRACE_SECONDS)
-        })
+        self.status != AccountStatus::Available.as_str()
+            || self.expires_at.is_none_or(|expires_at| {
+                access_token_needs_refresh(
+                    Some(expires_at),
+                    now,
+                    ACCESS_TOKEN_REFRESH_GRACE_SECONDS,
+                )
+            })
     }
 }
 
@@ -4584,6 +4907,27 @@ mod tests {
                 access_token: Some(access_token.to_string()),
                 refresh_token: Some(format!("refresh-{account_id}")),
                 expires_at: Some(json!(1_u64)),
+                ..CodexAuthFile::default()
+            },
+        }
+    }
+
+    fn parsed_expiring_soon_account(account_id: &str, access_token: &str) -> ParsedAccount {
+        ParsedAccount {
+            source: "test".to_string(),
+            auth_file: CodexAuthFile {
+                kind: Some("codex".to_string()),
+                account_id: Some(account_id.to_string()),
+                chatgpt_account_id: Some(account_id.to_string()),
+                email: Some(format!("{account_id}@example.com")),
+                name: Some(account_id.to_string()),
+                plan_type: Some("plus".to_string()),
+                chatgpt_plan_type: Some("plus".to_string()),
+                access_token: Some(access_token.to_string()),
+                refresh_token: Some(format!("refresh-{account_id}")),
+                expires_at: Some(json!(
+                    unix_now_secs().saturating_add(ACCESS_TOKEN_REFRESH_GRACE_SECONDS / 2)
+                )),
                 ..CodexAuthFile::default()
             },
         }
@@ -5104,6 +5448,44 @@ CREATE TABLE redeem_code_batches (
             filtered.items[0].email.as_deref(),
             Some("acct-b@example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn account_stats_available_matches_redeemable_stock() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_expiring_soon_account("soon-1", "access-soon")])
+            .await
+            .unwrap();
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].status, AccountStatus::Available.as_str());
+        assert_eq!(page.stats.total, 1);
+        assert_eq!(page.stats.available, 0);
+
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "near expiry stock".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let outcome = repo
+            .redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+        assert!(outcome.successes.is_empty());
+        assert_eq!(outcome.failures[0].reason, "可兑换账号库存不足");
     }
 
     #[tokio::test]
@@ -5759,7 +6141,7 @@ CREATE TABLE redeem_code_batches (
     }
 
     #[tokio::test]
-    async fn redeem_refresh_candidates_are_only_selected_when_usable_stock_is_short() {
+    async fn redeem_reserves_buffer_and_refresh_candidates_for_redeem() {
         let repo = temp_repo().await;
         repo.import_accounts(&[
             parsed_account("usable-1", "usable-access"),
@@ -5785,8 +6167,8 @@ CREATE TABLE redeem_code_batches (
             .await
             .unwrap();
         assert_eq!(first_only.estimated_account_count, 1);
-        assert!(first_only.refresh_account_ids.is_empty());
-        assert_eq!(first_only.probe_account_ids.len(), 1);
+        assert_eq!(first_only.refresh_account_ids.len(), 1);
+        assert_eq!(first_only.probe_account_ids.len(), 2);
         repo.release_redeem_reservation(first_only.reservation_id.as_deref().unwrap())
             .await
             .unwrap();
@@ -5796,8 +6178,8 @@ CREATE TABLE redeem_code_batches (
             .await
             .unwrap();
         assert_eq!(both.estimated_account_count, 2);
-        assert_eq!(both.refresh_account_ids.len(), 1);
-        assert_eq!(both.probe_account_ids.len(), 2);
+        assert_eq!(both.refresh_account_ids.len(), 2);
+        assert_eq!(both.probe_account_ids.len(), 3);
         let refreshed = repo
             .load_auth_files_for_ids(&both.refresh_account_ids, false)
             .await
@@ -5805,7 +6187,116 @@ CREATE TABLE redeem_code_batches (
             .into_iter()
             .map(|(summary, _)| summary.email.unwrap_or_default())
             .collect::<Vec<_>>();
-        assert!(refreshed[0].starts_with("expired-"));
+        assert!(refreshed.iter().all(|email| email.starts_with("expired-")));
+    }
+
+    #[tokio::test]
+    async fn prepared_redeem_uses_reserved_buffer_after_probe_downgrades_account() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[
+            parsed_account("buffer-1", "access-1"),
+            parsed_account("buffer-2", "access-2"),
+            parsed_account("buffer-3", "access-3"),
+        ])
+        .await
+        .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "buffered redeem".to_string(),
+                total_count: 1,
+                accounts_per_code: 2,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let preparation = repo
+            .prepare_redeem_export(&[batch.codes[0].code.clone()])
+            .await
+            .unwrap();
+        assert_eq!(preparation.estimated_account_count, 2);
+        assert!(preparation.refresh_account_ids.is_empty());
+        assert_eq!(preparation.probe_account_ids.len(), 3);
+
+        set_account_status(
+            &repo,
+            &preparation.probe_account_ids[0],
+            AccountStatus::QuotaExhausted,
+        )
+        .await;
+        let outcome = repo
+            .redeem_codes_for_export_with_prepared_accounts(
+                &[batch.codes[0].code.clone()],
+                ExportFormat::Cpa,
+                preparation.reservation_id.as_deref(),
+                Some(&preparation.probe_account_ids),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.successes.len(), 1);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.successes[0].account_count, 2);
+
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|account| account.redeemed_at.is_some())
+                .count(),
+            2
+        );
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|account| account.status == AccountStatus::QuotaExhausted.as_str())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn at_expired_candidate_with_live_token_is_refreshed_for_redeem_prepare() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("stale-status", "access-live")])
+            .await
+            .unwrap();
+        let page = repo
+            .list_accounts(AccountListQuery {
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let account_id = page.items[0].id.clone();
+        repo.mark_account_status(&account_id, AccountStatus::AtExpired)
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "stale status".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let preparation = repo
+            .prepare_redeem_export(&[batch.codes[0].code.clone()])
+            .await
+            .unwrap();
+        assert_eq!(preparation.refresh_account_ids, vec![account_id.clone()]);
+        assert_eq!(preparation.probe_account_ids, vec![account_id]);
     }
 
     #[tokio::test]
@@ -6242,6 +6733,8 @@ CREATE TABLE redeem_code_batches (
             parsed_account("old-2", "old-access-2"),
             parsed_account("fresh-1", "fresh-access-1"),
             parsed_account("fresh-2", "fresh-access-2"),
+            parsed_account("fresh-3", "fresh-access-3"),
+            parsed_account("fresh-4", "fresh-access-4"),
         ])
         .await
         .unwrap();
@@ -6307,8 +6800,12 @@ CREATE TABLE redeem_code_batches (
         let right_prep = right_prep.unwrap();
         assert_eq!(left_prep.current_probe_account_ids.len(), 1);
         assert_eq!(right_prep.current_probe_account_ids.len(), 1);
-        assert_eq!(left_prep.replacement_probe_account_ids.len(), 1);
-        assert_eq!(right_prep.replacement_probe_account_ids.len(), 1);
+        assert_eq!(left_prep.replacement_probe_account_ids.len(), 2);
+        assert_eq!(right_prep.replacement_probe_account_ids.len(), 2);
+        assert!(left_prep
+            .replacement_probe_account_ids
+            .iter()
+            .all(|id| !right_prep.replacement_probe_account_ids.contains(id)));
 
         let left_repo = repo.clone();
         let right_repo = repo.clone();
@@ -6569,6 +7066,8 @@ CREATE TABLE redeem_code_batches (
             .import_accounts(&[
                 parsed_account("prepared-1", "access-1"),
                 parsed_account("prepared-2", "access-2"),
+                parsed_account("prepared-3", "access-3"),
+                parsed_account("prepared-4", "access-4"),
             ])
             .await
             .unwrap();
@@ -6605,12 +7104,12 @@ CREATE TABLE redeem_code_batches (
         );
         let left_prep = left_prep.unwrap();
         let right_prep = right_prep.unwrap();
-        assert_eq!(left_prep.probe_account_ids.len(), 1);
-        assert_eq!(right_prep.probe_account_ids.len(), 1);
-        assert_ne!(
-            left_prep.probe_account_ids[0],
-            right_prep.probe_account_ids[0]
-        );
+        assert_eq!(left_prep.probe_account_ids.len(), 2);
+        assert_eq!(right_prep.probe_account_ids.len(), 2);
+        assert!(left_prep
+            .probe_account_ids
+            .iter()
+            .all(|id| !right_prep.probe_account_ids.contains(id)));
 
         let left_verified_ids = left_prep.probe_account_ids.clone();
         let right_verified_ids = right_prep.probe_account_ids.clone();
@@ -6808,6 +7307,7 @@ CREATE TABLE redeem_code_batches (
         repo.import_accounts(&[
             parsed_account("reserved-scope-1", "access-1"),
             parsed_account("reserved-scope-2", "access-2"),
+            parsed_account("reserved-scope-3", "access-3"),
         ])
         .await
         .unwrap();

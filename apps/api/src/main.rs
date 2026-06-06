@@ -34,9 +34,9 @@ use uuid::Uuid;
 const MAX_JSON_BODY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_REDEEM_CODES_PER_REQUEST: usize = 10_000;
 const MAX_REDEEM_ACCOUNTS_PER_REQUEST: usize = 100_000;
-const MAX_ACTIVE_REDEEM_JOBS: usize = 4;
+const DEFAULT_MAX_ACTIVE_REDEEM_JOBS: usize = 4;
 const MAX_COMPLETED_REDEEM_JOBS: usize = 12;
-const REDEEM_JOB_CHUNK_SIZE: usize = 500;
+const DEFAULT_REDEEM_JOB_CHUNK_SIZE: usize = 500;
 const REDEEM_JOB_RETENTION_SECONDS: u64 = 60 * 60;
 const REDEEM_JOB_PRUNE_INTERVAL_SECONDS: u64 = 60;
 const DEFAULT_REDEEM_PROBE_CONCURRENCY: usize = 16;
@@ -158,6 +158,33 @@ fn env_flag(name: &str) -> bool {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn env_usize_clamped(name: &str, fallback: usize, min: usize, max: usize) -> usize {
+    let Some(raw) = std::env::var(name).ok().filter(|value| !value.is_empty()) else {
+        return fallback;
+    };
+    raw.parse::<usize>()
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(fallback)
+}
+
+fn max_active_redeem_jobs() -> usize {
+    env_usize_clamped(
+        "AETHER_POOL_MAX_ACTIVE_REDEEM_JOBS",
+        DEFAULT_MAX_ACTIVE_REDEEM_JOBS,
+        1,
+        16,
+    )
+}
+
+fn redeem_job_chunk_size() -> usize {
+    env_usize_clamped(
+        "AETHER_POOL_REDEEM_JOB_CHUNK_SIZE",
+        DEFAULT_REDEEM_JOB_CHUNK_SIZE,
+        50,
+        2_000,
+    )
 }
 
 fn validate_startup_secrets(
@@ -1136,11 +1163,12 @@ async fn start_redeem_job(
     {
         let mut jobs = state.redeem_jobs.lock().await;
         let active_count = jobs.values().filter(|job| job.is_active()).count();
-        if active_count >= MAX_ACTIVE_REDEEM_JOBS {
+        let max_active_jobs = max_active_redeem_jobs();
+        if active_count >= max_active_jobs {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
-                    "too many redeem jobs are running; try again after one finishes (limit {MAX_ACTIVE_REDEEM_JOBS})"
+                    "too many redeem jobs are running; try again after one finishes (limit {max_active_jobs})"
                 ),
             ));
         }
@@ -1194,7 +1222,8 @@ async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>)
     })
     .await;
 
-    for (chunk_index, chunk) in codes.chunks(REDEEM_JOB_CHUNK_SIZE).enumerate() {
+    let chunk_size = redeem_job_chunk_size();
+    for (chunk_index, chunk) in codes.chunks(chunk_size).enumerate() {
         let (kind, format) = {
             let jobs = state.redeem_jobs.lock().await;
             let Some(job) = jobs.get(&job_id) else {
@@ -1202,7 +1231,7 @@ async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>)
             };
             (job.kind, job.format)
         };
-        let chunk_start = chunk_index * REDEEM_JOB_CHUNK_SIZE;
+        let chunk_start = chunk_index * chunk_size;
         let chunk_codes = chunk.to_vec();
         let next_processed = all_successes.len() + all_failures.len();
         update_redeem_job(&state, &job_id, |job| {
