@@ -1314,12 +1314,12 @@ async fn estimate_redeem_job_account_count(
     match kind {
         RedeemJobKind::Redeem => Ok(state
             .repo
-            .prepare_redeem_export(codes)
+            .estimate_redeem_export(codes)
             .await?
             .estimated_account_count),
         RedeemJobKind::AfterSale => Ok(state
             .repo
-            .prepare_after_sale_export(codes)
+            .estimate_after_sale_export(codes)
             .await?
             .estimated_account_count),
     }
@@ -1447,59 +1447,76 @@ async fn run_redeem_export_chunk(
     progress: Option<RedeemJobProgress>,
 ) -> Result<RedeemExportOutcome, ApiError> {
     let preparation = state.repo.prepare_redeem_export(codes).await?;
-    validate_redeem_export_limits(codes.len(), preparation.estimated_account_count)?;
-    if state.skip_redeem_probe {
-        return state
-            .repo
-            .redeem_codes_for_export_with_verified_accounts(codes, format, None)
-            .await
-            .map_err(ApiError::from);
-    }
-    if let Some(progress) = &progress {
-        progress
-            .add_network_total(
-                preparation.refresh_account_ids.len() + preparation.probe_account_ids.len(),
-                "正在兑换",
-            )
-            .await;
-    }
-    if !preparation.refresh_account_ids.is_empty() {
-        let _ = refresh_expired_accounts_with_progress(
-            state,
-            Some(&preparation.refresh_account_ids),
-            None,
-            true,
-            progress.clone(),
-        )
-        .await?;
-    }
-    if !state.skip_redeem_probe && !preparation.probe_account_ids.is_empty() {
-        let settings = state.repo.get_auto_probe_settings().await?;
-        let probe_summary = run_probe_accounts_with_progress(
-            state,
-            Some(&preparation.probe_account_ids),
-            ProbeRunOptions {
-                max_accounts: None,
-                concurrency: redeem_probe_concurrency(&settings),
-                include_redeemed: false,
-                pool_id: None,
-            },
-            progress.clone(),
-        )
-        .await?;
-        if probe_summary.failed > 0 {
-            return Err(ApiError::bad_request("兑换前测活失败，请稍后重试"));
+    let reservation_id = preparation.reservation_id.clone();
+    let outcome = async {
+        validate_redeem_export_limits(codes.len(), preparation.estimated_account_count)?;
+        refresh_redeem_reservation_heartbeat(state, reservation_id.as_deref()).await;
+        if state.skip_redeem_probe {
+            return state
+                .repo
+                .redeem_codes_for_export_with_prepared_accounts(
+                    codes,
+                    format,
+                    reservation_id.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(ApiError::from);
         }
+        if let Some(progress) = &progress {
+            progress
+                .add_network_total(
+                    preparation.refresh_account_ids.len() + preparation.probe_account_ids.len(),
+                    "正在兑换",
+                )
+                .await;
+        }
+        if !preparation.refresh_account_ids.is_empty() {
+            let _ = refresh_expired_accounts_with_progress(
+                state,
+                Some(&preparation.refresh_account_ids),
+                None,
+                true,
+                progress.clone(),
+                reservation_id.as_deref(),
+            )
+            .await?;
+        }
+        if !preparation.probe_account_ids.is_empty() {
+            let settings = state.repo.get_auto_probe_settings().await?;
+            let probe_summary = run_probe_accounts_with_progress(
+                state,
+                Some(&preparation.probe_account_ids),
+                ProbeRunOptions {
+                    max_accounts: None,
+                    concurrency: redeem_probe_concurrency(&settings),
+                    include_redeemed: false,
+                    pool_id: None,
+                },
+                progress.clone(),
+                reservation_id.as_deref(),
+            )
+            .await?;
+            if probe_summary.failed > 0 {
+                return Err(ApiError::bad_request("兑换前测活失败，请稍后重试"));
+            }
+        }
+        state
+            .repo
+            .redeem_codes_for_export_with_prepared_accounts(
+                codes,
+                format,
+                reservation_id.as_deref(),
+                Some(&preparation.probe_account_ids),
+            )
+            .await
+            .map_err(ApiError::from)
     }
-    state
-        .repo
-        .redeem_codes_for_export_with_verified_accounts(
-            codes,
-            format,
-            Some(&preparation.probe_account_ids),
-        )
-        .await
-        .map_err(ApiError::from)
+    .await;
+    if outcome.is_err() {
+        release_redeem_reservation_after_error(state, reservation_id.as_deref()).await;
+    }
+    outcome
 }
 
 async fn run_redeem_after_sale_chunk(
@@ -1509,59 +1526,106 @@ async fn run_redeem_after_sale_chunk(
     progress: Option<RedeemJobProgress>,
 ) -> Result<RedeemExportOutcome, ApiError> {
     let preparation = state.repo.prepare_after_sale_export(codes).await?;
-    validate_redeem_export_limits(codes.len(), preparation.estimated_account_count)?;
-    if state.skip_redeem_probe {
-        return state
-            .repo
-            .redeem_after_sale_for_export_with_verified_accounts(codes, format, None)
-            .await
-            .map_err(ApiError::from);
-    }
-    if let Some(progress) = &progress {
-        progress
-            .add_network_total(
-                preparation.refresh_account_ids.len() + preparation.probe_account_ids.len(),
-                "正在兑换",
-            )
-            .await;
-    }
-    if !preparation.refresh_account_ids.is_empty() {
-        let _ = refresh_expired_accounts_with_progress(
-            state,
-            Some(&preparation.refresh_account_ids),
-            None,
-            true,
-            progress.clone(),
-        )
-        .await?;
-    }
-    if !state.skip_redeem_probe && !preparation.probe_account_ids.is_empty() {
-        let settings = state.repo.get_auto_probe_settings().await?;
-        let probe_summary = run_probe_accounts_with_progress(
-            state,
-            Some(&preparation.probe_account_ids),
-            ProbeRunOptions {
-                max_accounts: None,
-                concurrency: redeem_probe_concurrency(&settings),
-                include_redeemed: true,
-                pool_id: None,
-            },
-            progress.clone(),
-        )
-        .await?;
-        if probe_summary.failed > 0 {
-            return Err(ApiError::bad_request("售后测活失败，请稍后重试"));
+    let reservation_id = preparation.reservation_id.clone();
+    let outcome = async {
+        validate_redeem_export_limits(codes.len(), preparation.estimated_account_count)?;
+        refresh_redeem_reservation_heartbeat(state, reservation_id.as_deref()).await;
+        if state.skip_redeem_probe {
+            return state
+                .repo
+                .redeem_after_sale_for_export_with_prepared_accounts(
+                    codes,
+                    format,
+                    None,
+                    reservation_id.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(ApiError::from);
         }
+        let mut probe_account_ids = preparation.current_probe_account_ids.clone();
+        probe_account_ids.extend(preparation.replacement_probe_account_ids.iter().cloned());
+        if let Some(progress) = &progress {
+            progress
+                .add_network_total(
+                    preparation.refresh_account_ids.len() + probe_account_ids.len(),
+                    "正在兑换",
+                )
+                .await;
+        }
+        if !preparation.refresh_account_ids.is_empty() {
+            let _ = refresh_expired_accounts_with_progress(
+                state,
+                Some(&preparation.refresh_account_ids),
+                None,
+                true,
+                progress.clone(),
+                reservation_id.as_deref(),
+            )
+            .await?;
+        }
+        if !probe_account_ids.is_empty() {
+            let settings = state.repo.get_auto_probe_settings().await?;
+            let probe_summary = run_probe_accounts_with_progress(
+                state,
+                Some(&probe_account_ids),
+                ProbeRunOptions {
+                    max_accounts: None,
+                    concurrency: redeem_probe_concurrency(&settings),
+                    include_redeemed: true,
+                    pool_id: None,
+                },
+                progress.clone(),
+                reservation_id.as_deref(),
+            )
+            .await?;
+            if probe_summary.failed > 0 {
+                return Err(ApiError::bad_request("售后测活失败，请稍后重试"));
+            }
+        }
+        state
+            .repo
+            .redeem_after_sale_for_export_with_prepared_accounts(
+                codes,
+                format,
+                Some(&preparation.current_probe_account_ids),
+                reservation_id.as_deref(),
+                Some(&preparation.replacement_probe_account_ids),
+            )
+            .await
+            .map_err(ApiError::from)
     }
-    state
-        .repo
-        .redeem_after_sale_for_export_with_verified_accounts(
-            codes,
-            format,
-            Some(&preparation.probe_account_ids),
-        )
-        .await
-        .map_err(ApiError::from)
+    .await;
+    if outcome.is_err() {
+        release_redeem_reservation_after_error(state, reservation_id.as_deref()).await;
+    }
+    outcome
+}
+
+async fn release_redeem_reservation_after_error(state: &AppState, reservation_id: Option<&str>) {
+    let Some(reservation_id) = reservation_id else {
+        return;
+    };
+    if let Err(error) = state.repo.release_redeem_reservation(reservation_id).await {
+        tracing::warn!(
+            reservation_id,
+            error = ?error,
+            "failed to release redeem reservation after chunk error"
+        );
+    }
+}
+
+async fn refresh_redeem_reservation_heartbeat(state: &AppState, reservation_id: Option<&str>) {
+    let Some(reservation_id) = reservation_id else {
+        return;
+    };
+    if let Err(error) = state.repo.refresh_redeem_reservation(reservation_id).await {
+        tracing::warn!(
+            reservation_id,
+            error = ?error,
+            "failed to refresh redeem reservation heartbeat"
+        );
+    }
 }
 
 fn append_export_items(format: ExportFormat, document: Value, items: &mut Vec<Value>) {
@@ -1749,7 +1813,7 @@ async fn run_probe_accounts(
     account_ids: Option<&[String]>,
     options: ProbeRunOptions,
 ) -> Result<ProbeRunSummary, ApiError> {
-    run_probe_accounts_with_progress(state, account_ids, options, None).await
+    run_probe_accounts_with_progress(state, account_ids, options, None, None).await
 }
 
 async fn run_probe_accounts_with_progress(
@@ -1757,6 +1821,7 @@ async fn run_probe_accounts_with_progress(
     account_ids: Option<&[String]>,
     options: ProbeRunOptions,
     progress: Option<RedeemJobProgress>,
+    reservation_id: Option<&str>,
 ) -> Result<ProbeRunSummary, ApiError> {
     let mut accounts = if options.include_redeemed {
         if let Some(account_ids) = account_ids {
@@ -1787,7 +1852,14 @@ async fn run_probe_accounts_with_progress(
     let mut summary = ProbeRunSummary::default();
     for (account, auth_file) in accounts {
         while join_set.len() >= concurrency {
-            collect_probe_result(&mut join_set, &mut summary, progress.as_ref()).await;
+            collect_probe_result(
+                state,
+                &mut join_set,
+                &mut summary,
+                progress.as_ref(),
+                reservation_id,
+            )
+            .await;
         }
         let state = state.clone();
         let probe_http = probe_http.clone();
@@ -1808,7 +1880,14 @@ async fn run_probe_accounts_with_progress(
         });
     }
     while !join_set.is_empty() {
-        collect_probe_result(&mut join_set, &mut summary, progress.as_ref()).await;
+        collect_probe_result(
+            state,
+            &mut join_set,
+            &mut summary,
+            progress.as_ref(),
+            reservation_id,
+        )
+        .await;
     }
     Ok(summary)
 }
@@ -1824,9 +1903,11 @@ fn pool_scope_for_ids(account_ids: Option<&[String]>, pool_id: Option<&str>) -> 
 }
 
 async fn collect_probe_result(
+    state: &AppState,
     join_set: &mut JoinSet<Result<Value, ApiError>>,
     summary: &mut ProbeRunSummary,
     progress: Option<&RedeemJobProgress>,
+    reservation_id: Option<&str>,
 ) {
     let Some(result) = join_set.join_next().await else {
         return;
@@ -1852,6 +1933,7 @@ async fn collect_probe_result(
     if let Some(progress) = progress {
         progress.increment_network_done("正在兑换").await;
     }
+    refresh_redeem_reservation_heartbeat(state, reservation_id).await;
 }
 
 async fn probe_one_account(
@@ -3362,7 +3444,7 @@ async fn refresh_expired_accounts(
     pool_id: Option<&str>,
     force: bool,
 ) -> Result<RefreshOutcome, ApiError> {
-    refresh_expired_accounts_with_progress(state, account_ids, pool_id, force, None).await
+    refresh_expired_accounts_with_progress(state, account_ids, pool_id, force, None, None).await
 }
 
 struct RefreshTaskResult {
@@ -3377,6 +3459,7 @@ async fn refresh_expired_accounts_with_progress(
     pool_id: Option<&str>,
     force: bool,
     progress: Option<RedeemJobProgress>,
+    reservation_id: Option<&str>,
 ) -> Result<RefreshOutcome, ApiError> {
     let now = unix_now_secs();
     let accounts = state
@@ -3404,7 +3487,14 @@ async fn refresh_expired_accounts_with_progress(
             continue;
         }
         while join_set.len() >= concurrency {
-            collect_refresh_result(&mut join_set, &mut outcome, progress.as_ref()).await?;
+            collect_refresh_result(
+                state,
+                &mut join_set,
+                &mut outcome,
+                progress.as_ref(),
+                reservation_id,
+            )
+            .await?;
         }
         let state = state.clone();
         let refresh_http = refresh_http.clone();
@@ -3452,15 +3542,24 @@ async fn refresh_expired_accounts_with_progress(
         });
     }
     while !join_set.is_empty() {
-        collect_refresh_result(&mut join_set, &mut outcome, progress.as_ref()).await?;
+        collect_refresh_result(
+            state,
+            &mut join_set,
+            &mut outcome,
+            progress.as_ref(),
+            reservation_id,
+        )
+        .await?;
     }
     Ok(outcome)
 }
 
 async fn collect_refresh_result(
+    state: &AppState,
     join_set: &mut JoinSet<Result<RefreshTaskResult, ApiError>>,
     outcome: &mut RefreshOutcome,
     progress: Option<&RedeemJobProgress>,
+    reservation_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let Some(result) = join_set.join_next().await else {
         return Ok(());
@@ -3486,6 +3585,7 @@ async fn collect_refresh_result(
     if let Some(progress) = progress {
         progress.increment_network_done("正在兑换").await;
     }
+    refresh_redeem_reservation_heartbeat(state, reservation_id).await;
     Ok(())
 }
 

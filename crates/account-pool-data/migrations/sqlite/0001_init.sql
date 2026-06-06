@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   redeem_code_id TEXT,
   redemption_id TEXT,
   redeemed_at INTEGER,
+  redeem_reservation_id TEXT,
+  redeem_reserved_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   FOREIGN KEY(pool_id) REFERENCES account_pools(id)
