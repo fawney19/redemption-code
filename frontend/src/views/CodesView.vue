@@ -37,6 +37,12 @@
             <button class="button" :disabled="!selectedBatch" @click="exportSelectedBatchCodes">
               <Download :size="15" />导出 CSV
             </button>
+            <button class="button" :disabled="!selectedBatch" @click="exportSelectedBatchCodesTxt">
+              <Download :size="15" />导出 TXT
+            </button>
+            <button class="button" :disabled="!selectedBatch" @click="selectedBatch && openEditBatch(selectedBatch)">
+              <Settings :size="15" />编辑
+            </button>
             <button class="button" @click="loadBatches">
               <RefreshCw :size="15" />刷新
             </button>
@@ -240,6 +246,10 @@
                       <div class="row-actions">
                         <button class="button ghost tiny" @click="copyBatchCodes(batch)">复制</button>
                         <button class="button ghost tiny" @click="exportBatchCodes(batch)">导出 CSV</button>
+                        <button class="button ghost tiny" @click="exportBatchCodesTxt(batch)">导出 TXT</button>
+                        <button class="button ghost tiny" :disabled="busy" @click="openEditBatch(batch)">
+                          <Settings :size="14" />编辑
+                        </button>
                         <button class="button danger tiny" :disabled="busy" @click="deleteBatch(batch)">
                           <Trash2 :size="14" />删除
                         </button>
@@ -381,12 +391,75 @@
         </div>
       </div>
     </section>
+
+    <Transition name="fade">
+      <div v-if="editingBatch" class="modal-backdrop" @click.self="closeEditBatch">
+        <section class="modal-panel batch-edit-modal" aria-label="编辑兑换码批次配置">
+          <header class="modal-header">
+            <div>
+              <h2>编辑批次配置</h2>
+              <span class="mono">{{ editingBatch.id }}</span>
+            </div>
+            <button class="button ghost tiny icon-only" type="button" :disabled="busy" aria-label="关闭" @click="closeEditBatch">
+              <span aria-hidden="true">X</span>
+            </button>
+          </header>
+          <div class="batch-edit-form">
+            <label class="field-label full">
+              <span>批次名称</span>
+              <input v-model="editBatchForm.name" class="input" />
+            </label>
+            <label class="field-label">
+              <span>状态</span>
+              <select v-model="editBatchForm.status" class="select">
+                <option value="active">可兑换</option>
+                <option value="disabled">已停用</option>
+              </select>
+            </label>
+            <label class="field-label">
+              <span>每码账号数</span>
+              <input
+                v-model.number="editBatchForm.accounts_per_code"
+                class="input"
+                type="number"
+                min="1"
+                max="100"
+                :disabled="editingBatch.redeemed_count > 0"
+              />
+            </label>
+            <label class="field-label">
+              <span>每码售后次数</span>
+              <input v-model.number="editBatchForm.after_sale_limit" class="input" type="number" min="0" max="10" />
+            </label>
+            <div class="field-label batch-edit-expiry">
+              <span>过期时间</span>
+              <div class="expiry-input-row">
+                <input v-model="editBatchForm.expires_at_text" class="input" type="datetime-local" />
+                <select v-model="editExpiryQuickDays" class="select expiry-quick-select" aria-label="快捷设置编辑过期时间" @change="applyEditExpiryQuickSelect">
+                  <option value="">不限制</option>
+                  <option value="1">1天</option>
+                  <option value="3">3天</option>
+                  <option value="7">7天</option>
+                  <option value="30">30天</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          <footer class="modal-actions">
+            <button class="button ghost" type="button" :disabled="busy" @click="closeEditBatch">取消</button>
+            <button class="button primary" type="button" :disabled="busy" @click="submitEditBatch">
+              <Save :size="15" />保存
+            </button>
+          </footer>
+        </section>
+      </div>
+    </Transition>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Activity, ChevronDown, ChevronRight, Copy, Download, ListFilter, Plus, RefreshCw, Ticket, Trash2 } from 'lucide-vue-next'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { Activity, ChevronDown, ChevronRight, Copy, Download, ListFilter, Plus, RefreshCw, Save, Settings, Ticket, Trash2 } from 'lucide-vue-next'
 import type { RedeemAfterSale, RedeemBatch, RedeemCode } from '../api/client'
 import { api } from '../api/client'
 import {
@@ -428,6 +501,15 @@ const detailPage = ref(1)
 const batchHeaderFilterMenu = ref<'pool' | 'status' | ''>('')
 const batchPoolFilters = ref<string[]>([])
 const batchStatusFilters = ref<string[]>([])
+const editingBatch = ref<RedeemBatch | null>(null)
+const editExpiryQuickDays = ref('')
+const editBatchForm = reactive({
+  name: '',
+  status: 'active',
+  accounts_per_code: 1,
+  after_sale_limit: 1,
+  expires_at_text: '',
+})
 
 const generatedCodePreviewLimit = 200
 const generatedCodeLines = computed(() => generatedCodes.value.split(/\r?\n/).filter(Boolean))
@@ -588,6 +670,40 @@ function applyExpiryQuickSelect() {
   setBatchExpiryDays(days)
 }
 
+function openEditBatch(batch: RedeemBatch) {
+  editingBatch.value = batch
+  editBatchForm.name = batch.name
+  editBatchForm.status = batch.status === 'disabled' ? 'disabled' : 'active'
+  editBatchForm.accounts_per_code = Number(batch.accounts_per_code || 1)
+  editBatchForm.after_sale_limit = Number(batch.after_sale_limit ?? 1)
+  editBatchForm.expires_at_text = batch.expires_at
+    ? formatDateTimeLocal(new Date(batch.expires_at * 1000))
+    : ''
+  editExpiryQuickDays.value = ''
+}
+
+function closeEditBatch() {
+  if (busy.value) return
+  editingBatch.value = null
+  editExpiryQuickDays.value = ''
+}
+
+function setEditBatchExpiryDays(days: number) {
+  const expiresAt = new Date()
+  expiresAt.setDate(expiresAt.getDate() + days)
+  expiresAt.setSeconds(0, 0)
+  editBatchForm.expires_at_text = formatDateTimeLocal(expiresAt)
+}
+
+function applyEditExpiryQuickSelect() {
+  const days = Number(editExpiryQuickDays.value)
+  if (!days) {
+    editBatchForm.expires_at_text = ''
+    return
+  }
+  setEditBatchExpiryDays(days)
+}
+
 function formatDateTimeLocal(value: Date) {
   const pad = (part: number) => String(part).padStart(2, '0')
   return [
@@ -601,6 +717,41 @@ function formatDateTimeLocal(value: Date) {
     ':',
     pad(value.getMinutes()),
   ].join('')
+}
+
+function parseEditBatchExpiresAt() {
+  const raw = editBatchForm.expires_at_text.trim()
+  if (!raw) return null
+  const value = Math.floor(new Date(raw).getTime() / 1000)
+  if (!Number.isFinite(value)) throw new Error('过期时间无效')
+  return value
+}
+
+async function submitEditBatch() {
+  const batch = editingBatch.value
+  if (!batch || busy.value) return
+  if (!editBatchForm.name.trim()) {
+    toast.info('批次名称不能为空')
+    return
+  }
+  busy.value = true
+  try {
+    const result = await api.updateBatch(apiState.value, batch.id, {
+      name: editBatchForm.name.trim(),
+      status: editBatchForm.status,
+      accounts_per_code: Number(editBatchForm.accounts_per_code || 1),
+      after_sale_limit: Number(editBatchForm.after_sale_limit ?? 1),
+      expires_at: parseEditBatchExpiresAt(),
+    })
+    await loadBatches()
+    editingBatch.value = null
+    editExpiryQuickDays.value = ''
+    toast.success(`已更新批次配置：${result.batch.name}`)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    busy.value = false
+  }
 }
 
 async function handleCreateBatch() {
@@ -639,6 +790,15 @@ async function exportSelectedBatchCodes() {
   exportBatchSnapshot(selectedBatch.value)
 }
 
+async function exportSelectedBatchCodesTxt() {
+  if (!selectedBatch.value) {
+    toast.info('请先选择一个批次')
+    return
+  }
+  await ensureSelectedBatchCodesLoaded()
+  exportBatchPlainText(selectedBatch.value)
+}
+
 async function copyBatchCodes(batch: RedeemBatch) {
   await loadCodes(batch.id)
   await copySelectedBatchCodes()
@@ -647,6 +807,11 @@ async function copyBatchCodes(batch: RedeemBatch) {
 async function exportBatchCodes(batch: RedeemBatch) {
   await loadCodes(batch.id)
   exportBatchSnapshot(batch)
+}
+
+async function exportBatchCodesTxt(batch: RedeemBatch) {
+  await loadCodes(batch.id)
+  exportBatchPlainText(batch)
 }
 
 async function ensureSelectedBatchCodesLoaded() {
@@ -662,6 +827,24 @@ function exportBatchSnapshot(batch: RedeemBatch) {
     'text/csv;charset=utf-8',
   )
   toast.success('已导出批次兑换状态 CSV')
+}
+
+function exportBatchPlainText(batch: RedeemBatch) {
+  const codes = batchCodes.value
+    .map((code) => code.code?.trim())
+    .filter((code): code is string => Boolean(code))
+  const skipped = batchCodes.value.length - codes.length
+  if (!codes.length) {
+    toast.info('该批次没有可导出的未脱敏兑换码')
+    return
+  }
+  downloadText(
+    `account-pool-redeem-codes-${safeFileName(batch.name)}-${timestamp()}.txt`,
+    codes.join('\n'),
+  )
+  toast.success(skipped
+    ? `已导出 ${codes.length} 个未脱敏兑换码，跳过 ${skipped} 个历史脱敏码`
+    : `已导出 ${codes.length} 个未脱敏兑换码`)
 }
 
 function buildBatchCsv(batch: RedeemBatch) {

@@ -18,12 +18,12 @@ use crate::domain::{
 use crate::repository::{
     AccountListQuery, AccountPoolRepository, AccountPoolUpsertInput, AccountSummary,
     AutoProbeSettings, CreateRedeemBatchInput, DataError, RedeemExportOutcome, RedeemFailure,
-    RedeemRateLimitSettings, RedeemSuccess,
+    RedeemRateLimitSettings, RedeemSuccess, UpdateRedeemBatchInput,
 };
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::{Client, Proxy};
@@ -281,7 +281,7 @@ fn router(state: AppState) -> Router {
         )
         .route(
             "/api/alalalateam/redeem-code-batches/{batch_id}",
-            delete(delete_redeem_batch),
+            post(update_redeem_batch).delete(delete_redeem_batch),
         )
         .route(
             "/api/alalalateam/redeem-code-batches/{batch_id}/codes",
@@ -1040,6 +1040,20 @@ async fn list_redeem_batches(
         .list_redeem_batches_scoped(query.pool_id.as_deref())
         .await?;
     Ok(Json(json!({ "items": items })))
+}
+
+async fn update_redeem_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<String>,
+    Json(payload): Json<UpdateRedeemBatchInput>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let batch = state.repo.update_redeem_batch(&batch_id, payload).await?;
+    Ok(Json(json!({
+        "success": true,
+        "batch": batch,
+    })))
 }
 
 async fn delete_redeem_batch(

@@ -85,6 +85,14 @@ export interface RedeemBatch {
   created_at: number
 }
 
+export interface RedeemBatchUpdatePayload {
+  name: string
+  status: string
+  accounts_per_code: number
+  after_sale_limit: number
+  expires_at?: number | null
+}
+
 export interface RedeemCodeAccount {
   id: string
   pool_id: string
@@ -453,6 +461,13 @@ export const api = {
       `${MANAGEMENT_API_PREFIX}/redeem-code-batches/${encodeURIComponent(batchId)}`,
       state,
       { method: 'DELETE' },
+    )
+  },
+  updateBatch(state: ApiState, batchId: string, payload: RedeemBatchUpdatePayload) {
+    return request<{ success: boolean; batch: RedeemBatch }>(
+      `${MANAGEMENT_API_PREFIX}/redeem-code-batches/${encodeURIComponent(batchId)}`,
+      state,
+      { method: 'POST', body: JSON.stringify(payload) },
     )
   },
   getAutoProbeSettings(state: ApiState) {

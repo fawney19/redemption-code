@@ -1232,6 +1232,60 @@ INSERT OR IGNORE INTO redeem_codes (
         Ok(CreateRedeemBatchOutcome { batch_id, codes })
     }
 
+    pub async fn update_redeem_batch(
+        &self,
+        batch_id: &str,
+        input: UpdateRedeemBatchInput,
+    ) -> Result<RedeemBatchSummary, DataError> {
+        let batch_id = batch_id.trim();
+        if batch_id.is_empty() {
+            return Err(DataError::InvalidInput("batch_id is required".to_string()));
+        }
+        let input = input.normalized()?;
+        let now = unix_now_secs() as i64;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let Some(existing) = sqlx::query(
+            "SELECT accounts_per_code, redeemed_count FROM redeem_code_batches WHERE id = ?",
+        )
+        .bind(batch_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Err(DataError::NotFound);
+        };
+
+        let existing_accounts_per_code =
+            usize_from_i64(existing.try_get::<i64, _>("accounts_per_code")?);
+        let redeemed_count = usize_from_i64(existing.try_get::<i64, _>("redeemed_count")?);
+        if redeemed_count > 0 && input.accounts_per_code != existing_accounts_per_code {
+            tx.rollback().await?;
+            return Err(DataError::InvalidInput(
+                "已有兑换记录的批次不能修改每码账号数".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            r#"
+UPDATE redeem_code_batches
+SET name = ?, status = ?, accounts_per_code = ?, after_sale_limit = ?, expires_at = ?, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(&input.name)
+        .bind(&input.status)
+        .bind(input.accounts_per_code as i64)
+        .bind(input.after_sale_limit as i64)
+        .bind(input.expires_at.map(|value| value as i64))
+        .bind(now)
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.load_redeem_batch(batch_id).await
+    }
+
     pub async fn list_redeem_batches_scoped(
         &self,
         pool_id: Option<&str>,
@@ -1250,6 +1304,24 @@ LEFT JOIN account_pools p ON p.id = b.pool_id
         builder.push(" ORDER BY b.created_at DESC");
         let rows = builder.build().fetch_all(&self.pool).await?;
         rows.into_iter().map(batch_summary_from_row).collect()
+    }
+
+    async fn load_redeem_batch(&self, batch_id: &str) -> Result<RedeemBatchSummary, DataError> {
+        let row = sqlx::query(
+            r#"
+SELECT b.id, b.pool_id, p.name AS pool_name, b.name, b.status, b.total_count, b.redeemed_count, b.accounts_per_code, b.after_sale_limit,
+       b.plan_filter_json, b.expires_at, b.created_at, b.updated_at
+FROM redeem_code_batches b
+LEFT JOIN account_pools p ON p.id = b.pool_id
+WHERE b.id = ?
+"#,
+        )
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(batch_summary_from_row)
+            .transpose()?
+            .ok_or(DataError::NotFound)
     }
 
     pub async fn delete_redeem_batch(
@@ -4756,6 +4828,49 @@ pub struct CreateRedeemBatchInput {
     pub plan_filter: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateRedeemBatchInput {
+    pub name: String,
+    pub status: String,
+    pub accounts_per_code: usize,
+    pub after_sale_limit: usize,
+    pub expires_at: Option<u64>,
+}
+
+impl UpdateRedeemBatchInput {
+    fn normalized(self) -> Result<Self, DataError> {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err(DataError::InvalidInput(
+                "batch name is required".to_string(),
+            ));
+        }
+        let status = self.status.trim().to_ascii_lowercase();
+        if !matches!(status.as_str(), "active" | "disabled") {
+            return Err(DataError::InvalidInput(
+                "status must be active or disabled".to_string(),
+            ));
+        }
+        if self.accounts_per_code == 0 || self.accounts_per_code > 100 {
+            return Err(DataError::InvalidInput(
+                "accounts_per_code must be 1..=100".to_string(),
+            ));
+        }
+        if self.after_sale_limit > 10 {
+            return Err(DataError::InvalidInput(
+                "after_sale_limit must be 0..=10".to_string(),
+            ));
+        }
+        Ok(Self {
+            name,
+            status,
+            accounts_per_code: self.accounts_per_code,
+            after_sale_limit: self.after_sale_limit,
+            expires_at: self.expires_at,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateRedeemBatchOutcome {
     pub batch_id: String,
@@ -6162,6 +6277,99 @@ CREATE TABLE redeem_code_batches (
             .zip(batch.codes.iter())
             .all(|(listed, created)| listed.masked_code == created.masked_code));
         assert!(codes.iter().all(|code| code.accounts.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn update_redeem_batch_changes_editable_config() {
+        let repo = temp_repo().await;
+        let expires_at = unix_now_secs().saturating_add(86_400);
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "editable config".to_string(),
+                total_count: 2,
+                accounts_per_code: 1,
+                after_sale_limit: Some(1),
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let updated = repo
+            .update_redeem_batch(
+                &batch.batch_id,
+                UpdateRedeemBatchInput {
+                    name: " edited config ".to_string(),
+                    status: "disabled".to_string(),
+                    accounts_per_code: 2,
+                    after_sale_limit: 0,
+                    expires_at: Some(expires_at),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.name, "edited config");
+        assert_eq!(updated.status, "disabled");
+        assert_eq!(updated.accounts_per_code, 2);
+        assert_eq!(updated.after_sale_limit, 0);
+        assert_eq!(updated.expires_at, Some(expires_at));
+    }
+
+    #[tokio::test]
+    async fn update_redeem_batch_keeps_redeemed_account_count_stable() {
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account("redeemed-config", "redeemed-config-access")])
+            .await
+            .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "redeemed config".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: Some(1),
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        repo.redeem_codes_for_export(&[batch.codes[0].code.clone()], ExportFormat::Cpa)
+            .await
+            .unwrap();
+
+        let rejected = repo
+            .update_redeem_batch(
+                &batch.batch_id,
+                UpdateRedeemBatchInput {
+                    name: "redeemed config".to_string(),
+                    status: "active".to_string(),
+                    accounts_per_code: 2,
+                    after_sale_limit: 2,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(rejected, DataError::InvalidInput(message) if message.contains("不能修改每码账号数"))
+        );
+
+        let updated = repo
+            .update_redeem_batch(
+                &batch.batch_id,
+                UpdateRedeemBatchInput {
+                    name: "redeemed config edited".to_string(),
+                    status: "active".to_string(),
+                    accounts_per_code: 1,
+                    after_sale_limit: 2,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "redeemed config edited");
+        assert_eq!(updated.accounts_per_code, 1);
+        assert_eq!(updated.after_sale_limit, 2);
     }
 
     #[tokio::test]
