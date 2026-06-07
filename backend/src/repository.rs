@@ -2533,6 +2533,19 @@ WHERE codes.code_hash IN (
 
         let mut allocations: Vec<Option<Vec<String>>> = vec![None; demands.len()];
         if !demands.is_empty() {
+            let first_pool_id = demands[0].pool_id.clone();
+            let first_plan_filter = normalized_plan_filter_key(&demands[0].plan_filter);
+            let single_candidate_scope = demands.iter().all(|demand| {
+                demand.pool_id == first_pool_id
+                    && normalized_plan_filter_key(&demand.plan_filter) == first_plan_filter
+            });
+            let verified_scope_can_be_sql_filtered = match &verified_account_ids {
+                None => true,
+                Some(account_ids) => account_ids.len() <= 5_000,
+            };
+            let bounded_candidate_scope =
+                single_candidate_scope && verified_scope_can_be_sql_filtered;
+            let required_candidate_count = demands.iter().map(|demand| demand.count).sum::<usize>();
             let pool_ids = demands
                 .iter()
                 .map(|demand| demand.pool_id.clone())
@@ -2548,13 +2561,26 @@ WHERE redeemed_at IS NULL AND status = 'available'
 "#,
             );
             builder.push_bind(usable_after);
-            builder.push(" AND pool_id IN (");
-            {
-                let mut separated = builder.separated(", ");
-                for pool_id in &pool_ids {
-                    separated.push_bind(pool_id);
+            if bounded_candidate_scope {
+                builder.push(" AND pool_id = ");
+                builder.push_bind(&first_pool_id);
+                if !first_plan_filter.is_empty() {
+                    builder.push(" AND lower(plan_type) IN (");
+                    let mut separated = builder.separated(", ");
+                    for plan in &first_plan_filter {
+                        separated.push_bind(plan);
+                    }
+                    separated.push_unseparated(")");
                 }
-                separated.push_unseparated(")");
+            } else {
+                builder.push(" AND pool_id IN (");
+                {
+                    let mut separated = builder.separated(", ");
+                    for pool_id in &pool_ids {
+                        separated.push_bind(pool_id);
+                    }
+                    separated.push_unseparated(")");
+                }
             }
             if let Some(reservation_id) = &reservation_id {
                 builder.push(" AND redeem_reservation_id = ");
@@ -2573,6 +2599,10 @@ WHERE redeemed_at IS NULL AND status = 'available'
                 }
             }
             builder.push(" ORDER BY created_at ASC");
+            if bounded_candidate_scope {
+                builder.push(" LIMIT ");
+                builder.push_bind(required_candidate_count as i64);
+            }
             let candidates = builder
                 .build()
                 .fetch_all(&mut *tx)
@@ -3622,12 +3652,7 @@ fn redeem_stock_shortage_log_key(
     reservation_id: Option<&str>,
     verified_account_ids: Option<&HashSet<String>>,
 ) -> String {
-    let mut normalized_plans = plan_filter
-        .iter()
-        .map(|plan| plan.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    normalized_plans.sort();
-    normalized_plans.dedup();
+    let normalized_plans = normalized_plan_filter_key(plan_filter);
     format!(
         "{}|{}|{}|{}",
         pool_id,
@@ -3637,6 +3662,17 @@ fn redeem_stock_shortage_log_key(
             .map(|account_ids| account_ids.len())
             .unwrap_or_default()
     )
+}
+
+fn normalized_plan_filter_key(plan_filter: &[String]) -> Vec<String> {
+    let mut normalized_plans = plan_filter
+        .iter()
+        .map(|plan| plan.trim().to_ascii_lowercase())
+        .filter(|plan| !plan.is_empty())
+        .collect::<Vec<_>>();
+    normalized_plans.sort();
+    normalized_plans.dedup();
+    normalized_plans
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5016,6 +5052,56 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .to_string()
+    }
+
+    fn document_access_tokens(value: &Value) -> Vec<String> {
+        if let Some(token) = value.get("access_token").and_then(Value::as_str) {
+            return vec![token.to_string()];
+        }
+        if let Some(accounts) = value.as_array() {
+            return accounts
+                .iter()
+                .filter_map(|account| account.get("access_token").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        value
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map(|accounts| {
+                accounts
+                    .iter()
+                    .filter_map(|account| {
+                        account
+                            .get("credentials")
+                            .and_then(|credentials| credentials.get("access_token"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn stress_env_usize(name: &str, fallback: usize, min: usize, max: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(min, max))
+            .unwrap_or(fallback)
+    }
+
+    fn percentile_ms(durations: &[Duration], percentile: usize) -> f64 {
+        if durations.is_empty() {
+            return 0.0;
+        }
+        let mut micros = durations
+            .iter()
+            .map(Duration::as_micros)
+            .collect::<Vec<_>>();
+        micros.sort_unstable();
+        let index = ((micros.len() - 1) * percentile.min(100) + 50) / 100;
+        micros[index] as f64 / 1000.0
     }
 
     #[tokio::test]
@@ -7112,6 +7198,548 @@ CREATE TABLE redeem_code_batches (
                 .count(),
             2
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stress_concurrent_batch_generation_persists_unique_codes() {
+        const BATCH_COUNT: usize = 8;
+        const CODES_PER_BATCH: usize = 96;
+
+        let database_url = temp_database_url();
+        let setup_repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        drop(setup_repo);
+
+        let mut handles = Vec::with_capacity(BATCH_COUNT);
+        for batch_index in 0..BATCH_COUNT {
+            let database_url = database_url.clone();
+            handles.push(tokio::spawn(async move {
+                let repo = AccountPoolRepository::connect(&database_url, "test-secret")
+                    .await
+                    .unwrap();
+                repo.create_redeem_batch(CreateRedeemBatchInput {
+                    name: format!("stress-generate-{batch_index}"),
+                    total_count: CODES_PER_BATCH,
+                    accounts_per_code: 1,
+                    after_sale_limit: None,
+                    expires_at: None,
+                    plan_filter: None,
+                })
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut batch_ids = HashSet::new();
+        let mut generated_hashes = HashSet::new();
+        for handle in handles {
+            let outcome = handle.await.unwrap();
+            assert_eq!(outcome.codes.len(), CODES_PER_BATCH);
+            assert!(batch_ids.insert(outcome.batch_id));
+            for code in outcome.codes {
+                let normalized = normalize_redeem_code(&code.code).unwrap();
+                assert_eq!(code.code, format_redeem_code(&normalized));
+                assert_eq!(code.masked_code, mask_redeem_code(&normalized));
+                assert!(generated_hashes.insert(redeem_code_hash(&normalized)));
+            }
+        }
+        assert_eq!(batch_ids.len(), BATCH_COUNT);
+        assert_eq!(generated_hashes.len(), BATCH_COUNT * CODES_PER_BATCH);
+
+        let verify_repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        let rows = sqlx::query("SELECT batch_id, code_hash FROM redeem_codes")
+            .fetch_all(verify_repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), BATCH_COUNT * CODES_PER_BATCH);
+        let persisted_hashes = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("code_hash").unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(persisted_hashes.len(), BATCH_COUNT * CODES_PER_BATCH);
+        assert_eq!(persisted_hashes, generated_hashes);
+
+        let batch_row = sqlx::query(
+            "SELECT COUNT(*) AS count, SUM(total_count) AS total FROM redeem_code_batches",
+        )
+        .fetch_one(verify_repo.pool())
+        .await
+        .unwrap();
+        let batch_count: i64 = batch_row.try_get("count").unwrap();
+        let total_count: i64 = batch_row.try_get("total").unwrap();
+        assert_eq!(batch_count, BATCH_COUNT as i64);
+        assert_eq!(total_count, (BATCH_COUNT * CODES_PER_BATCH) as i64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stress_concurrent_redeems_allocate_distinct_accounts() {
+        const CODE_COUNT: usize = 64;
+        const ACCOUNTS_PER_CODE: usize = 2;
+        const ACCOUNT_COUNT: usize = CODE_COUNT * ACCOUNTS_PER_CODE;
+
+        let database_url = temp_database_url();
+        let setup_repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        let accounts = (0..ACCOUNT_COUNT)
+            .map(|index| {
+                parsed_account(
+                    &format!("stress-account-{index:03}"),
+                    &format!("stress-access-{index:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        setup_repo.import_accounts(&accounts).await.unwrap();
+        let batch = setup_repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "stress-redeem".to_string(),
+                total_count: CODE_COUNT,
+                accounts_per_code: ACCOUNTS_PER_CODE,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        drop(setup_repo);
+
+        let mut handles = Vec::with_capacity(CODE_COUNT);
+        for created in batch.codes {
+            let database_url = database_url.clone();
+            let code = created.code;
+            handles.push(tokio::spawn(async move {
+                let repo = AccountPoolRepository::connect(&database_url, "test-secret")
+                    .await
+                    .unwrap();
+                repo.redeem_codes_for_export(&[code], ExportFormat::Sub2api)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut exported_tokens = HashSet::new();
+        for handle in handles {
+            let outcome = handle.await.unwrap();
+            assert!(outcome.failures.is_empty());
+            assert_eq!(outcome.successes.len(), 1);
+            assert_eq!(outcome.successes[0].account_count, ACCOUNTS_PER_CODE);
+            let tokens = document_access_tokens(&outcome.document);
+            assert_eq!(tokens.len(), ACCOUNTS_PER_CODE);
+            for token in tokens {
+                assert!(exported_tokens.insert(token), "duplicate exported token");
+            }
+        }
+        assert_eq!(exported_tokens.len(), ACCOUNT_COUNT);
+
+        let verify_repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        let page = verify_repo
+            .list_accounts(AccountListQuery {
+                limit: ACCOUNT_COUNT,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, ACCOUNT_COUNT);
+        assert_eq!(page.stats.redeemed, ACCOUNT_COUNT);
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|account| account.redeemed_at.is_some())
+                .count(),
+            ACCOUNT_COUNT
+        );
+
+        let redemption_rows =
+            sqlx::query("SELECT account_ids_json FROM redeem_redemptions ORDER BY created_at ASC")
+                .fetch_all(verify_repo.pool())
+                .await
+                .unwrap();
+        assert_eq!(redemption_rows.len(), CODE_COUNT);
+        let mut redeemed_account_ids = HashSet::new();
+        for row in redemption_rows {
+            let account_ids = serde_json::from_str::<Vec<String>>(
+                row.try_get::<String, _>("account_ids_json")
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            assert_eq!(account_ids.len(), ACCOUNTS_PER_CODE);
+            for account_id in account_ids {
+                assert!(
+                    redeemed_account_ids.insert(account_id),
+                    "duplicate account id"
+                );
+            }
+        }
+        assert_eq!(redeemed_account_ids.len(), ACCOUNT_COUNT);
+
+        let code_row = sqlx::query(
+            "SELECT COUNT(*) AS count FROM redeem_codes WHERE status = 'redeemed' AND redemption_id IS NOT NULL",
+        )
+        .fetch_one(verify_repo.pool())
+        .await
+        .unwrap();
+        let redeemed_codes: i64 = code_row.try_get("count").unwrap();
+        assert_eq!(redeemed_codes, CODE_COUNT as i64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stress_duplicate_redeem_requests_return_one_binding_snapshot() {
+        const ATTEMPT_COUNT: usize = 40;
+
+        let database_url = temp_database_url();
+        let setup_repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        setup_repo
+            .import_accounts(&[parsed_account("duplicate-stress", "duplicate-access")])
+            .await
+            .unwrap();
+        let batch = setup_repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "duplicate stress".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let code = batch.codes[0].code.clone();
+        drop(setup_repo);
+
+        let mut handles = Vec::with_capacity(ATTEMPT_COUNT);
+        for _ in 0..ATTEMPT_COUNT {
+            let database_url = database_url.clone();
+            let code = code.clone();
+            handles.push(tokio::spawn(async move {
+                let repo = AccountPoolRepository::connect(&database_url, "test-secret")
+                    .await
+                    .unwrap();
+                repo.redeem_codes_for_export(&[code], ExportFormat::Cpa)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let outcome = handle.await.unwrap();
+            assert!(outcome.failures.is_empty());
+            assert_eq!(outcome.successes.len(), 1);
+            assert_eq!(outcome.successes[0].account_count, 1);
+            assert_eq!(document_access_token(&outcome.document), "duplicate-access");
+        }
+
+        let verify_repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        let redemption_count_row = sqlx::query("SELECT COUNT(*) AS count FROM redeem_redemptions")
+            .fetch_one(verify_repo.pool())
+            .await
+            .unwrap();
+        let redemption_count: i64 = redemption_count_row.try_get("count").unwrap();
+        assert_eq!(redemption_count, 1);
+
+        let account_count_row =
+            sqlx::query("SELECT COUNT(*) AS count FROM accounts WHERE redeemed_at IS NOT NULL")
+                .fetch_one(verify_repo.pool())
+                .await
+                .unwrap();
+        let account_count: i64 = account_count_row.try_get("count").unwrap();
+        assert_eq!(account_count, 1);
+
+        let code_row = sqlx::query(
+            "SELECT status, redeemed_at, redemption_id FROM redeem_codes WHERE code_hash = ?",
+        )
+        .bind(redeem_code_hash(&normalize_redeem_code(&code).unwrap()))
+        .fetch_one(verify_repo.pool())
+        .await
+        .unwrap();
+        let status: String = code_row.try_get("status").unwrap();
+        let redeemed_at: Option<i64> = code_row.try_get("redeemed_at").unwrap();
+        let redemption_id: Option<String> = code_row.try_get("redemption_id").unwrap();
+        assert_eq!(status, "redeemed");
+        assert!(redeemed_at.is_some());
+        assert!(redemption_id.is_some());
+
+        let batch_row = sqlx::query("SELECT redeemed_count FROM redeem_code_batches WHERE id = ?")
+            .bind(&batch.batch_id)
+            .fetch_one(verify_repo.pool())
+            .await
+            .unwrap();
+        let redeemed_count: i64 = batch_row.try_get("redeemed_count").unwrap();
+        assert_eq!(redeemed_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "run with make test-stress-high"]
+    async fn stress_high_concurrency_redeem_speed_and_correctness() {
+        let code_count = stress_env_usize("AETHER_STRESS_CODES", 10_000, 1, 100_000);
+        let accounts_per_code = stress_env_usize("AETHER_STRESS_ACCOUNTS_PER_CODE", 1, 1, 10);
+        let account_count = code_count * accounts_per_code;
+        let concurrency = stress_env_usize("AETHER_STRESS_CONCURRENCY", 200, 1, 5_000);
+        let chunk_size = stress_env_usize("AETHER_STRESS_CHUNK_SIZE", 50, 1, 1_000);
+        let min_codes_per_sec =
+            stress_env_usize("AETHER_STRESS_MIN_CODES_PER_SEC", 1_500, 1, usize::MAX) as f64;
+
+        let database_url = temp_database_url();
+        let setup_started = std::time::Instant::now();
+        let repo = AccountPoolRepository::connect(&database_url, "test-secret")
+            .await
+            .unwrap();
+        let accounts = (0..account_count)
+            .map(|index| {
+                parsed_account(
+                    &format!("high-stress-account-{index:06}"),
+                    &format!("high-stress-access-{index:06}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let import_outcome = repo.import_accounts(&accounts).await.unwrap();
+        assert_eq!(import_outcome.imported, account_count);
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "high concurrency redeem speed".to_string(),
+                total_count: code_count,
+                accounts_per_code,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(batch.codes.len(), code_count);
+        let setup_elapsed = setup_started.elapsed();
+
+        let chunks = batch
+            .codes
+            .chunks(chunk_size)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|created| created.code.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let request_count = chunks.len();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let redeem_started = std::time::Instant::now();
+        let mut handles = Vec::with_capacity(request_count);
+        for codes in chunks {
+            let repo = repo.clone();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let chunk_started = std::time::Instant::now();
+                let outcome = repo
+                    .redeem_codes_for_export(&codes, ExportFormat::Sub2api)
+                    .await
+                    .unwrap();
+                let elapsed = chunk_started.elapsed();
+                let failures = outcome
+                    .failures
+                    .into_iter()
+                    .map(|failure| format!("{}: {}", failure.code, failure.reason))
+                    .collect::<Vec<_>>();
+                (
+                    outcome.successes.len(),
+                    failures,
+                    document_access_tokens(&outcome.document),
+                    elapsed,
+                )
+            }));
+        }
+
+        let mut success_count = 0;
+        let mut failures = Vec::new();
+        let mut exported_tokens = HashSet::new();
+        let mut chunk_durations = Vec::new();
+        for handle in handles {
+            let (chunk_success_count, chunk_failures, tokens, elapsed) = handle.await.unwrap();
+            success_count += chunk_success_count;
+            failures.extend(chunk_failures);
+            chunk_durations.push(elapsed);
+            for token in tokens {
+                assert!(exported_tokens.insert(token), "duplicate exported token");
+            }
+        }
+        let redeem_elapsed = redeem_started.elapsed();
+        let codes_per_sec = code_count as f64 / redeem_elapsed.as_secs_f64();
+        let accounts_per_sec = account_count as f64 / redeem_elapsed.as_secs_f64();
+        eprintln!(
+            "high-stress redeem: codes={code_count} accounts={account_count} requests={request_count} concurrency={concurrency} chunk_size={chunk_size} setup={:.3}s redeem={:.3}s throughput={:.0} codes/s {:.0} accounts/s p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+            setup_elapsed.as_secs_f64(),
+            redeem_elapsed.as_secs_f64(),
+            codes_per_sec,
+            accounts_per_sec,
+            percentile_ms(&chunk_durations, 50),
+            percentile_ms(&chunk_durations, 95),
+            percentile_ms(&chunk_durations, 99),
+        );
+
+        assert!(failures.is_empty(), "redeem failures: {failures:?}");
+        assert_eq!(success_count, code_count);
+        assert_eq!(exported_tokens.len(), account_count);
+        assert!(
+            codes_per_sec >= min_codes_per_sec,
+            "redeem throughput {codes_per_sec:.0} codes/s is below required {min_codes_per_sec:.0} codes/s"
+        );
+
+        let summary_row = sqlx::query(
+            r#"
+SELECT
+  (SELECT COUNT(*) FROM accounts WHERE redeemed_at IS NOT NULL) AS redeemed_accounts,
+  (SELECT COUNT(*) FROM redeem_redemptions) AS redemptions,
+  (SELECT COUNT(*) FROM redeem_codes WHERE status = 'redeemed' AND redemption_id IS NOT NULL) AS redeemed_codes,
+  (SELECT redeemed_count FROM redeem_code_batches WHERE id = ?) AS redeemed_count
+"#,
+        )
+        .bind(&batch.batch_id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        let redeemed_accounts: i64 = summary_row.try_get("redeemed_accounts").unwrap();
+        let redemptions: i64 = summary_row.try_get("redemptions").unwrap();
+        let redeemed_codes: i64 = summary_row.try_get("redeemed_codes").unwrap();
+        let redeemed_count: i64 = summary_row.try_get("redeemed_count").unwrap();
+        assert_eq!(redeemed_accounts, account_count as i64);
+        assert_eq!(redemptions, code_count as i64);
+        assert_eq!(redeemed_codes, code_count as i64);
+        assert_eq!(redeemed_count, code_count as i64);
+
+        let redemption_rows = sqlx::query("SELECT account_ids_json FROM redeem_redemptions")
+            .fetch_all(repo.pool())
+            .await
+            .unwrap();
+        let mut redeemed_account_ids = HashSet::new();
+        for row in redemption_rows {
+            let account_ids = serde_json::from_str::<Vec<String>>(
+                row.try_get::<String, _>("account_ids_json")
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            assert_eq!(account_ids.len(), accounts_per_code);
+            for account_id in account_ids {
+                assert!(
+                    redeemed_account_ids.insert(account_id),
+                    "duplicate redeemed account id"
+                );
+            }
+        }
+        assert_eq!(redeemed_account_ids.len(), account_count);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "run with make test-stress-high"]
+    async fn stress_high_duplicate_redeem_speed_and_idempotence() {
+        let attempt_count = stress_env_usize("AETHER_DUPLICATE_STRESS_ATTEMPTS", 1_000, 1, 100_000);
+        let concurrency = stress_env_usize("AETHER_DUPLICATE_STRESS_CONCURRENCY", 256, 1, 10_000);
+        let min_attempts_per_sec = stress_env_usize(
+            "AETHER_DUPLICATE_STRESS_MIN_ATTEMPTS_PER_SEC",
+            2_000,
+            1,
+            usize::MAX,
+        ) as f64;
+
+        let repo = temp_repo().await;
+        repo.import_accounts(&[parsed_account(
+            "high-duplicate-stress",
+            "high-duplicate-access",
+        )])
+        .await
+        .unwrap();
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "high duplicate redeem speed".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let code = batch.codes[0].code.clone();
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let redeem_started = std::time::Instant::now();
+        let mut handles = Vec::with_capacity(attempt_count);
+        for _ in 0..attempt_count {
+            let repo = repo.clone();
+            let code = code.clone();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let attempt_started = std::time::Instant::now();
+                let outcome = repo
+                    .redeem_codes_for_export(&[code], ExportFormat::Cpa)
+                    .await
+                    .unwrap();
+                (
+                    outcome.successes.len(),
+                    outcome.failures.len(),
+                    document_access_token(&outcome.document),
+                    attempt_started.elapsed(),
+                )
+            }));
+        }
+
+        let mut success_count = 0;
+        let mut failure_count = 0;
+        let mut attempt_durations = Vec::new();
+        for handle in handles {
+            let (successes, failures, token, elapsed) = handle.await.unwrap();
+            success_count += successes;
+            failure_count += failures;
+            assert_eq!(token, "high-duplicate-access");
+            attempt_durations.push(elapsed);
+        }
+        let redeem_elapsed = redeem_started.elapsed();
+        let attempts_per_sec = attempt_count as f64 / redeem_elapsed.as_secs_f64();
+        eprintln!(
+            "high-duplicate redeem: attempts={attempt_count} concurrency={concurrency} elapsed={:.3}s throughput={:.0} attempts/s p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+            redeem_elapsed.as_secs_f64(),
+            attempts_per_sec,
+            percentile_ms(&attempt_durations, 50),
+            percentile_ms(&attempt_durations, 95),
+            percentile_ms(&attempt_durations, 99),
+        );
+
+        assert_eq!(success_count, attempt_count);
+        assert_eq!(failure_count, 0);
+        assert!(
+            attempts_per_sec >= min_attempts_per_sec,
+            "duplicate redeem throughput {attempts_per_sec:.0} attempts/s is below required {min_attempts_per_sec:.0} attempts/s"
+        );
+
+        let row = sqlx::query(
+            r#"
+SELECT
+  (SELECT COUNT(*) FROM redeem_redemptions) AS redemptions,
+  (SELECT COUNT(*) FROM accounts WHERE redeemed_at IS NOT NULL) AS redeemed_accounts,
+  (SELECT redeemed_count FROM redeem_code_batches WHERE id = ?) AS redeemed_count,
+  (SELECT COUNT(*) FROM account_exports WHERE source = 'redeem') AS export_count
+"#,
+        )
+        .bind(&batch.batch_id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        let redemptions: i64 = row.try_get("redemptions").unwrap();
+        let redeemed_accounts: i64 = row.try_get("redeemed_accounts").unwrap();
+        let redeemed_count: i64 = row.try_get("redeemed_count").unwrap();
+        let export_count: i64 = row.try_get("export_count").unwrap();
+        assert_eq!(redemptions, 1);
+        assert_eq!(redeemed_accounts, 1);
+        assert_eq!(redeemed_count, 1);
+        assert_eq!(export_count, attempt_count as i64);
     }
 
     #[tokio::test]

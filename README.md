@@ -88,7 +88,7 @@ The default Compose deployment runs a single container:
 
 - `api`: Rust/Axum app on container port `8318`, serving `/api`, `/health`, and the built Vue frontend.
 
-Baota Nginx only needs to reverse proxy the public domain to the Docker `api` port. By default that port is bound to `127.0.0.1:8318`, so it does not conflict with Baota's 80/443 listeners.
+Baota Nginx can reverse proxy the public domain to the Docker `api` port. By default that port is published on all host interfaces as `0.0.0.0:8318`; set `AETHER_POOL_API_BIND=127.0.0.1` in `.env` if you want access only through a local reverse proxy.
 
 ```bash
 cd redemption-code

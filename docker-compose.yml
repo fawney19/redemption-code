@@ -20,5 +20,5 @@ services:
     volumes:
       - ./data:/data
     ports:
-      - "${AETHER_POOL_API_BIND:-127.0.0.1}:${AETHER_POOL_API_PORT:-8318}:8318"
+      - "${AETHER_POOL_API_BIND:-0.0.0.0}:${AETHER_POOL_API_PORT:-8318}:8318"
     restart: unless-stopped
