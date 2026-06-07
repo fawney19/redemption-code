@@ -8,6 +8,7 @@ export interface AccountPool {
   description?: string | null
   is_default: boolean
   is_active: boolean
+  stats: AccountPoolStats
   created_at: number
   updated_at: number
 }
@@ -56,6 +57,17 @@ export interface AccountPoolStats {
   available: number
   redeemed: number
   attention: number
+}
+
+export interface AccountBulkFilters {
+  search?: string
+  statuses?: string[]
+  redeemed_values?: string[]
+}
+
+export interface AccountBulkFilterPayload {
+  pool_id: string
+  filters: AccountBulkFilters
 }
 
 export interface RedeemBatch {
@@ -366,6 +378,13 @@ export const api = {
       body: JSON.stringify({ account_ids: accountIds, pool_id: poolId || undefined }),
     })
   },
+  probeAccountsByFilter(state: ApiState, payload: AccountBulkFilterPayload) {
+    return request<{ success: boolean; matched: number; checked: number; failed: number; results: unknown[] }>(
+      `${MANAGEMENT_API_PREFIX}/accounts/probe`,
+      state,
+      { method: 'POST', body: JSON.stringify(payload) },
+    )
+  },
   refreshAccounts(state: ApiState, accountIds?: string[], poolId?: string) {
     return request<{ refreshed: number; skipped: number; failed: number; results: unknown[] }>(
       `${MANAGEMENT_API_PREFIX}/accounts/refresh`,
@@ -373,10 +392,23 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ account_ids: accountIds, pool_id: poolId || undefined }) },
     )
   },
+  refreshAccountsByFilter(state: ApiState, payload: AccountBulkFilterPayload) {
+    return request<{ success: boolean; matched: number; refreshed: number; skipped: number; failed: number; results: unknown[] }>(
+      `${MANAGEMENT_API_PREFIX}/accounts/refresh`,
+      state,
+      { method: 'POST', body: JSON.stringify(payload) },
+    )
+  },
   deleteAccounts(state: ApiState, accountIds: string[]) {
     return request<DeleteAccountsResponse>(`${MANAGEMENT_API_PREFIX}/accounts/delete`, state, {
       method: 'POST',
       body: JSON.stringify({ account_ids: accountIds }),
+    })
+  },
+  deleteAccountsByFilter(state: ApiState, payload: AccountBulkFilterPayload) {
+    return request<DeleteAccountsResponse & { matched: number }>(`${MANAGEMENT_API_PREFIX}/accounts/delete`, state, {
+      method: 'POST',
+      body: JSON.stringify(payload),
     })
   },
   exportAccounts(state: ApiState, payload: { account_ids?: string[]; include_redeemed?: boolean; pool_id?: string; format: ExportFormat }) {

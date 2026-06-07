@@ -1,6 +1,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import {
   api,
+  type AccountBulkFilterPayload,
   type AccountPool,
   type AccountPoolPayload,
   type AccountPoolStats,
@@ -39,7 +40,7 @@ const selectedIds = ref<string[]>([])
 const importText = ref('')
 const accountPools = ref<AccountPool[]>([])
 const defaultPoolId = ref('')
-const selectedPoolId = ref('')
+const selectedPoolId = ref(accountPoolIdFromLocation())
 const importPoolId = ref('')
 const adminResult = ref('')
 const adminExportFormat = ref<ExportFormat>('cpa')
@@ -133,6 +134,19 @@ const operationPoolId = computed(() => {
   return defaultPool?.id || activePools.value[0]?.id || ''
 })
 const selectedPoolLabel = computed(() => selectedPool.value ? poolLabel(selectedPool.value.id) : '全部号池')
+const poolOverviewStats = computed<AccountPoolStats>(() => accountPools.value.reduce((stats, pool) => {
+  stats.total += Number(pool.stats?.total || 0)
+  stats.available += Number(pool.stats?.available || 0)
+  stats.redeemed += Number(pool.stats?.redeemed || 0)
+  stats.attention += Number(pool.stats?.attention || 0)
+  return stats
+}, {
+  total: 0,
+  available: 0,
+  redeemed: 0,
+  attention: 0,
+}))
+const bulkFilterTargetCount = computed(() => selectedPoolId.value ? accountPagination.total : 0)
 const proxyTestDisabled = computed(() => {
   if (busy.value) return true
   if (!autoProbeForm.proxy_enabled) return false
@@ -206,6 +220,8 @@ export function useAdmin() {
     selectedPoolId,
     selectedPool,
     selectedPoolLabel,
+    poolOverviewStats,
+    bulkFilterTargetCount,
     importPoolId,
     adminResult,
     adminExportFormat,
@@ -280,7 +296,11 @@ export async function loginAdmin() {
       await loadBatches()
       await loadAutoProbeSettings()
       await loadRedeemRateLimitSettings()
-      navigateAdminView(activeView.value, 'replace')
+      if (activeView.value === 'accounts' && selectedPoolId.value) {
+        navigateAccountPool(selectedPoolId.value, 'replace')
+      } else {
+        navigateAdminView(activeView.value, 'replace')
+      }
     } catch (error) {
       adminToken.value = previousToken
       if (previousToken) {
@@ -323,11 +343,14 @@ export function logoutAdmin() {
 }
 
 export async function loadPools() {
+  syncSelectedPoolFromLocation()
   const result = await api.listPools(apiState.value)
   accountPools.value = result.items
   defaultPoolId.value = result.default_pool_id || result.items.find((pool) => pool.is_default)?.id || result.items[0]?.id || ''
   if (selectedPoolId.value && !accountPools.value.some((pool) => pool.id === selectedPoolId.value)) {
     selectedPoolId.value = ''
+    resetAccountListState()
+    if (activeView.value === 'accounts') navigateAdminView('accounts', 'replace')
   }
   filters.pool_ids = filters.pool_ids.filter((poolId) => accountPools.value.some((pool) => pool.id === poolId))
   if (!importPoolId.value || !accountPools.value.some((pool) => pool.id === importPoolId.value && pool.is_active)) {
@@ -345,13 +368,17 @@ export async function changeSelectedPool() {
   importPoolId.value = operationPoolId.value
   batchForm.pool_id = operationPoolId.value
   await loadAccounts()
-  await loadBatches()
 }
 
 export async function loadAccounts() {
+  if (!selectedPoolId.value) {
+    resetAccountListState()
+    return
+  }
   const page = await api.listAccounts(apiState.value, {
     ...filters,
-    pool_id: filters.pool_ids.length ? undefined : selectedPoolId.value || undefined,
+    pool_ids: undefined,
+    pool_id: selectedPoolId.value,
     limit: accountPagination.limit,
     offset: accountPagination.offset,
   })
@@ -390,8 +417,33 @@ export async function changeAccountsPageSize() {
   await loadAccounts()
 }
 
+export async function enterAccountPool(poolId: string) {
+  if (!poolId) return
+  selectedPoolId.value = poolId
+  resetAccountFilters()
+  resetAccountListState()
+  importPoolId.value = poolId
+  batchForm.pool_id = accountPools.value.some((pool) => pool.id === poolId && pool.is_active)
+    ? poolId
+    : operationPoolId.value
+  navigateAccountPool(poolId, 'push')
+  await loadAccounts()
+}
+
+export function leaveAccountPool() {
+  selectedPoolId.value = ''
+  resetAccountFilters()
+  resetAccountListState()
+  navigateAdminView('accounts', 'push')
+}
+
 export function setActiveView(view: AdminView) {
   activeView.value = view
+  if (view === 'accounts') {
+    selectedPoolId.value = ''
+    resetAccountFilters()
+    resetAccountListState()
+  }
   navigateAdminView(view, 'push')
 }
 
@@ -400,7 +452,7 @@ export function adminViewHref(view: AdminView) {
 }
 
 export async function loadBatches() {
-  const result = await api.listBatches(apiState.value, selectedPoolId.value || undefined)
+  const result = await api.listBatches(apiState.value)
   batches.value = result.items
   if (selectedBatchId.value && !batches.value.some((batch) => batch.id === selectedBatchId.value)) {
     selectedBatchId.value = ''
@@ -445,15 +497,21 @@ export async function importAccounts() {
     const result = await api.importAccounts(apiState.value, importText.value, importPoolId.value || operationPoolId.value)
     adminResult.value = JSON.stringify(result, null, 2)
     importText.value = ''
+    await loadPools()
     await loadAccounts()
   })
 }
 
 export async function probeSelected() {
   await withBusy(async () => {
-    const ids = selectedIds.value.length ? selectedIds.value : undefined
-    const result = await api.probeAccounts(apiState.value, ids, ids ? undefined : selectedPoolId.value || undefined)
+    const ids = selectedIds.value.slice()
+    if (!ids.length) {
+      adminResult.value = '请选择要测活的账号'
+      return
+    }
+    const result = await api.probeAccounts(apiState.value, ids)
     adminResult.value = JSON.stringify(result, null, 2)
+    await loadPools()
     await loadAccounts()
   })
 }
@@ -462,15 +520,39 @@ export async function probeAccount(accountId: string) {
   await withBusy(async () => {
     const result = await api.probeAccounts(apiState.value, [accountId])
     adminResult.value = JSON.stringify(result, null, 2)
+    await loadPools()
     await loadAccounts()
   })
 }
 
 export async function refreshSelected() {
   await withBusy(async () => {
-    const ids = selectedIds.value.length ? selectedIds.value : undefined
-    const result = await api.refreshAccounts(apiState.value, ids, ids ? undefined : selectedPoolId.value || undefined)
+    const ids = selectedIds.value.slice()
+    if (!ids.length) {
+      adminResult.value = '请选择要刷新的账号'
+      return
+    }
+    const result = await api.refreshAccounts(apiState.value, ids)
     adminResult.value = JSON.stringify(result, null, 2)
+    await loadPools()
+    await loadAccounts()
+  })
+}
+
+export async function probeFilteredAccounts() {
+  await withBusy(async () => {
+    const result = await api.probeAccountsByFilter(apiState.value, currentBulkFilterPayload())
+    adminResult.value = JSON.stringify(result, null, 2)
+    await loadPools()
+    await loadAccounts()
+  })
+}
+
+export async function refreshFilteredAccounts() {
+  await withBusy(async () => {
+    const result = await api.refreshAccountsByFilter(apiState.value, currentBulkFilterPayload())
+    adminResult.value = JSON.stringify(result, null, 2)
+    await loadPools()
     await loadAccounts()
   })
 }
@@ -499,8 +581,57 @@ async function deleteAccountsByIds(ids: string[]) {
     selectedIds.value = selectedIds.value.filter(
       (id) => !result.results.some((item) => item.account_id === id && item.status === 'deleted'),
     )
+    await loadPools()
     await loadAccounts()
   })
+}
+
+export async function deleteFilteredAccounts() {
+  const count = bulkFilterTargetCount.value
+  if (!selectedPoolId.value || !count) {
+    adminResult.value = '当前筛选范围没有可处理账号'
+    return
+  }
+  if (!window.confirm(`确认按当前筛选条件删除「${selectedPoolLabel.value}」内匹配的 ${count} 个账号？未兑换账号会直接删除；已兑换账号仅在 AT 过期、刷新失败、账号失效或网络受限时删除，其余会跳过。`)) {
+    return
+  }
+  await withBusy(async () => {
+    const result = await api.deleteAccountsByFilter(apiState.value, currentBulkFilterPayload())
+    adminResult.value = formatDeleteAccountsResult(result)
+    selectedIds.value = selectedIds.value.filter(
+      (id) => !result.results.some((item) => item.account_id === id && item.status === 'deleted'),
+    )
+    await loadPools()
+    await loadAccounts()
+  })
+}
+
+function currentBulkFilterPayload(): AccountBulkFilterPayload {
+  const poolId = selectedPoolId.value.trim()
+  if (!poolId) throw new Error('请先进入一个号池')
+  return {
+    pool_id: poolId,
+    filters: {
+      search: filters.search.trim() || undefined,
+      statuses: filters.statuses.slice(),
+      redeemed_values: filters.redeemed_values.slice(),
+    },
+  }
+}
+
+function resetAccountFilters() {
+  filters.search = ''
+  filters.pool_ids = []
+  filters.statuses = []
+  filters.redeemed_values = []
+}
+
+function resetAccountListState() {
+  accounts.value = []
+  selectedIds.value = []
+  accountPagination.total = 0
+  accountPagination.offset = 0
+  applyAccountStats()
 }
 
 export async function saveAutoProbeSettings() {
@@ -688,11 +819,7 @@ export async function togglePoolActive(pool: AccountPool) {
     const result = await api.updatePool(apiState.value, pool.id, payload)
     adminResult.value = result.pool.is_active ? `已启用号池：${result.pool.name}` : `已停用号池：${result.pool.name}`
     await loadPools()
-    if (!result.pool.is_active && selectedPoolId.value === result.pool.id) {
-      selectedPoolId.value = ''
-    }
     await loadAccounts()
-    await loadBatches()
   })
 }
 
@@ -886,7 +1013,17 @@ export function syncAdminViewFromLocation() {
   const normalizedPath = normalizePath(window.location.pathname)
   const view = viewFromPath(window.location.pathname) || viewFromValue(window.location.hash)
   if (view) {
+    const previousPoolId = selectedPoolId.value
     activeView.value = view
+    if (view === 'accounts') {
+      syncSelectedPoolFromLocation()
+      if (previousPoolId !== selectedPoolId.value) {
+        selectedIds.value = []
+        accountPagination.offset = 0
+        if (!selectedPoolId.value) resetAccountListState()
+        else if (adminAuthenticated.value) void loadAccounts()
+      }
+    }
     if (!adminAuthenticated.value) {
       navigateAdminLogin('replace')
       return
@@ -922,10 +1059,32 @@ function navigateAdminView(view: AdminView, mode: 'push' | 'replace') {
 
   const nextPath = adminViewPaths[view]
   const currentPath = normalizePath(window.location.pathname)
-  if (currentPath === nextPath && !window.location.hash) return
+  if (currentPath === nextPath && !window.location.search && !window.location.hash) return
 
   const method = mode === 'push' ? 'pushState' : 'replaceState'
   window.history[method]({ ...window.history.state, adminView: view }, '', nextPath)
+}
+
+function navigateAccountPool(poolId: string, mode: 'push' | 'replace') {
+  sessionStorage.setItem(activeViewStorageKey, 'accounts')
+  if (!isManagementPath()) return
+
+  const nextPath = `${adminViewPaths.accounts}?pool=${encodeURIComponent(poolId)}`
+  const currentPath = `${normalizePath(window.location.pathname)}${window.location.search}`
+  if (currentPath === nextPath && !window.location.hash) return
+
+  const method = mode === 'push' ? 'pushState' : 'replaceState'
+  window.history[method]({ ...window.history.state, adminView: 'accounts', poolId }, '', nextPath)
+}
+
+function syncSelectedPoolFromLocation() {
+  if (activeView.value !== 'accounts') return
+  selectedPoolId.value = accountPoolIdFromLocation()
+}
+
+function accountPoolIdFromLocation() {
+  if (viewFromPath(window.location.pathname) !== 'accounts') return ''
+  return new URLSearchParams(window.location.search).get('pool')?.trim() || ''
 }
 
 watch(activeView, (view) => {

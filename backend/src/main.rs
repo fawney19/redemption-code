@@ -491,6 +491,14 @@ async fn get_account_token(
 struct AccountIdRequest {
     account_ids: Option<Vec<String>>,
     pool_id: Option<String>,
+    filters: Option<AccountBulkFilters>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AccountBulkFilters {
+    search: Option<String>,
+    statuses: Option<Vec<String>>,
+    redeemed_values: Option<Vec<String>>,
 }
 
 async fn refresh_accounts(
@@ -499,15 +507,11 @@ async fn refresh_accounts(
     Json(payload): Json<AccountIdRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
-    let outcome = refresh_expired_accounts(
-        &state,
-        payload.account_ids.as_deref(),
-        payload.pool_id.as_deref(),
-        true,
-    )
-    .await?;
+    let account_ids = resolve_bulk_account_ids(&state, &payload).await?;
+    let outcome = refresh_expired_accounts(&state, Some(&account_ids), None, true).await?;
     Ok(Json(json!({
         "success": true,
+        "matched": account_ids.len(),
         "refreshed": outcome.refreshed,
         "skipped": outcome.skipped,
         "failed": outcome.failed,
@@ -521,19 +525,11 @@ async fn delete_accounts(
     Json(payload): Json<AccountIdRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
-    let account_ids = payload
-        .account_ids
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    if account_ids.is_empty() {
-        return Err(ApiError::bad_request("account_ids is required"));
-    }
+    let account_ids = resolve_bulk_account_ids(&state, &payload).await?;
     let outcome = state.repo.delete_unbound_accounts(&account_ids).await?;
     Ok(Json(json!({
         "success": true,
+        "matched": account_ids.len(),
         "deleted": outcome.deleted,
         "skipped": outcome.skipped,
         "not_found": outcome.not_found,
@@ -547,24 +543,82 @@ async fn probe_accounts(
     Json(payload): Json<AccountIdRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers)?;
+    let account_ids = resolve_bulk_account_ids(&state, &payload).await?;
     let settings = state.repo.get_auto_probe_settings().await?;
     let summary = run_probe_accounts(
         &state,
-        payload.account_ids.as_deref(),
+        Some(&account_ids),
         ProbeRunOptions {
             max_accounts: None,
             concurrency: settings.concurrency as usize,
-            include_redeemed: payload.account_ids.is_some(),
-            pool_id: pool_scope_for_ids(payload.account_ids.as_deref(), payload.pool_id.as_deref()),
+            include_redeemed: true,
+            pool_id: None,
         },
     )
     .await?;
     Ok(Json(json!({
         "success": true,
+        "matched": account_ids.len(),
         "checked": summary.checked,
         "failed": summary.failed,
         "results": summary.results,
     })))
+}
+
+async fn resolve_bulk_account_ids(
+    state: &AppState,
+    payload: &AccountIdRequest,
+) -> Result<Vec<String>, ApiError> {
+    let account_ids = normalized_account_ids(payload.account_ids.as_deref());
+    if !account_ids.is_empty() {
+        return Ok(account_ids);
+    }
+    let query = filtered_bulk_account_query(payload)?;
+    Ok(state.repo.list_account_ids(query).await?)
+}
+
+fn filtered_bulk_account_query(payload: &AccountIdRequest) -> Result<AccountListQuery, ApiError> {
+    let pool_id = payload
+        .pool_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("pool_id is required for filtered bulk account operation")
+        })?;
+    let filters = payload.filters.clone().unwrap_or_default();
+    Ok(AccountListQuery {
+        pool_id: Some(pool_id.to_string()),
+        search: filters.search,
+        statuses: csv_payload_values(filters.statuses),
+        redeemed_values: csv_payload_values(filters.redeemed_values),
+        limit: 0,
+        offset: 0,
+        ..AccountListQuery::default()
+    })
+}
+
+fn normalized_account_ids(account_ids: Option<&[String]>) -> Vec<String> {
+    account_ids
+        .unwrap_or_default()
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn csv_payload_values(values: Option<Vec<String>>) -> Option<String> {
+    let values = values
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(","))
+    }
 }
 
 async fn get_auto_probe_settings(
@@ -1996,16 +2050,6 @@ async fn run_probe_accounts_with_progress(
         .await;
     }
     Ok(summary)
-}
-
-fn pool_scope_for_ids(account_ids: Option<&[String]>, pool_id: Option<&str>) -> Option<String> {
-    if account_ids.is_some() {
-        return None;
-    }
-    pool_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 async fn collect_probe_result(
@@ -3903,6 +3947,22 @@ mod tests {
         );
         assert!(admin_request_authorized("secret", &headers).is_ok());
         assert!(admin_request_authorized("secret2", &headers).is_err());
+    }
+
+    #[test]
+    fn filtered_bulk_request_requires_pool_id() {
+        let payload = AccountIdRequest {
+            account_ids: None,
+            pool_id: None,
+            filters: Some(AccountBulkFilters {
+                search: Some("target".to_string()),
+                statuses: Some(vec!["available".to_string()]),
+                redeemed_values: Some(vec!["false".to_string()]),
+            }),
+        };
+        let error = filtered_bulk_account_query(&payload).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("pool_id"));
     }
 
     #[test]

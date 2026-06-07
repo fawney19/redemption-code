@@ -201,7 +201,14 @@ ORDER BY is_default DESC, updated_at DESC, created_at DESC
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(account_pool_from_row).collect()
+        let mut pools = rows
+            .into_iter()
+            .map(account_pool_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        for pool in &mut pools {
+            pool.stats = self.load_account_pool_stats(Some(&pool.id)).await?;
+        }
+        Ok(pools)
     }
 
     pub async fn create_account_pool(
@@ -275,9 +282,12 @@ WHERE id = ?
         .bind(pool_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(account_pool_from_row)
+        let mut pool = row
+            .map(account_pool_from_row)
             .transpose()?
-            .ok_or(DataError::NotFound)
+            .ok_or(DataError::NotFound)?;
+        pool.stats = self.load_account_pool_stats(Some(&pool.id)).await?;
+        Ok(pool)
     }
 
     async fn resolve_account_pool_id(
@@ -549,6 +559,19 @@ LEFT JOIN redeem_codes rc ON rc.id = a.redeem_code_id
             offset,
             stats,
         })
+    }
+
+    pub async fn list_account_ids(
+        &self,
+        query: AccountListQuery,
+    ) -> Result<Vec<String>, DataError> {
+        let mut builder = QueryBuilder::<Sqlite>::new("SELECT a.id FROM accounts a");
+        push_account_filters(&mut builder, &query);
+        builder.push(" ORDER BY a.created_at ASC, a.rowid ASC");
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| row.try_get("id").map_err(DataError::from))
+            .collect()
     }
 
     async fn load_account_pool_stats(
@@ -4189,6 +4212,7 @@ pub struct AccountPoolSummary {
     pub description: Option<String>,
     pub is_default: bool,
     pub is_active: bool,
+    pub stats: AccountPoolStats,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -4658,6 +4682,7 @@ fn account_pool_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AccountPoolSumm
         description: row.try_get("description")?,
         is_default: row.try_get::<i64, _>("is_default").unwrap_or(0) != 0,
         is_active: row.try_get::<i64, _>("is_active").unwrap_or(0) != 0,
+        stats: AccountPoolStats::default(),
         created_at: optional_i64(&row, "created_at")?.unwrap_or_default(),
         updated_at: optional_i64(&row, "updated_at")?.unwrap_or_default(),
     })
@@ -5319,6 +5344,14 @@ CREATE TABLE redeem_code_batches (
         assert_eq!(left_page.stats.total, 1);
         assert_eq!(left_page.items[0].pool_id, left.id);
 
+        let pools = repo.list_account_pools().await.unwrap();
+        let left_pool = pools.iter().find(|pool| pool.id == left.id).unwrap();
+        let right_pool = pools.iter().find(|pool| pool.id == right.id).unwrap();
+        assert_eq!(left_pool.stats.total, 1);
+        assert_eq!(left_pool.stats.available, 1);
+        assert_eq!(right_pool.stats.total, 1);
+        assert_eq!(right_pool.stats.available, 1);
+
         let right_export = repo
             .export_admin_accounts_scoped(None, false, ExportFormat::Sub2api, Some(&right.id))
             .await
@@ -5763,6 +5796,63 @@ CREATE TABLE redeem_code_batches (
             .await
             .unwrap();
         assert_eq!(page.total, 1);
+    }
+
+    #[tokio::test]
+    async fn filtered_account_ids_delete_only_target_pool() {
+        let repo = temp_repo().await;
+        let left = repo.create_account_pool(pool_input("left")).await.unwrap();
+        let right = repo.create_account_pool(pool_input("right")).await.unwrap();
+        repo.import_accounts_into_pool(
+            &[parsed_account("bulk-target-left", "left-access")],
+            Some(&left.id),
+        )
+        .await
+        .unwrap();
+        repo.import_accounts_into_pool(
+            &[parsed_account("bulk-target-right", "right-access")],
+            Some(&right.id),
+        )
+        .await
+        .unwrap();
+
+        let account_ids = repo
+            .list_account_ids(AccountListQuery {
+                pool_id: Some(left.id.clone()),
+                search: Some("bulk-target".to_string()),
+                statuses: Some("available".to_string()),
+                redeemed_values: Some("false".to_string()),
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(account_ids.len(), 1);
+
+        let outcome = repo.delete_unbound_accounts(&account_ids).await.unwrap();
+        assert_eq!(outcome.deleted, 1);
+
+        let left_page = repo
+            .list_accounts(AccountListQuery {
+                pool_id: Some(left.id),
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        let right_page = repo
+            .list_accounts(AccountListQuery {
+                pool_id: Some(right.id),
+                limit: 10,
+                ..AccountListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(left_page.total, 0);
+        assert_eq!(right_page.total, 1);
+        assert_eq!(
+            right_page.items[0].account_id.as_deref(),
+            Some("bulk-target-right")
+        );
     }
 
     #[tokio::test]

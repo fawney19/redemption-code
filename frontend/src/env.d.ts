@@ -16,6 +16,7 @@ declare module 'lucide-vue-next' {
 
   export const Activity: IconComponent
   export const ChevronDown: IconComponent
+  export const ChevronLeft: IconComponent
   export const ChevronRight: IconComponent
   export const CircleAlert: IconComponent
   export const CircleCheck: IconComponent
