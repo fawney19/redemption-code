@@ -96,16 +96,9 @@ cp .env.example .env
 vim .env
 # Replace AETHER_POOL_ADMIN_TOKEN and AETHER_POOL_SECRET_KEY before starting.
 
-# Pull the published image and start the app.
-docker compose pull api
-docker compose up -d api
+# Build and start the app.
+docker compose up -d --build api
 docker compose ps
-```
-
-To build the image on the server instead of pulling the published image, use the build compose file:
-
-```bash
-docker compose -f docker-compose.build.yml up -d --build api
 ```
 
 Baota reverse proxy target:
@@ -141,14 +134,7 @@ Update deployment after pulling new code:
 
 ```bash
 cd redemption-code
-docker compose pull api
-docker compose up -d api
-```
-
-For local/server-side image builds:
-
-```bash
-docker compose -f docker-compose.build.yml up -d --build api
+docker compose up -d --build api
 ```
 
 SQLite schema upgrades are applied automatically at API startup. Current upgrades add `account_pools`, `accounts.pool_id`, `redeem_code_batches.pool_id`, `redeem_code_batches.after_sale_limit`, and `redeem_after_sales`; no manual migration command is required for existing deployments.

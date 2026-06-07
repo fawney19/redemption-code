@@ -1,6 +1,11 @@
 services:
   api:
-    image: ghcr.io/fawney19/redemption-code:${AETHER_POOL_IMAGE_TAG:-v0.1.0}
+    image: aether-pool-api:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-}
     environment:
       AETHER_POOL_ADDR: 0.0.0.0:8318
       AETHER_POOL_DATABASE_URL: sqlite:///data/aether-pool.sqlite3
