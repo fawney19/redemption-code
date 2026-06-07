@@ -27,8 +27,9 @@
             <p>复制、导出、查看兑换状态</p>
           </div>
           <div class="toolbar compact-toolbar">
-            <button class="button primary" :class="{ active: codeGeneratorOpen }" :disabled="busy" @click="toggleCodeGenerator">
-              <Plus :size="15" />生成兑换码
+            <button class="button code-generator-toggle-button" :class="{ primary: !codeGeneratorOpen, active: codeGeneratorOpen }" :disabled="busy" @click="toggleCodeGenerator">
+              <ChevronDown v-if="codeGeneratorOpen" :size="15" />
+              <Plus v-else :size="15" />{{ codeGeneratorOpen ? '收起配置' : '生成兑换码' }}
             </button>
             <button class="button" :disabled="!selectedBatch" @click="copySelectedBatchCodes">
               <Copy :size="15" />复制
@@ -44,72 +45,70 @@
         <div class="panel-body grid">
           <Transition name="fade">
             <div v-if="codeGeneratorOpen" class="code-generator-panel">
-              <div class="code-generator-form">
-                <label class="field-label">
-                  <span>号池</span>
-                  <select v-model="batchForm.pool_id" class="select">
-                    <option v-for="pool in activePools" :key="pool.id" :value="pool.id">
-                      {{ poolLabel(pool.id) }}
-                    </option>
-                  </select>
-                </label>
-                <label class="field-label">
-                  <span>批次名称</span>
-                  <input v-model="batchForm.name" class="input" placeholder="例如 6 月 Pro 批次" />
-                </label>
-                <label class="field-label">
-                  <span>兑换码数量</span>
-                  <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="10000" />
-                </label>
-                <label class="field-label">
-                  <span>每码账号数</span>
-                  <input v-model.number="batchForm.accounts_per_code" class="input" type="number" min="1" max="100" />
-                </label>
-                <label class="field-label">
-                  <span>每码售后次数</span>
-                  <input v-model.number="batchForm.after_sale_limit" class="input" type="number" min="0" max="10" />
-                </label>
-                <div class="field-label">
-                  <span>过期时间</span>
-                  <div class="expiry-input-row">
-                    <input v-model="batchForm.expires_at_text" class="input" type="datetime-local" />
-                    <select v-model="expiryQuickDays" class="select expiry-quick-select" aria-label="快捷设置过期时间" @change="applyExpiryQuickSelect">
-                      <option value="">快捷</option>
-                      <option value="1">1天</option>
-                      <option value="3">3天</option>
-                      <option value="7">7天</option>
-                      <option value="30">30天</option>
-                    </select>
-                    <button type="button" class="button tiny expiry-clear-button" @click="clearBatchExpiry">清除</button>
+              <div class="code-generator-card">
+                <div class="code-generator-card-body">
+                  <div class="code-generator-config">
+                    <div class="code-generator-form">
+                      <label class="field-label code-generator-field code-generator-field--pool">
+                        <span>号池</span>
+                        <select v-model="batchForm.pool_id" class="select">
+                          <option v-for="pool in activePools" :key="pool.id" :value="pool.id">
+                            {{ poolLabel(pool.id) }}
+                          </option>
+                        </select>
+                      </label>
+                      <label class="field-label code-generator-field code-generator-field--name">
+                        <span>批次名称</span>
+                        <input v-model="batchForm.name" class="input" placeholder="例如 6 月 Pro 批次" />
+                      </label>
+                      <label class="field-label code-generator-field code-generator-field--count">
+                        <span>兑换码数量</span>
+                        <input v-model.number="batchForm.total_count" class="input" type="number" min="1" max="10000" />
+                      </label>
+                      <div class="code-generator-form-actions">
+                        <button class="button primary" :disabled="busy" @click="handleCreateBatch">
+                          <Plus :size="15" />生成
+                        </button>
+                      </div>
+                      <label class="field-label code-generator-field code-generator-field--compact">
+                        <span>每码账号数</span>
+                        <input v-model.number="batchForm.accounts_per_code" class="input" type="number" min="1" max="100" />
+                      </label>
+                      <label class="field-label code-generator-field code-generator-field--compact">
+                        <span>每码售后次数</span>
+                        <input v-model.number="batchForm.after_sale_limit" class="input" type="number" min="0" max="10" />
+                      </label>
+                      <div class="field-label code-generator-field code-generator-field--expiry">
+                        <span>过期时间</span>
+                        <div class="expiry-input-row">
+                          <input v-model="batchForm.expires_at_text" class="input" type="datetime-local" />
+                          <select v-model="expiryQuickDays" class="select expiry-quick-select" aria-label="快捷设置过期时间" @change="applyExpiryQuickSelect">
+                            <option value="">不限制</option>
+                            <option value="1">1天</option>
+                            <option value="3">3天</option>
+                            <option value="7">7天</option>
+                            <option value="30">30天</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div class="code-generator-actions">
-                  <button class="button primary" :disabled="busy" @click="handleCreateBatch">
-                    <Plus :size="15" />生成
-                  </button>
-                  <button class="button ghost" :disabled="busy" @click="codeGeneratorOpen = false">收起</button>
+                  <div class="generated-codes-wrap">
+                    <div class="terminal-bar generated-codes-terminal-bar">
+                      <div class="terminal-dots"><span></span><span></span><span></span></div>
+                      <div class="generated-codes-terminal-actions">
+                        <button class="button ghost tiny" :disabled="!generatedCodes.trim()" @click="copyGeneratedCodes">
+                          <Copy :size="15" />复制
+                        </button>
+                        <button class="button ghost tiny" :disabled="!generatedCodes.trim()" @click="exportGeneratedCodes">
+                          <Download :size="15" />导出 TXT
+                        </button>
+                      </div>
+                    </div>
+                    <pre class="result mono dark-result generated-codes-result" :class="{ 'generated-codes-result--empty': !generatedCodes.trim() }">{{ generatedCodesPreview || '暂无生成结果' }}</pre>
+                  </div>
                 </div>
               </div>
-              <Transition name="fade">
-                <div v-if="generatedCodes" class="generated-codes-wrap">
-                  <div class="generated-codes-toolbar">
-                    <div>
-                      <strong>本次生成 {{ generatedCodeCount }} 个完整兑换码</strong>
-                      <span>完整兑换码会加密存储，可在批次中再次复制或导出</span>
-                    </div>
-                    <div class="toolbar compact-toolbar">
-                      <button class="button ghost" @click="copyGeneratedCodes">
-                        <Copy :size="15" />复制
-                      </button>
-                      <button class="button ghost" @click="exportGeneratedCodes">
-                        <Download :size="15" />导出 TXT
-                      </button>
-                    </div>
-                  </div>
-                  <div class="terminal-bar"><span></span><span></span><span></span></div>
-                  <pre class="result mono dark-result generated-codes-result">{{ generatedCodesPreview }}</pre>
-                </div>
-              </Transition>
             </div>
           </Transition>
 
@@ -422,7 +421,7 @@ const toast = useToast()
 const manualCopyTitle = ref('')
 const manualCopyText = ref('')
 const probingCodeId = ref('')
-const codeGeneratorOpen = ref(false)
+const codeGeneratorOpen = ref(true)
 const expiryQuickDays = ref('')
 const detailPageSize = ref(10)
 const detailPage = ref(1)
@@ -582,14 +581,11 @@ function setBatchExpiryDays(days: number) {
 
 function applyExpiryQuickSelect() {
   const days = Number(expiryQuickDays.value)
-  if (!days) return
+  if (!days) {
+    batchForm.expires_at_text = ''
+    return
+  }
   setBatchExpiryDays(days)
-  expiryQuickDays.value = ''
-}
-
-function clearBatchExpiry() {
-  batchForm.expires_at_text = ''
-  expiryQuickDays.value = ''
 }
 
 function formatDateTimeLocal(value: Date) {

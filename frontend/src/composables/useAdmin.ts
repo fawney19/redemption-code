@@ -648,9 +648,8 @@ export async function createBatch() {
     })
     generatedCodes.value = result.codes.map((c) => c.code).join('\n')
     await loadBatches()
-    selectedBatchId.value = result.batch_id
-    if (result.codes.length <= 500) await fetchCodes(result.batch_id)
-    else batchCodes.value = []
+    selectedBatchId.value = ''
+    batchCodes.value = []
     adminResult.value = `已生成 ${result.codes.length} 个兑换码`
   })
 }
