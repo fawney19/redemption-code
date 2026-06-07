@@ -34,7 +34,7 @@ RUN useradd --system --uid 10001 --gid users aether \
 COPY --from=builder /app/target/release/aether-pool-api /usr/local/bin/aether-pool-api
 COPY --from=web-builder /app/frontend/dist /usr/local/share/aether-pool/web
 
-USER aether
+USER root
 WORKDIR /data
 
 ENV AETHER_POOL_ADDR=0.0.0.0:8318
