@@ -3,39 +3,6 @@
 version = 4
 
 [[package]]
-name = "account-pool-core"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
-]
-
-[[package]]
-name = "account-pool-data"
-version = "0.1.0"
-dependencies = [
- "account-pool-core",
- "aes-gcm",
- "anyhow",
- "base64",
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -74,15 +41,19 @@ dependencies = [
 name = "aether-pool-api"
 version = "0.1.0"
 dependencies = [
- "account-pool-core",
- "account-pool-data",
+ "aes-gcm",
  "anyhow",
  "axum",
  "base64",
  "chrono",
+ "hex",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
  "tokio",
  "tower-http",
  "tracing",

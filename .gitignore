@@ -1,8 +1,8 @@
 target/
-apps/web/node_modules/
-apps/web/dist/
-apps/web/.vite/
-apps/web/node_modules/.tmp/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/node_modules/.tmp/
 deploy/web/
 data/
 *.sqlite3

@@ -4,10 +4,12 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 
 ## Layout
 
-- `apps/api`: Rust + Axum API service.
-- `apps/web`: Vue 3 + Vite admin/user console.
-- `crates/account-pool-core`: Codex auth parsing, export formats, token expiry rules, wham/usage normalization, redeem code helpers.
-- `crates/account-pool-data`: SQLite schema, repositories, encrypted auth storage, redeem allocation.
+This repository uses a simple frontend/backend split:
+
+- `backend`: Rust + Axum backend. It contains the API server, static web serving, SQLite repository, migrations, account parsing, redeem code logic, and Docker runtime.
+- `frontend`: Vue 3 + Vite frontend. It contains the public redeem page, admin UI, API client, and static build.
+- `docker-compose.yml`: production-style orchestration for the single `api` service that serves both API routes and the built frontend.
+- `Makefile`: local development orchestration for running backend and frontend together.
 
 ## Behavior
 
@@ -51,64 +53,65 @@ AetherPool is a standalone Codex/OpenAI OAuth account pool service extracted fro
 
 Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-admin-token`.
 Pool-aware admin endpoints accept `pool_id` as documented by shape: account list and batch list use query `pool_id`; import, probe, refresh, admin export, and batch creation use JSON `pool_id`. When `pool_id` is omitted, legacy behavior is preserved: account/batch lists are global, while new imports and new batches use the default pool. Registrars can call `GET /api/alalalateam/account-pools?active_only=true` with the admin token to fetch selectable upload pools, then submit `POST /api/alalalateam/accounts/import` with body `{"pool_id":"<pool id>","credentials":"<auth json/text>"}`.
-By default admin endpoints are locked when `AETHER_POOL_ADMIN_TOKEN` is empty. The API refuses known example admin tokens and empty/example encryption secrets unless `AETHER_POOL_ALLOW_INSECURE_DEV_CONFIG=1` is explicitly set for isolated local development. Use `AETHER_POOL_ALLOW_OPEN_ADMIN=1` only for isolated local development.
-Cross-origin browser access is restricted by `AETHER_POOL_CORS_ORIGINS`, defaulting to local Vite origins.
+The admin password is read from `AETHER_POOL_ADMIN_TOKEN`. The API refuses to start when it is empty or still set to a known example value.
+Cross-origin browser access is controlled by `AETHER_POOL_CORS_ORIGINS`. Same-origin deployments should leave it empty because the Rust server serves both the frontend and `/api`. Separate-origin deployments should set it to the frontend origin, for example `https://pool.example.com`.
 Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`.
+OAuth refresh defaults to ChatGPT (`AETHER_POOL_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann`, `AETHER_POOL_OAUTH_TOKEN_URL=https://auth.openai.com/oauth/token`), so those environment variables can be omitted unless you need to override them.
 
 The public web entry is `/` and only shows the redeem/export page. The management console is available at `/alalalateam` and is not linked from the public page.
 
 ## Development
 
 ```bash
-cd aether-pool
-export AETHER_POOL_ADMIN_TOKEN=dev-admin-token
+cd redemption-code
 export AETHER_POOL_SECRET_KEY=dev-only-secret-key
-cargo run -p aether-pool-api
+make dev
 ```
 
-The API defaults to `127.0.0.1:8318` and SQLite at `data/aether-pool.sqlite3`.
+The API defaults to `127.0.0.1:8318`, SQLite at `data/aether-pool.sqlite3`, and local admin password `admin123` when started through `make dev`. Override it with `AETHER_POOL_ADMIN_TOKEN=your-admin-password make dev`.
 
 Frontend:
 
 ```bash
-cd aether-pool/apps/web
+cd redemption-code/frontend
 npm install
-VITE_API_BASE=http://127.0.0.1:8318 npm run dev -- --port 5178
+npm run dev -- --port 5178
 ```
 
-Set `VITE_API_BASE=http://127.0.0.1:8318` when the API runs on a different origin.
+The Vite dev server proxies `/api` and `/health` to `VITE_DEV_API_TARGET`, defaulting to `http://127.0.0.1:8318`.
+
+For fully separated local origins, set `VITE_API_BASE=http://127.0.0.1:8318` for the frontend and make sure the backend allows the frontend origin through `AETHER_POOL_CORS_ORIGINS`.
 
 ## Server deployment with Docker and Baota Nginx
 
-The default Compose deployment runs both services in Docker:
+The default Compose deployment runs a single container:
 
-- `api`: Rust/Axum API on container port `8318`.
-- `web`: Nginx container serving the built Vue app and proxying `/api` plus `/health` to `api`.
+- `api`: Rust/Axum app on container port `8318`, serving `/api`, `/health`, and the built Vue frontend.
 
-Baota Nginx only needs to reverse proxy the public domain to the Docker `web` port. By default that port is bound to `127.0.0.1:8080`, so it does not conflict with Baota's 80/443 listeners.
+Baota Nginx only needs to reverse proxy the public domain to the Docker `api` port. By default that port is bound to `127.0.0.1:8318`, so it does not conflict with Baota's 80/443 listeners.
 
 ```bash
-cd aether-pool
+cd redemption-code
 cp .env.example .env
 vim .env
 # Replace AETHER_POOL_ADMIN_TOKEN and AETHER_POOL_SECRET_KEY before starting.
 
-# Build and start both frontend and backend.
-docker compose up -d --build api web
+# Build and start the app.
+docker compose up -d --build api
 docker compose ps
 ```
 
 Baota reverse proxy target:
 
 ```text
-http://127.0.0.1:8080
+http://127.0.0.1:8318
 ```
 
 If you edit the Baota Nginx site config manually, the only required rule is:
 
 ```nginx
 location / {
-  proxy_pass http://127.0.0.1:8080;
+  proxy_pass http://127.0.0.1:8318;
   proxy_set_header Host $host;
   proxy_set_header X-Real-IP $remote_addr;
   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -116,34 +119,34 @@ location / {
 }
 ```
 
-For same-domain deployment, keep `VITE_API_BASE=` empty in `.env` so the frontend calls `/api/...` through the `web` container. If API and frontend use different domains, set `VITE_API_BASE` to the API origin and set `AETHER_POOL_CORS_ORIGINS` to the frontend origin.
+With the default same-origin mode, keep `VITE_API_BASE=` empty. The frontend calls `/api/...` on the same Rust server.
+
+For true separate-domain deployment, set:
+
+```env
+VITE_API_BASE=https://api.example.com
+AETHER_POOL_CORS_ORIGINS=https://pool.example.com
+```
+
+Then expose the `api` service behind the API domain and serve a separate frontend static build behind the frontend domain.
 
 Update deployment after pulling new code:
 
 ```bash
-cd aether-pool
-docker compose up -d --build api web
-```
-
-Optional static-Baota mode is still available if you do not want a web container:
-
-```bash
-docker compose --profile build run --rm web-build
+cd redemption-code
 docker compose up -d --build api
 ```
-
-Then set Baota's site root to `/absolute/path/to/aether-pool/deploy/web` and proxy `/api/` to `http://127.0.0.1:8318`.
 
 SQLite schema upgrades are applied automatically at API startup. Current upgrades add `account_pools`, `accounts.pool_id`, `redeem_code_batches.pool_id`, `redeem_code_batches.after_sale_limit`, and `redeem_after_sales`; no manual migration command is required for existing deployments.
 
 ## Verification
 
 ```bash
-cd aether-pool
+cd redemption-code
 cargo test
 cargo fmt --all -- --check
 RUSTC_WRAPPER= cargo clippy --all-targets --all-features -- -D warnings
 
-cd apps/web
+cd frontend
 npm run build
 ```

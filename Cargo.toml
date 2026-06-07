@@ -1,9 +1,5 @@
 [workspace]
-members = [
-  "apps/api",
-  "crates/account-pool-core",
-  "crates/account-pool-data",
-]
+members = ["backend"]
 resolver = "2"
 
 [workspace.package]
@@ -12,8 +8,6 @@ license = "MIT"
 version = "0.1.0"
 
 [workspace.dependencies]
-account-pool-core = { path = "crates/account-pool-core" }
-account-pool-data = { path = "crates/account-pool-data" }
 aes-gcm = "0.10"
 anyhow = "1"
 axum = "0.8"
