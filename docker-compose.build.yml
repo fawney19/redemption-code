@@ -1,0 +1,24 @@
+services:
+  api:
+    image: aether-pool-api:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-}
+    environment:
+      AETHER_POOL_ADDR: 0.0.0.0:8318
+      AETHER_POOL_DATABASE_URL: sqlite:///data/aether-pool.sqlite3
+      AETHER_POOL_WEB_DIR: /usr/local/share/aether-pool/web
+      AETHER_POOL_ADMIN_TOKEN: ${AETHER_POOL_ADMIN_TOKEN:?set AETHER_POOL_ADMIN_TOKEN in .env}
+      AETHER_POOL_SECRET_KEY: ${AETHER_POOL_SECRET_KEY:?set AETHER_POOL_SECRET_KEY in .env}
+      AETHER_POOL_CORS_ORIGINS: ${AETHER_POOL_CORS_ORIGINS:-}
+      AETHER_POOL_OAUTH_CLIENT_ID: ${AETHER_POOL_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}
+      AETHER_POOL_OAUTH_TOKEN_URL: ${AETHER_POOL_OAUTH_TOKEN_URL:-https://auth.openai.com/oauth/token}
+      AETHER_POOL_IP_CHECK_URL: ${AETHER_POOL_IP_CHECK_URL:-https://api.ipify.org?format=json}
+      RUST_LOG: ${RUST_LOG:-aether_pool_api=info,tower_http=info}
+    volumes:
+      - ./data:/data
+    ports:
+      - "${AETHER_POOL_API_BIND:-127.0.0.1}:${AETHER_POOL_API_PORT:-8318}:8318"
+    restart: unless-stopped
