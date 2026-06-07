@@ -16,7 +16,7 @@ VITE_DEV_API_TARGET ?= http://$(AETHER_POOL_ADDR)
 dev: require-admin-token web-deps
 	@echo "API:   http://$(AETHER_POOL_ADDR)"
 	@echo "Web:   http://$(WEB_HOST):$(WEB_PORT)"
-	@echo "Admin: http://$(WEB_HOST):$(WEB_PORT)/alalalateam"
+	@echo "Admin: http://$(WEB_HOST):$(WEB_PORT)/act"
 	@echo "Admin password: $(AETHER_POOL_ADMIN_TOKEN)"
 	@cleanup() { kill $$api_pid $$web_pid 2>/dev/null || true; }; \
 	( \

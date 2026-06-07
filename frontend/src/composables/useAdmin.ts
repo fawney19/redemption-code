@@ -20,7 +20,7 @@ import {
 
 const adminTokenStorageKey = 'aether-pool.admin-token'
 const activeViewStorageKey = 'aether-pool.admin-active-view'
-const managementEntryPath = '/alalalateam'
+const managementEntryPath = '/act'
 type AdminView = 'accounts' | 'codes' | 'redeem' | 'pools' | 'settings'
 const adminViewPaths = {
   accounts: `${managementEntryPath}/accounts`,
@@ -65,7 +65,7 @@ const filters = reactive({
 })
 const accountPagination = reactive({
   total: 0,
-  limit: 50,
+  limit: 25,
   offset: 0,
 })
 const accountStats = reactive<AccountPoolStats>({
@@ -280,6 +280,7 @@ export async function loginAdmin() {
       await loadBatches()
       await loadAutoProbeSettings()
       await loadRedeemRateLimitSettings()
+      navigateAdminView(activeView.value, 'replace')
     } catch (error) {
       adminToken.value = previousToken
       if (previousToken) {
@@ -318,6 +319,7 @@ export function logoutAdmin() {
   applyAccountStats()
   selectedIds.value = []
   sessionStorage.removeItem(adminTokenStorageKey)
+  navigateAdminLogin('replace')
 }
 
 export async function loadPools() {
@@ -383,7 +385,7 @@ export async function nextAccountsPage() {
 }
 
 export async function changeAccountsPageSize() {
-  accountPagination.limit = Number(accountPagination.limit || 50)
+  accountPagination.limit = Number(accountPagination.limit || 25)
   accountPagination.offset = 0
   await loadAccounts()
 }
@@ -882,18 +884,37 @@ export function isManagementPath(pathname = window.location.pathname) {
 }
 
 export function syncAdminViewFromLocation() {
+  const normalizedPath = normalizePath(window.location.pathname)
   const view = viewFromPath(window.location.pathname) || viewFromValue(window.location.hash)
   if (view) {
     activeView.value = view
-    if (isManagementPath() && normalizePath(window.location.pathname) !== adminViewPaths[view]) {
+    if (!adminAuthenticated.value) {
+      navigateAdminLogin('replace')
+      return
+    }
+    if (isManagementPath() && normalizedPath !== adminViewPaths[view]) {
       navigateAdminView(view, 'replace')
     }
     return
   }
 
   if (isManagementPath()) {
+    if (!adminAuthenticated.value) {
+      navigateAdminLogin('replace')
+      return
+    }
     navigateAdminView(activeView.value, 'replace')
   }
+}
+
+function navigateAdminLogin(mode: 'push' | 'replace') {
+  if (!isManagementPath()) return
+
+  const currentPath = normalizePath(window.location.pathname)
+  if (currentPath === managementEntryPath && !window.location.hash) return
+
+  const method = mode === 'push' ? 'pushState' : 'replaceState'
+  window.history[method]({ ...window.history.state, adminView: activeView.value }, '', managementEntryPath)
 }
 
 function navigateAdminView(view: AdminView, mode: 'push' | 'replace') {

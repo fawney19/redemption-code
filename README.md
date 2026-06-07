@@ -58,7 +58,7 @@ Cross-origin browser access is controlled by `AETHER_POOL_CORS_ORIGINS`. Same-or
 Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`.
 OAuth refresh defaults to ChatGPT (`AETHER_POOL_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann`, `AETHER_POOL_OAUTH_TOKEN_URL=https://auth.openai.com/oauth/token`), so those environment variables can be omitted unless you need to override them.
 
-The public web entry is `/` and only shows the redeem/export page. The management console is available at `/alalalateam` and is not linked from the public page.
+The public web entry is `/` and only shows the redeem/export page. The management console is available at `/act` and is not linked from the public page.
 
 ## Development
 
