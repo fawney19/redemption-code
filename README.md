@@ -96,8 +96,9 @@ cp .env.example .env
 vim .env
 # Replace AETHER_POOL_ADMIN_TOKEN and AETHER_POOL_SECRET_KEY before starting.
 
-# Build and start the app.
-docker compose up -d --build api
+# Pull the published image and start the app.
+docker compose pull api
+docker compose up -d api
 docker compose ps
 ```
 
@@ -134,7 +135,8 @@ Update deployment after pulling new code:
 
 ```bash
 cd redemption-code
-docker compose up -d --build api
+docker compose pull api
+docker compose up -d api
 ```
 
 SQLite schema upgrades are applied automatically at API startup. Current upgrades add `account_pools`, `accounts.pool_id`, `redeem_code_batches.pool_id`, `redeem_code_batches.after_sale_limit`, and `redeem_after_sales`; no manual migration command is required for existing deployments.
