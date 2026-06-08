@@ -175,6 +175,7 @@ export interface RedeemJob {
   status: 'queued' | 'running' | 'completed' | 'failed' | string
   total_codes: number
   processed_codes: number
+  progress_processed_codes?: number
   progress: number
   success_count: number
   failure_count: number

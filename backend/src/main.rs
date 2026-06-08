@@ -45,11 +45,11 @@ const DEFAULT_MAX_QUEUED_REDEEM_JOBS: usize = 64;
 const DEFAULT_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT: usize = 4;
 const DEFAULT_REDEEM_NETWORK_CONCURRENCY: usize = 128;
 const MAX_COMPLETED_REDEEM_JOBS: usize = 12;
-const DEFAULT_REDEEM_JOB_CHUNK_SIZE: usize = 500;
+const DEFAULT_REDEEM_JOB_CHUNK_SIZE: usize = 100;
 const REDEEM_JOB_RETENTION_SECONDS: u64 = 60 * 60;
 const REDEEM_JOB_PRUNE_INTERVAL_SECONDS: u64 = 60;
 const REDEEM_JOB_QUEUE_POLL_MS: u64 = 350;
-const DEFAULT_REDEEM_PROBE_CONCURRENCY: usize = 16;
+const DEFAULT_REDEEM_PROBE_CONCURRENCY: usize = 64;
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const ADMIN_TOKEN_PLACEHOLDERS: &[&str] = &["change-this-admin-password"];
@@ -1207,6 +1207,10 @@ struct RedeemJob {
     account_count: usize,
     network_total: usize,
     network_done: usize,
+    active_codes_start: usize,
+    active_codes_total: usize,
+    active_network_start: usize,
+    active_network_total: usize,
     message: Option<String>,
     error: Option<String>,
     result: Option<RedeemJobResult>,
@@ -1237,6 +1241,7 @@ impl RedeemJobProgress {
         let message = message.into();
         update_redeem_job(&self.state, &self.job_id, |job| {
             job.network_total = job.network_total.saturating_add(amount);
+            job.active_network_total = job.active_network_total.saturating_add(amount);
             job.message = Some(message);
         })
         .await;
@@ -1377,6 +1382,10 @@ async fn start_redeem_job(
         account_count: 0,
         network_total: 0,
         network_done: 0,
+        active_codes_start: 0,
+        active_codes_total: 0,
+        active_network_start: 0,
+        active_network_total: 0,
         message: Some("任务已提交，等待运行槽".to_string()),
         error: None,
         result: None,
@@ -1465,6 +1474,10 @@ async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>)
         let next_processed = all_successes.len() + all_failures.len();
         update_redeem_job(&state, &job_id, |job| {
             job.processed_codes = next_processed.min(job.total_codes);
+            job.active_codes_start = job.processed_codes;
+            job.active_codes_total = chunk_codes.len();
+            job.active_network_start = job.network_done;
+            job.active_network_total = 0;
             job.message = Some("正在兑换".to_string());
         })
         .await;
@@ -1500,6 +1513,10 @@ async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>)
                     job.success_count = result.successes.len();
                     job.failure_count = result.failures.len();
                     job.account_count = account_count;
+                    job.active_codes_start = job.total_codes;
+                    job.active_codes_total = 0;
+                    job.active_network_start = job.network_done;
+                    job.active_network_total = 0;
                     job.error = Some(error.message.clone());
                     job.message = Some("兑换完成，部分失败".to_string());
                     job.result = Some(result);
@@ -1522,10 +1539,16 @@ async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>)
         let success_count = all_successes.len();
         let failure_count = all_failures.len();
         update_redeem_job(&state, &job_id, |job| {
-            job.processed_codes = job.processed_codes.saturating_add(processed);
+            job.processed_codes = next_processed
+                .saturating_add(processed)
+                .min(job.total_codes);
             job.success_count = success_count;
             job.failure_count = failure_count;
             job.account_count = account_count;
+            job.active_codes_start = job.processed_codes;
+            job.active_codes_total = 0;
+            job.active_network_start = job.network_done;
+            job.active_network_total = 0;
             job.message = Some(format!(
                 "已处理 {} / {}",
                 job.processed_codes, job.total_codes
@@ -1551,6 +1574,10 @@ async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>)
         job.success_count = result.successes.len();
         job.failure_count = result.failures.len();
         job.account_count = account_count;
+        job.active_codes_start = job.total_codes;
+        job.active_codes_total = 0;
+        job.active_network_start = job.network_done;
+        job.active_network_total = 0;
         job.message = Some("兑换完成".to_string());
         job.result = Some(result);
         job.finished_at = Some(unix_now_secs());
@@ -1774,10 +1801,11 @@ async fn redeem_job_json(state: &AppState, job_id: &str) -> Option<Value> {
         };
         (job, queue_position)
     };
+    let progress_processed_codes = redeem_job_progress_processed_codes(&job);
     let progress = if job.total_codes == 0 {
         0
     } else {
-        ((job.processed_codes.min(job.total_codes) * 100) / job.total_codes) as u64
+        ((progress_processed_codes.min(job.total_codes) * 100) / job.total_codes) as u64
     };
     let result = job.result.as_ref().map(|result| {
         json!({
@@ -1795,6 +1823,7 @@ async fn redeem_job_json(state: &AppState, job_id: &str) -> Option<Value> {
         "status": job.status,
         "total_codes": job.total_codes,
         "processed_codes": job.processed_codes,
+        "progress_processed_codes": progress_processed_codes,
         "progress": progress,
         "success_count": job.success_count,
         "failure_count": job.failure_count,
@@ -1810,6 +1839,28 @@ async fn redeem_job_json(state: &AppState, job_id: &str) -> Option<Value> {
         "finished_at": job.finished_at,
         "result": result,
     }))
+}
+
+fn redeem_job_progress_processed_codes(job: &RedeemJob) -> usize {
+    let processed_codes = job.processed_codes.min(job.total_codes);
+    if job.status != "running" || job.active_codes_total == 0 || job.active_network_total == 0 {
+        return processed_codes;
+    }
+
+    let active_codes_start = job.active_codes_start.min(job.total_codes);
+    let active_codes_total = job
+        .active_codes_total
+        .min(job.total_codes.saturating_sub(active_codes_start));
+    let active_network_done = job
+        .network_done
+        .saturating_sub(job.active_network_start)
+        .min(job.active_network_total);
+    let active_codes_done =
+        active_codes_total.saturating_mul(active_network_done) / job.active_network_total;
+
+    processed_codes
+        .max(active_codes_start.saturating_add(active_codes_done))
+        .min(job.total_codes)
 }
 
 fn normalize_redeem_job_codes(raw_codes: Vec<String>) -> (Vec<String>, Vec<RedeemFailure>) {
@@ -2188,15 +2239,16 @@ struct ProbeRunOptions {
 }
 
 fn redeem_probe_concurrency(settings: &AutoProbeSettings) -> usize {
+    let max_concurrency = redeem_network_concurrency().max(1);
     if let Some(concurrency) = std::env::var("AETHER_POOL_REDEEM_PROBE_CONCURRENCY")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
     {
-        return concurrency.clamp(1, 32);
+        return concurrency.clamp(1, max_concurrency);
     }
     (settings.concurrency as usize)
         .max(DEFAULT_REDEEM_PROBE_CONCURRENCY)
-        .clamp(1, 32)
+        .clamp(1, max_concurrency)
 }
 
 #[derive(Default)]
@@ -2245,7 +2297,9 @@ async fn run_probe_accounts_with_progress(
     let probe_settings = state.repo.get_auto_probe_settings().await?;
     let (probe_http, probe_proxy) = resolve_probe_http_client(state, &probe_settings).await?;
     let cpa_management_key = state.repo.get_cpa_management_key().await?;
-    let concurrency = options.concurrency.clamp(1, 32);
+    let concurrency = options
+        .concurrency
+        .clamp(1, redeem_network_concurrency().max(1));
     let mut join_set = JoinSet::new();
     let mut summary = ProbeRunSummary::default();
     for (account, auth_file) in accounts {
@@ -4243,6 +4297,10 @@ mod tests {
             account_count: 0,
             network_total: 0,
             network_done: 0,
+            active_codes_start: 0,
+            active_codes_total: 0,
+            active_network_start: 0,
+            active_network_total: 0,
             message: None,
             error: None,
             result: None,
@@ -4844,6 +4902,22 @@ mod tests {
         assert_eq!(DEFAULT_MAX_QUEUED_REDEEM_JOBS, 64);
         assert_eq!(DEFAULT_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT, 4);
         assert_eq!(DEFAULT_REDEEM_NETWORK_CONCURRENCY, 128);
+        assert_eq!(DEFAULT_REDEEM_PROBE_CONCURRENCY, 64);
+    }
+
+    #[test]
+    fn redeem_job_progress_uses_active_network_progress() {
+        let mut job = test_redeem_job("job", "client", "running");
+        job.total_codes = 1_000;
+        job.processed_codes = 500;
+        job.network_total = 1_020;
+        job.network_done = 765;
+        job.active_codes_start = 500;
+        job.active_codes_total = 500;
+        job.active_network_start = 510;
+        job.active_network_total = 510;
+
+        assert_eq!(redeem_job_progress_processed_codes(&job), 750);
     }
 
     #[test]

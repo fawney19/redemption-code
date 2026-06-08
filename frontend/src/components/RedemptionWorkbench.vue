@@ -80,11 +80,15 @@
           <div class="result-metrics">
             <div>
               <span>已处理</span>
-              <strong>{{ redeemJob?.processed_codes || 0 }}</strong>
+              <strong>{{ redeemProgressProcessedCodes }}</strong>
             </div>
             <div>
               <span>总兑换码</span>
               <strong>{{ redeemJob?.total_codes || 0 }}</strong>
+            </div>
+            <div v-if="redeemNetworkTotal > 0">
+              <span>账号检测</span>
+              <strong>{{ redeemNetworkDone }} / {{ redeemNetworkTotal }}</strong>
             </div>
             <div>
               <span>进度</span>
@@ -175,6 +179,7 @@ const redeemFileName = ref('')
 const redeemSuccesses = ref<RedeemSuccess[]>([])
 const redeemFailures = ref<RedeemFailure[]>([])
 let redeemPollTimer: number | null = null
+const redeemPollIntervalMs = 500
 
 const formatLabel = computed(() => redeemFormat.value === 'cpa' ? 'CPA JSON / ZIP' : 'Sub2API JSON')
 const modeTitle = computed(() => redeemMode.value === 'afterSale' ? '售后补发' : '兑换码')
@@ -190,8 +195,21 @@ const previewText = computed(() => {
 })
 const redeemedAccountCount = computed(() => redeemSuccesses.value.reduce((sum, item) => sum + Number(item.account_count || 0), 0))
 const redeemProgress = computed(() => Math.max(0, Math.min(100, Math.round(Number(redeemJob.value?.progress || 0)))))
+const redeemProgressProcessedCodes = computed(() => {
+  const job = redeemJob.value
+  if (!job) return 0
+  const total = safeCount(job.total_codes)
+  return Math.max(0, Math.min(total, safeCount(job.progress_processed_codes ?? job.processed_codes)))
+})
+const redeemNetworkTotal = computed(() => safeCount(redeemJob.value?.network_total))
+const redeemNetworkDone = computed(() => Math.min(redeemNetworkTotal.value, safeCount(redeemJob.value?.network_done)))
 const visibleRedeemFailures = computed(() => redeemFailures.value.slice(0, 100))
 const hiddenRedeemFailureCount = computed(() => Math.max(0, redeemFailures.value.length - visibleRedeemFailures.value.length))
+
+function safeCount(value: unknown) {
+  const count = Math.floor(Number(value || 0))
+  return Number.isFinite(count) && count > 0 ? count : 0
+}
 
 async function handleRedeem() {
   clearRedeemPoll()
@@ -231,7 +249,7 @@ async function handleRedeem() {
 function scheduleRedeemPoll(jobId: string) {
   redeemPollTimer = window.setTimeout(() => {
     void pollRedeemJob(jobId)
-  }, 700)
+  }, redeemPollIntervalMs)
 }
 
 async function pollRedeemJob(jobId: string) {
