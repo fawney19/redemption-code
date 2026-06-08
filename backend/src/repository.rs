@@ -20,19 +20,24 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 const INIT_SQL: &str = include_str!("../migrations/sqlite/0001_init.sql");
 const AUTO_PROBE_SETTINGS_KEY: &str = "auto_probe";
 const CPA_MANAGEMENT_KEY_SETTING_KEY: &str = "cpa_management_key";
 const REDEEM_RATE_LIMIT_SETTINGS_KEY: &str = "redeem_rate_limit";
+const MIN_DB_CONNECTIONS: u32 = 8;
+const MAX_DB_CONNECTIONS: u32 = 32;
+const IMPORT_DB_CONCURRENCY: usize = 1;
 pub const DEFAULT_ACCOUNT_POOL_ID: &str = "default";
 const DEFAULT_ACCOUNT_POOL_NAME: &str = "默认 Codex 号池";
 const DEFAULT_ACCOUNT_POOL_WORKSPACE_LABEL: &str = "默认工作区";
 const DEFAULT_ACCOUNT_POOL_TYPE: &str = "codex";
 const DEFAULT_ACCOUNT_POOL_DESCRIPTION: &str = "旧账号和未指定池的默认归属";
 const REDEEM_RESERVATION_TTL_SECONDS: u64 = 30 * 60;
+const REDEEM_CODE_INSERT_CHUNK_SIZE: usize = 100;
+const IMPORT_ACCOUNTS_WRITE_CHUNK_SIZE: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum DataError {
@@ -108,6 +113,7 @@ pub struct AccountPoolRepository {
     pool: SqlitePool,
     secrets: SecretBox,
     redemption_lock: Arc<Mutex<()>>,
+    import_db_limiter: Arc<Semaphore>,
 }
 
 impl AccountPoolRepository {
@@ -119,7 +125,6 @@ impl AccountPoolRepository {
                 }
             }
         }
-        let max_connections = env_u32_clamped("AETHER_POOL_DB_MAX_CONNECTIONS", 8, 1, 64);
         let busy_timeout_ms = env_u64_clamped("AETHER_POOL_DB_BUSY_TIMEOUT_MS", 30_000, 0, 600_000);
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
@@ -128,7 +133,7 @@ impl AccountPoolRepository {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_millis(busy_timeout_ms));
         let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
+            .max_connections(db_max_connections())
             .connect_with(options)
             .await?;
         for statement in INIT_SQL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -139,6 +144,7 @@ impl AccountPoolRepository {
             pool,
             secrets: SecretBox::new(secret_key),
             redemption_lock: Arc::new(Mutex::new(())),
+            import_db_limiter: Arc::new(Semaphore::new(IMPORT_DB_CONCURRENCY)),
         })
     }
 
@@ -324,7 +330,6 @@ WHERE id = ?
         accounts: &[ParsedAccount],
         pool_id: Option<&str>,
     ) -> Result<ImportAccountsOutcome, DataError> {
-        let pool_id = self.resolve_account_pool_id(pool_id, true).await?;
         let now = unix_now_secs() as i64;
         let mut prepared = Vec::with_capacity(accounts.len());
         let mut imported = 0;
@@ -366,40 +371,50 @@ WHERE id = ?
             });
         }
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let fingerprints = prepared
-            .iter()
-            .map(|item| item.fingerprint.clone())
-            .collect::<Vec<_>>();
-        let existing_by_fingerprint =
-            load_import_ids_by_fingerprint_tx(&mut tx, &fingerprints).await?;
-        let legacy_keys = prepared
-            .iter()
-            .filter(|item| !existing_by_fingerprint.contains_key(&item.fingerprint))
-            .filter_map(|item| {
-                let email = item.email_key.as_ref()?;
-                if item.legacy_fingerprint == item.fingerprint {
-                    return None;
-                }
-                Some((item.legacy_fingerprint.clone(), email.clone()))
-            })
-            .collect::<Vec<_>>();
-        let existing_by_legacy = load_import_ids_by_legacy_tx(&mut tx, &legacy_keys).await?;
+        let _import_permit = self
+            .import_db_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DataError::InvalidInput("import limiter closed".to_string()))?;
+        let pool_id = self.resolve_account_pool_id(pool_id, true).await?;
         let mut results = Vec::with_capacity(prepared.len());
 
-        for item in prepared {
-            let exists = existing_by_fingerprint
-                .get(&item.fingerprint)
-                .cloned()
-                .or_else(|| {
+        for chunk in prepared.chunks(IMPORT_ACCOUNTS_WRITE_CHUNK_SIZE) {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let fingerprints = chunk
+                .iter()
+                .map(|item| item.fingerprint.clone())
+                .collect::<Vec<_>>();
+            let mut existing_by_fingerprint =
+                load_import_ids_by_fingerprint_tx(&mut tx, &fingerprints).await?;
+            let legacy_keys = chunk
+                .iter()
+                .filter(|item| !existing_by_fingerprint.contains_key(&item.fingerprint))
+                .filter_map(|item| {
                     let email = item.email_key.as_ref()?;
-                    existing_by_legacy
-                        .get(&(item.legacy_fingerprint.clone(), email.clone()))
-                        .cloned()
-                });
-            if let Some(id) = exists {
-                sqlx::query(
-                    r#"
+                    if item.legacy_fingerprint == item.fingerprint {
+                        return None;
+                    }
+                    Some((item.legacy_fingerprint.clone(), email.clone()))
+                })
+                .collect::<Vec<_>>();
+            let mut existing_by_legacy =
+                load_import_ids_by_legacy_tx(&mut tx, &legacy_keys).await?;
+
+            for item in chunk {
+                let exists = existing_by_fingerprint
+                    .get(&item.fingerprint)
+                    .cloned()
+                    .or_else(|| {
+                        let email = item.email_key.as_ref()?;
+                        existing_by_legacy
+                            .get(&(item.legacy_fingerprint.clone(), email.clone()))
+                            .cloned()
+                    });
+                if let Some(id) = exists {
+                    sqlx::query(
+                        r#"
 UPDATE accounts
 SET pool_id = CASE WHEN redeemed_at IS NULL THEN ? ELSE pool_id END,
     email = ?, name = ?, account_id = ?, plan_type = ?, auth_fingerprint = ?,
@@ -411,94 +426,112 @@ SET pool_id = CASE WHEN redeemed_at IS NULL THEN ? ELSE pool_id END,
     updated_at = ?
 WHERE id = ?
 "#,
-                )
-                .bind(&pool_id)
-                .bind(&item.auth_file.email)
-                .bind(&item.auth_file.name)
-                .bind(
-                    item.auth_file
-                        .account_id
-                        .clone()
-                        .or_else(|| item.auth_file.chatgpt_account_id.clone()),
-                )
-                .bind(
-                    item.auth_file
-                        .plan_type
-                        .clone()
-                        .or_else(|| item.auth_file.chatgpt_plan_type.clone()),
-                )
-                .bind(&item.fingerprint)
-                .bind(&item.ciphertext)
-                .bind(secret_preview(item.auth_file.access_token.as_deref()))
-                .bind(secret_preview(item.auth_file.refresh_token.as_deref()))
-                .bind(item.expires_at)
-                .bind(&item.status)
-                .bind(now)
-                .bind(&id)
-                .execute(&mut *tx)
-                .await?;
-                updated += 1;
-                results.push(ImportAccountResult {
-                    source_index: item.source_index,
-                    id: Some(id),
-                    email: item.auth_file.email,
-                    external_account_id: item.external_account_id,
-                    pool_id: pool_id.clone(),
-                    action: "updated".to_string(),
-                    status: Some(item.status),
-                    error: None,
-                });
-            } else {
-                let id = Uuid::new_v4().to_string();
-                sqlx::query(
-                    r#"
+                    )
+                    .bind(&pool_id)
+                    .bind(&item.auth_file.email)
+                    .bind(&item.auth_file.name)
+                    .bind(
+                        item.auth_file
+                            .account_id
+                            .clone()
+                            .or_else(|| item.auth_file.chatgpt_account_id.clone()),
+                    )
+                    .bind(
+                        item.auth_file
+                            .plan_type
+                            .clone()
+                            .or_else(|| item.auth_file.chatgpt_plan_type.clone()),
+                    )
+                    .bind(&item.fingerprint)
+                    .bind(&item.ciphertext)
+                    .bind(secret_preview(item.auth_file.access_token.as_deref()))
+                    .bind(secret_preview(item.auth_file.refresh_token.as_deref()))
+                    .bind(item.expires_at)
+                    .bind(&item.status)
+                    .bind(now)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                    existing_by_fingerprint
+                        .entry(item.fingerprint.clone())
+                        .or_insert_with(|| id.clone());
+                    if let Some(email) = &item.email_key {
+                        existing_by_legacy
+                            .entry((item.legacy_fingerprint.clone(), email.clone()))
+                            .or_insert_with(|| id.clone());
+                    }
+                    updated += 1;
+                    results.push(ImportAccountResult {
+                        source_index: item.source_index,
+                        id: Some(id),
+                        email: item.auth_file.email.clone(),
+                        external_account_id: item.external_account_id.clone(),
+                        pool_id: pool_id.clone(),
+                        action: "updated".to_string(),
+                        status: Some(item.status.clone()),
+                        error: None,
+                    });
+                } else {
+                    let id = Uuid::new_v4().to_string();
+                    sqlx::query(
+                        r#"
 INSERT INTO accounts (
   id, pool_id, email, name, account_id, plan_type, status, auth_fingerprint,
   auth_file_ciphertext, access_token_preview, refresh_token_preview,
   expires_at, created_at, updated_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
-                )
-                .bind(&id)
-                .bind(&pool_id)
-                .bind(&item.auth_file.email)
-                .bind(&item.auth_file.name)
-                .bind(
-                    item.auth_file
-                        .account_id
-                        .clone()
-                        .or_else(|| item.auth_file.chatgpt_account_id.clone()),
-                )
-                .bind(
-                    item.auth_file
-                        .plan_type
-                        .clone()
-                        .or_else(|| item.auth_file.chatgpt_plan_type.clone()),
-                )
-                .bind(&item.status)
-                .bind(&item.fingerprint)
-                .bind(&item.ciphertext)
-                .bind(secret_preview(item.auth_file.access_token.as_deref()))
-                .bind(secret_preview(item.auth_file.refresh_token.as_deref()))
-                .bind(item.expires_at)
-                .bind(now)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-                imported += 1;
-                results.push(ImportAccountResult {
-                    source_index: item.source_index,
-                    id: Some(id),
-                    email: item.auth_file.email,
-                    external_account_id: item.external_account_id,
-                    pool_id: pool_id.clone(),
-                    action: "imported".to_string(),
-                    status: Some(item.status),
-                    error: None,
-                });
+                    )
+                    .bind(&id)
+                    .bind(&pool_id)
+                    .bind(&item.auth_file.email)
+                    .bind(&item.auth_file.name)
+                    .bind(
+                        item.auth_file
+                            .account_id
+                            .clone()
+                            .or_else(|| item.auth_file.chatgpt_account_id.clone()),
+                    )
+                    .bind(
+                        item.auth_file
+                            .plan_type
+                            .clone()
+                            .or_else(|| item.auth_file.chatgpt_plan_type.clone()),
+                    )
+                    .bind(&item.status)
+                    .bind(&item.fingerprint)
+                    .bind(&item.ciphertext)
+                    .bind(secret_preview(item.auth_file.access_token.as_deref()))
+                    .bind(secret_preview(item.auth_file.refresh_token.as_deref()))
+                    .bind(item.expires_at)
+                    .bind(now)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                    existing_by_fingerprint
+                        .entry(item.fingerprint.clone())
+                        .or_insert_with(|| id.clone());
+                    if let Some(email) = &item.email_key {
+                        existing_by_legacy
+                            .entry((item.legacy_fingerprint.clone(), email.clone()))
+                            .or_insert_with(|| id.clone());
+                    }
+                    imported += 1;
+                    results.push(ImportAccountResult {
+                        source_index: item.source_index,
+                        id: Some(id),
+                        email: item.auth_file.email.clone(),
+                        external_account_id: item.external_account_id.clone(),
+                        pool_id: pool_id.clone(),
+                        action: "imported".to_string(),
+                        status: Some(item.status.clone()),
+                        error: None,
+                    });
+                }
             }
+            tx.commit().await?;
+            tokio::task::yield_now().await;
         }
-        tx.commit().await?;
         Ok(ImportAccountsOutcome {
             imported,
             updated,
@@ -1140,7 +1173,7 @@ INSERT INTO redeem_code_batches (
         let mut seen_hashes = HashSet::new();
         while codes.len() < input.total_count {
             let remaining = input.total_count - codes.len();
-            let target_count = remaining.min(500);
+            let target_count = remaining.min(REDEEM_CODE_INSERT_CHUNK_SIZE);
             let mut candidates = Vec::with_capacity(target_count);
             while candidates.len() < target_count {
                 let formatted = generate_redeem_code();
@@ -3754,6 +3787,19 @@ fn redeem_reservation_cutoff(now: u64) -> i64 {
     now.saturating_sub(REDEEM_RESERVATION_TTL_SECONDS) as i64
 }
 
+fn db_max_connections() -> u32 {
+    let parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(MIN_DB_CONNECTIONS as usize);
+    db_max_connections_for_parallelism(parallelism)
+}
+
+fn db_max_connections_for_parallelism(parallelism: usize) -> u32 {
+    parallelism
+        .saturating_mul(2)
+        .clamp(MIN_DB_CONNECTIONS as usize, MAX_DB_CONNECTIONS as usize) as u32
+}
+
 async fn clear_expired_redeem_reservations_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     reservation_cutoff: i64,
@@ -4228,15 +4274,6 @@ async fn ensure_sqlite_column(
         sqlx::query(alter_sql).execute(pool).await?;
     }
     Ok(())
-}
-
-fn env_u32_clamped(name: &str, fallback: u32, min: u32, max: u32) -> u32 {
-    let Some(raw) = std::env::var(name).ok().filter(|value| !value.is_empty()) else {
-        return fallback;
-    };
-    raw.parse::<u32>()
-        .map(|value| value.clamp(min, max))
-        .unwrap_or(fallback)
 }
 
 fn env_u64_clamped(name: &str, fallback: u64, min: u64, max: u64) -> u64 {
@@ -5340,6 +5377,14 @@ mod tests {
         micros[index] as f64 / 1000.0
     }
 
+    #[test]
+    fn db_pool_size_scales_with_parallelism_with_bounds() {
+        assert_eq!(db_max_connections_for_parallelism(1), MIN_DB_CONNECTIONS);
+        assert_eq!(db_max_connections_for_parallelism(4), MIN_DB_CONNECTIONS);
+        assert_eq!(db_max_connections_for_parallelism(8), 16);
+        assert_eq!(db_max_connections_for_parallelism(128), MAX_DB_CONNECTIONS);
+    }
+
     #[tokio::test]
     async fn import_accounts_returns_per_item_results_for_imports_and_updates() {
         let repo = temp_repo().await;
@@ -5389,6 +5434,25 @@ mod tests {
         assert_eq!(update.results[0].source_index, 0);
         assert_eq!(update.results[0].id.as_deref(), Some(first_id.as_str()));
         assert_eq!(update.results[0].action, "updated");
+    }
+
+    #[tokio::test]
+    async fn import_accounts_handles_duplicates_in_same_upload() {
+        let repo = temp_repo().await;
+        let outcome = repo
+            .import_accounts(&[
+                parsed_account("duplicate-upload", "access-1"),
+                parsed_account("duplicate-upload", "access-2"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(outcome.updated, 1);
+        assert_eq!(outcome.results.len(), 2);
+        assert_eq!(outcome.results[0].action, "imported");
+        assert_eq!(outcome.results[1].action, "updated");
+        assert_eq!(outcome.results[0].id, outcome.results[1].id);
     }
 
     async fn set_account_status(

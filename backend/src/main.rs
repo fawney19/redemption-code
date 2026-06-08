@@ -1947,7 +1947,11 @@ async fn run_redeem_export_chunk(
             )
             .await?;
             if probe_summary.failed > 0 {
-                return Err(ApiError::bad_request("兑换前测活失败，请稍后重试"));
+                tracing::warn!(
+                    checked = probe_summary.checked,
+                    failed = probe_summary.failed,
+                    "redeem preflight probe had task failures; continuing with accounts still marked available"
+                );
             }
         }
         state
@@ -2029,7 +2033,11 @@ async fn run_redeem_after_sale_chunk(
             )
             .await?;
             if probe_summary.failed > 0 {
-                return Err(ApiError::bad_request("售后测活失败，请稍后重试"));
+                tracing::warn!(
+                    checked = probe_summary.checked,
+                    failed = probe_summary.failed,
+                    "after-sale preflight probe had task failures; continuing with current account states"
+                );
             }
         }
         state

@@ -765,16 +765,34 @@ export function toggleAll(event: Event) {
 
 export async function createBatch() {
   await withBusy(async () => {
-    const expiresAt = batchForm.expires_at_text.trim()
-      ? Math.floor(new Date(batchForm.expires_at_text.trim()).getTime() / 1000)
+    adminResult.value = ''
+    generatedCodes.value = ''
+    const totalCount = Math.floor(Number(batchForm.total_count || 1))
+    const accountsPerCode = Math.floor(Number(batchForm.accounts_per_code || 1))
+    const afterSaleLimit = Math.floor(Number(batchForm.after_sale_limit ?? 1))
+    if (!Number.isFinite(totalCount) || totalCount < 1 || totalCount > 10000) {
+      throw new Error('兑换码数量必须是 1..=10000')
+    }
+    if (!Number.isFinite(accountsPerCode) || accountsPerCode < 1 || accountsPerCode > 100) {
+      throw new Error('每码账号数必须是 1..=100')
+    }
+    if (!Number.isFinite(afterSaleLimit) || afterSaleLimit < 0 || afterSaleLimit > 10) {
+      throw new Error('每码售后次数必须是 0..=10')
+    }
+    const rawExpiresAt = batchForm.expires_at_text.trim()
+    const expiresAt = rawExpiresAt
+      ? Math.floor(new Date(rawExpiresAt).getTime() / 1000)
       : null
+    if (rawExpiresAt && !Number.isFinite(expiresAt)) {
+      throw new Error('过期时间无效')
+    }
     const result = await api.createBatch(apiState.value, {
       pool_id: batchForm.pool_id || operationPoolId.value,
       name: batchForm.name || `兑换码批次 ${new Date().toLocaleString()}`,
-      total_count: Number(batchForm.total_count || 1),
-      accounts_per_code: Number(batchForm.accounts_per_code || 1),
-      after_sale_limit: Number(batchForm.after_sale_limit ?? 1),
-      expires_at: Number.isFinite(expiresAt) ? expiresAt : null,
+      total_count: totalCount,
+      accounts_per_code: accountsPerCode,
+      after_sale_limit: afterSaleLimit,
+      expires_at: expiresAt,
       plan_filter: null,
     })
     generatedCodes.value = result.codes.map((c) => c.code).join('\n')

@@ -97,6 +97,11 @@
                           </select>
                         </div>
                       </div>
+                      <div class="code-generator-stock" :class="{ warning: generatorStockLow }">
+                        <span>库存</span>
+                        <strong>需要 {{ batchRequiredAccounts }} / 可兑 {{ generatorPoolAvailable }}</strong>
+                        <small v-if="generatorStockLow">当前号池库存不足，兑换导出会失败</small>
+                      </div>
                     </div>
                   </div>
                   <div class="generated-codes-wrap">
@@ -526,8 +531,10 @@ const {
   selectedBatch,
   selectedBatchStats,
   generatedCodes,
+  adminResult,
   redeemStats,
   activePools,
+  operationPoolId,
   busy,
   apiState,
 } = useAdmin()
@@ -556,6 +563,14 @@ const editBatchForm = reactive({
 const generatedCodePreviewLimit = 200
 const generatedCodeLines = computed(() => generatedCodes.value.split(/\r?\n/).filter(Boolean))
 const generatedCodeCount = computed(() => generatedCodeLines.value.length)
+const generatorPool = computed(() => activePools.value.find((pool) => pool.id === (batchForm.pool_id || operationPoolId.value)) || null)
+const generatorPoolAvailable = computed(() => Number(generatorPool.value?.stats?.available || 0))
+const batchRequiredAccounts = computed(() => {
+  const totalCount = Math.max(0, Math.floor(Number(batchForm.total_count || 0)))
+  const accountsPerCode = Math.max(0, Math.floor(Number(batchForm.accounts_per_code || 0)))
+  return totalCount * accountsPerCode
+})
+const generatorStockLow = computed(() => batchRequiredAccounts.value > generatorPoolAvailable.value)
 const generatedCodesPreview = computed(() => {
   const lines = generatedCodeLines.value
   if (lines.length <= generatedCodePreviewLimit) return generatedCodes.value
@@ -877,6 +892,11 @@ function replaceBatchCode(updated: RedeemCode) {
 async function handleCreateBatch() {
   await createBatch()
   codeGeneratorOpen.value = true
+  if (generatedCodes.value.trim()) {
+    toast.success(`已生成 ${generatedCodeCount.value} 个兑换码`)
+  } else if (adminResult.value.trim()) {
+    toast.error(adminResult.value.trim())
+  }
 }
 
 async function copyGeneratedCodes() {

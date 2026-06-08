@@ -1319,6 +1319,41 @@ button:disabled { cursor: not-allowed; }
   grid-column: 1 / -1;
 }
 
+.code-generator-stock {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 9px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--rounded-md);
+  background: var(--canvas);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.code-generator-stock strong {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.code-generator-stock small {
+  color: #8d3b2e;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+}
+
+.code-generator-stock.warning {
+  border-color: rgba(198, 69, 69, 0.24);
+  background: rgba(198, 69, 69, 0.06);
+}
+
 .code-generator-form-actions {
   grid-column: 9;
   grid-row: 1;
@@ -3026,6 +3061,15 @@ button:disabled { cursor: not-allowed; }
   .code-generator-form-actions .button {
     flex: 1 1 0;
     width: 100%;
+  }
+
+  .code-generator-stock {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .code-generator-stock small {
+    text-align: left;
   }
 
   .redeem-actions {
