@@ -55,7 +55,7 @@ Admin endpoints accept `Authorization: Bearer <AETHER_POOL_ADMIN_TOKEN>` or `x-a
 Pool-aware admin endpoints accept `pool_id` as documented by shape: account list and batch list use query `pool_id`; import, probe, refresh, admin export, and batch creation use JSON `pool_id`. When `pool_id` is omitted, legacy behavior is preserved: account/batch lists are global, while new imports and new batches use the default pool. Registrars can call `GET /api/alalalateam/account-pools?active_only=true` with the admin token to fetch selectable upload pools, then submit `POST /api/alalalateam/accounts/import` with body `{"pool_id":"<pool id>","credentials":"<auth json/text>"}`.
 The admin password is read from `AETHER_POOL_ADMIN_TOKEN`. The API refuses to start when it is empty or still set to a known example value.
 Cross-origin browser access is controlled by `AETHER_POOL_CORS_ORIGINS`. Same-origin deployments should leave it empty because the Rust server serves both the frontend and `/api`. Separate-origin deployments should set it to the frontend origin, for example `https://pool.example.com`.
-Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`.
+Public redeem rate limiting uses the socket peer IP by default. Set `AETHER_POOL_TRUST_PROXY_HEADERS=1` only when a trusted reverse proxy strips client-supplied forwarding headers and injects `x-forwarded-for`, `x-real-ip`, or `cf-connecting-ip`. Async redeem jobs are queued before they run: `AETHER_POOL_MAX_QUEUED_REDEEM_JOBS` defaults to `64`, `AETHER_POOL_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT` defaults to `4`, `AETHER_POOL_MAX_ACTIVE_REDEEM_JOBS` defaults to `8`, and `AETHER_POOL_MAX_ACTIVE_REDEEM_JOBS_PER_CLIENT` defaults to `2` so one source cannot occupy every running slot. Network refresh/probe work is also capped globally by `AETHER_POOL_REDEEM_NETWORK_CONCURRENCY`, defaulting to `128`.
 OAuth refresh defaults to ChatGPT (`AETHER_POOL_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann`, `AETHER_POOL_OAUTH_TOKEN_URL=https://auth.openai.com/oauth/token`), so those environment variables can be omitted unless you need to override them.
 
 The public web entry is `/` and only shows the redeem/export page. The management console is available at `/act` and is not linked from the public page.
@@ -144,6 +144,10 @@ SQLite schema upgrades are applied automatically at API startup. Current upgrade
 ```bash
 cd redemption-code
 cargo test
+# Optional targeted async redeem job queue stress test.
+make test-stress-jobs
+# Optional mocked end-to-end redeem chain stress test, including probe network calls.
+make test-stress-redeem-chain
 cargo fmt --all -- --check
 RUSTC_WRAPPER= cargo clippy --all-targets --all-features -- -D warnings
 

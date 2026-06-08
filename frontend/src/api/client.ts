@@ -177,6 +177,11 @@ export interface RedeemJob {
   account_count: number
   network_total: number
   network_done: number
+  queue_position?: number | null
+  network_capacity?: {
+    configured: number
+    available: number
+  }
   message?: string | null
   error?: string | null
   result?: RedeemExportResponse | null

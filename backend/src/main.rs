@@ -29,7 +29,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::{Client, Proxy};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
@@ -39,11 +39,16 @@ use uuid::Uuid;
 const MAX_JSON_BODY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_REDEEM_CODES_PER_REQUEST: usize = 10_000;
 const MAX_REDEEM_ACCOUNTS_PER_REQUEST: usize = 100_000;
-const DEFAULT_MAX_ACTIVE_REDEEM_JOBS: usize = 4;
+const DEFAULT_MAX_ACTIVE_REDEEM_JOBS: usize = 8;
+const DEFAULT_MAX_ACTIVE_REDEEM_JOBS_PER_CLIENT: usize = 2;
+const DEFAULT_MAX_QUEUED_REDEEM_JOBS: usize = 64;
+const DEFAULT_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT: usize = 4;
+const DEFAULT_REDEEM_NETWORK_CONCURRENCY: usize = 128;
 const MAX_COMPLETED_REDEEM_JOBS: usize = 12;
 const DEFAULT_REDEEM_JOB_CHUNK_SIZE: usize = 500;
 const REDEEM_JOB_RETENTION_SECONDS: u64 = 60 * 60;
 const REDEEM_JOB_PRUNE_INTERVAL_SECONDS: u64 = 60;
+const REDEEM_JOB_QUEUE_POLL_MS: u64 = 350;
 const DEFAULT_REDEEM_PROBE_CONCURRENCY: usize = 16;
 const DEFAULT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -70,6 +75,7 @@ struct AppState {
     auto_probe_lock: Arc<Mutex<()>>,
     redeem_rate_limiter: Arc<Mutex<RedeemRateLimiter>>,
     redeem_jobs: Arc<Mutex<HashMap<String, RedeemJob>>>,
+    redeem_network_limiter: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -123,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         auto_probe_lock: Arc::new(Mutex::new(())),
         redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
         redeem_jobs: Arc::new(Mutex::new(HashMap::new())),
+        redeem_network_limiter: Arc::new(Semaphore::new(redeem_network_concurrency())),
     };
 
     let _auto_probe_worker = spawn_auto_probe_worker(state.clone());
@@ -168,6 +175,47 @@ fn max_active_redeem_jobs() -> usize {
         DEFAULT_MAX_ACTIVE_REDEEM_JOBS,
         1,
         16,
+    )
+}
+
+fn max_active_redeem_jobs_per_client() -> usize {
+    env_usize_clamped(
+        "AETHER_POOL_MAX_ACTIVE_REDEEM_JOBS_PER_CLIENT",
+        DEFAULT_MAX_ACTIVE_REDEEM_JOBS_PER_CLIENT,
+        1,
+        16,
+    )
+    .min(max_active_redeem_jobs())
+    .max(1)
+}
+
+fn max_queued_redeem_jobs() -> usize {
+    env_usize_clamped(
+        "AETHER_POOL_MAX_QUEUED_REDEEM_JOBS",
+        DEFAULT_MAX_QUEUED_REDEEM_JOBS,
+        1,
+        1024,
+    )
+    .max(max_active_redeem_jobs())
+}
+
+fn max_queued_redeem_jobs_per_client() -> usize {
+    env_usize_clamped(
+        "AETHER_POOL_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT",
+        DEFAULT_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT,
+        1,
+        256,
+    )
+    .max(max_active_redeem_jobs_per_client())
+    .min(max_queued_redeem_jobs())
+}
+
+fn redeem_network_concurrency() -> usize {
+    env_usize_clamped(
+        "AETHER_POOL_REDEEM_NETWORK_CONCURRENCY",
+        DEFAULT_REDEEM_NETWORK_CONCURRENCY,
+        1,
+        1024,
     )
 }
 
@@ -1120,6 +1168,7 @@ impl RedeemJobKind {
 #[derive(Debug, Clone)]
 struct RedeemJob {
     id: String,
+    client_key: String,
     kind: RedeemJobKind,
     format: ExportFormat,
     status: String,
@@ -1276,18 +1325,20 @@ async fn start_redeem_job(
     format: String,
     kind: RedeemJobKind,
 ) -> Result<Json<Value>, ApiError> {
-    enforce_redeem_rate_limit(&state, &headers, peer_ip).await?;
+    let client_key = enforce_redeem_rate_limit(&state, &headers, peer_ip).await?;
     validate_redeem_export_limits(codes.len(), 0)?;
     let format = format
         .parse::<ExportFormat>()
         .map_err(|_| ApiError::bad_request("unsupported export format"))?;
+    prune_redeem_jobs(&state).await;
+    ensure_redeem_queue_capacity(&state, &client_key).await?;
     let estimated_account_count = estimate_redeem_job_account_count(&state, kind, &codes).await?;
     validate_redeem_export_limits(codes.len(), estimated_account_count)?;
-    prune_redeem_jobs(&state).await;
     let job_id = Uuid::new_v4().to_string();
     let now = unix_now_secs();
     let job = RedeemJob {
         id: job_id.clone(),
+        client_key: client_key.clone(),
         kind,
         format,
         status: "queued".to_string(),
@@ -1298,7 +1349,7 @@ async fn start_redeem_job(
         account_count: 0,
         network_total: 0,
         network_done: 0,
-        message: Some("任务已提交".to_string()),
+        message: Some("任务已提交，等待运行槽".to_string()),
         error: None,
         result: None,
         created_at: now,
@@ -1307,14 +1358,21 @@ async fn start_redeem_job(
     };
     {
         let mut jobs = state.redeem_jobs.lock().await;
-        let active_count = jobs.values().filter(|job| job.is_active()).count();
-        let max_active_jobs = max_active_redeem_jobs();
-        if active_count >= max_active_jobs {
+        let counts = redeem_job_counts(&jobs, &client_key);
+        let max_queued_jobs = max_queued_redeem_jobs();
+        let max_queued_jobs_per_client = max_queued_redeem_jobs_per_client();
+        if counts.queued_or_running_for_client >= max_queued_jobs_per_client {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
-                    "too many redeem jobs are running; try again after one finishes (limit {max_active_jobs})"
+                    "当前来源已有 {max_queued_jobs_per_client} 个兑换任务在运行或排队，请等待一个任务完成后再试"
                 ),
+            ));
+        }
+        if counts.queued_or_running >= max_queued_jobs {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("兑换任务队列已满 {max_queued_jobs}，请稍后再试"),
             ));
         }
         jobs.insert(job_id.clone(), job);
@@ -1343,11 +1401,9 @@ async fn get_redeem_job(
 }
 
 async fn run_redeem_job(state: AppState, job_id: String, raw_codes: Vec<String>) {
-    update_redeem_job(&state, &job_id, |job| {
-        job.status = "running".to_string();
-        job.message = Some("正在兑换".to_string());
-    })
-    .await;
+    if !wait_for_redeem_run_slot(&state, &job_id).await {
+        return;
+    }
 
     let (codes, initial_failures) = normalize_redeem_job_codes(raw_codes);
     let initial_failure_count = initial_failures.len();
@@ -1478,6 +1534,135 @@ impl RedeemJob {
     fn is_active(&self) -> bool {
         matches!(self.status.as_str(), "queued" | "running")
     }
+
+    fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RedeemJobCounts {
+    queued_or_running: usize,
+    queued_or_running_for_client: usize,
+    running: usize,
+    running_for_client: usize,
+}
+
+fn redeem_job_counts(jobs: &HashMap<String, RedeemJob>, client_key: &str) -> RedeemJobCounts {
+    let mut counts = RedeemJobCounts::default();
+    for job in jobs.values() {
+        if job.is_active() {
+            counts.queued_or_running += 1;
+            if job.client_key == client_key {
+                counts.queued_or_running_for_client += 1;
+            }
+        }
+        if job.is_running() {
+            counts.running += 1;
+            if job.client_key == client_key {
+                counts.running_for_client += 1;
+            }
+        }
+    }
+    counts
+}
+
+fn redeem_job_queue_position(jobs: &HashMap<String, RedeemJob>, job_id: &str) -> Option<usize> {
+    let job = jobs.get(job_id)?;
+    if job.status != "queued" {
+        return Some(0);
+    }
+    let mut queued = jobs
+        .values()
+        .filter(|item| item.status == "queued")
+        .collect::<Vec<_>>();
+    queued.sort_by_key(|item| (item.created_at, item.id.as_str()));
+    queued
+        .iter()
+        .position(|item| item.id == job_id)
+        .map(|index| index + 1)
+}
+
+fn can_start_redeem_job(counts: &RedeemJobCounts) -> bool {
+    counts.running < max_active_redeem_jobs()
+        && counts.running_for_client < max_active_redeem_jobs_per_client()
+}
+
+async fn ensure_redeem_queue_capacity(state: &AppState, client_key: &str) -> Result<(), ApiError> {
+    let jobs = state.redeem_jobs.lock().await;
+    let counts = redeem_job_counts(&jobs, client_key);
+    let max_queued_jobs = max_queued_redeem_jobs();
+    let max_queued_jobs_per_client = max_queued_redeem_jobs_per_client();
+    if counts.queued_or_running_for_client >= max_queued_jobs_per_client {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "当前来源已有 {max_queued_jobs_per_client} 个兑换任务在运行或排队，请等待一个任务完成后再试"
+            ),
+        ));
+    }
+    if counts.queued_or_running >= max_queued_jobs {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("兑换任务队列已满 {max_queued_jobs}，请稍后再试"),
+        ));
+    }
+    Ok(())
+}
+
+async fn wait_for_redeem_run_slot(state: &AppState, job_id: &str) -> bool {
+    loop {
+        {
+            let mut jobs = state.redeem_jobs.lock().await;
+            let Some(client_key) = jobs.get(job_id).map(|job| job.client_key.clone()) else {
+                return false;
+            };
+            let counts = redeem_job_counts(&jobs, &client_key);
+            if can_start_redeem_job(&counts) {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if job.status != "queued" {
+                        return job.status == "running";
+                    }
+                    job.status = "running".to_string();
+                    job.message = Some("正在兑换".to_string());
+                    job.updated_at = unix_now_secs();
+                    return true;
+                }
+                return false;
+            }
+            let position = redeem_job_queue_position(&jobs, job_id).unwrap_or(0);
+            if let Some(job) = jobs.get_mut(job_id) {
+                if job.status != "queued" {
+                    return job.status == "running";
+                }
+                job.message = Some(if position > 0 {
+                    format!("正在排队，前方还有 {} 个任务", position.saturating_sub(1))
+                } else {
+                    "正在排队，等待运行槽".to_string()
+                });
+                job.updated_at = unix_now_secs();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(REDEEM_JOB_QUEUE_POLL_MS)).await;
+    }
+}
+
+async fn acquire_redeem_network_permit(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    state
+        .redeem_network_limiter
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::bad_request("网络并发控制器已关闭"))
+}
+
+fn redeem_network_capacity_snapshot(state: &AppState) -> Value {
+    json!({
+        "configured": redeem_network_concurrency(),
+        "available": state.redeem_network_limiter.available_permits(),
+    })
 }
 
 async fn estimate_redeem_job_account_count(
@@ -1551,7 +1736,16 @@ async fn prune_redeem_jobs(state: &AppState) {
 }
 
 async fn redeem_job_json(state: &AppState, job_id: &str) -> Option<Value> {
-    let job = state.redeem_jobs.lock().await.get(job_id).cloned()?;
+    let (job, queue_position) = {
+        let jobs = state.redeem_jobs.lock().await;
+        let job = jobs.get(job_id).cloned()?;
+        let queue_position = if job.status == "queued" {
+            redeem_job_queue_position(&jobs, job_id)
+        } else {
+            None
+        };
+        (job, queue_position)
+    };
     let progress = if job.total_codes == 0 {
         0
     } else {
@@ -1579,6 +1773,8 @@ async fn redeem_job_json(state: &AppState, job_id: &str) -> Option<Value> {
         "account_count": job.account_count,
         "network_total": job.network_total,
         "network_done": job.network_done,
+        "queue_position": queue_position,
+        "network_capacity": redeem_network_capacity_snapshot(state),
         "message": job.message,
         "error": job.error,
         "created_at": job.created_at,
@@ -2041,6 +2237,7 @@ async fn run_probe_accounts_with_progress(
         let probe_settings = probe_settings.clone();
         let cpa_management_key = cpa_management_key.clone();
         join_set.spawn(async move {
+            let _network_permit = acquire_redeem_network_permit(&state).await?;
             probe_one_account(
                 state,
                 account,
@@ -3531,14 +3728,15 @@ async fn enforce_redeem_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     peer_ip: IpAddr,
-) -> Result<(), ApiError> {
+) -> Result<String, ApiError> {
     let settings = state.repo.get_redeem_rate_limit_settings().await?;
-    if !settings.enabled {
-        return Ok(());
-    }
     let ip = redeem_rate_limit_client_ip(headers, peer_ip, state.trust_proxy_headers);
+    let client_key = redeem_job_client_key(&ip);
+    if !settings.enabled {
+        return Ok(client_key);
+    }
     if redeem_rate_limit_ip_whitelisted(&ip, &settings.whitelist_ips) {
-        return Ok(());
+        return Ok(client_key);
     }
     match state
         .redeem_rate_limiter
@@ -3546,7 +3744,7 @@ async fn enforce_redeem_rate_limit(
         .await
         .check(&ip, &settings, unix_now_secs())
     {
-        RateLimitDecision::Allowed => Ok(()),
+        RateLimitDecision::Allowed => Ok(client_key),
         RateLimitDecision::Denied {
             retry_after_seconds,
         } => Err(ApiError::new(
@@ -3554,6 +3752,10 @@ async fn enforce_redeem_rate_limit(
             format!("兑换请求过于频繁，请 {retry_after_seconds} 秒后重试"),
         )),
     }
+}
+
+fn redeem_job_client_key(ip: &str) -> String {
+    format!("ip:{ip}")
 }
 
 fn redeem_rate_limit_client_ip(
@@ -3665,6 +3867,7 @@ async fn refresh_expired_accounts_with_progress(
         let refresh_proxy = refresh_proxy.clone();
         join_set.spawn(async move {
             let account_id = summary.id;
+            let _network_permit = acquire_redeem_network_permit(&state).await?;
             match refresh_codex_auth_file_with_client(&state, &refresh_http, &auth_file).await {
                 Ok(refreshed) => {
                     state
@@ -3822,6 +4025,7 @@ mod tests {
     struct MockResponse {
         status: u16,
         body: String,
+        delay_ms: u64,
     }
 
     impl MockResponse {
@@ -3829,6 +4033,7 @@ mod tests {
             Self {
                 status,
                 body: body.to_string(),
+                delay_ms: 0,
             }
         }
     }
@@ -3845,6 +4050,9 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_mock_request(&mut stream).await;
                 server_records.lock().await.push(request);
+                if response.delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
+                }
                 let reason = match response.status {
                     200 => "OK",
                     400 => "Bad Request",
@@ -3861,6 +4069,54 @@ mod tests {
                     response.body
                 );
                 stream.write_all(raw_response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}"), records)
+    }
+
+    async fn spawn_redeem_chain_mock_http(
+        response_count: usize,
+        wham_delay_ms: u64,
+    ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let server_records = records.clone();
+        tokio::spawn(async move {
+            let mut handles = Vec::with_capacity(response_count);
+            for _ in 0..response_count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let server_records = server_records.clone();
+                handles.push(tokio::spawn(async move {
+                    let request = read_mock_request(&mut stream).await;
+                    let (status, body, delay_ms) = if request.path == "/oauth/token" {
+                        (
+                            200,
+                            json!({
+                                "access_token": "mock-refreshed-access-token",
+                                "refresh_token": "mock-refreshed-refresh-token",
+                                "expires_in": 3600
+                            })
+                            .to_string(),
+                            0,
+                        )
+                    } else {
+                        (200, json!({}).to_string(), wham_delay_ms)
+                    };
+                    server_records.lock().await.push(request);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let raw_response = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(raw_response.as_bytes()).await.unwrap();
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
             }
         });
         (format!("http://{address}"), records)
@@ -3941,6 +4197,116 @@ mod tests {
             auto_probe_lock: Arc::new(Mutex::new(())),
             redeem_rate_limiter: Arc::new(Mutex::new(RedeemRateLimiter::default())),
             redeem_jobs: Arc::new(Mutex::new(HashMap::new())),
+            redeem_network_limiter: Arc::new(Semaphore::new(redeem_network_concurrency())),
+        }
+    }
+
+    fn test_redeem_job(id: &str, client_key: &str, status: &str) -> RedeemJob {
+        RedeemJob {
+            id: id.to_string(),
+            client_key: client_key.to_string(),
+            kind: RedeemJobKind::Redeem,
+            format: ExportFormat::Cpa,
+            status: status.to_string(),
+            total_codes: 1,
+            processed_codes: 0,
+            success_count: 0,
+            failure_count: 0,
+            account_count: 0,
+            network_total: 0,
+            network_done: 0,
+            message: None,
+            error: None,
+            result: None,
+            created_at: 0,
+            updated_at: 0,
+            finished_at: None,
+        }
+    }
+
+    fn test_parsed_account(account_id: &str, access_token: &str) -> crate::domain::ParsedAccount {
+        test_parsed_account_with_expiry(account_id, access_token, 2_000_000_000)
+    }
+
+    fn test_expired_parsed_account(
+        account_id: &str,
+        access_token: &str,
+    ) -> crate::domain::ParsedAccount {
+        test_parsed_account_with_expiry(account_id, access_token, 1)
+    }
+
+    fn test_parsed_account_with_expiry(
+        account_id: &str,
+        access_token: &str,
+        expires_at: u64,
+    ) -> crate::domain::ParsedAccount {
+        crate::domain::ParsedAccount {
+            source: "test".to_string(),
+            auth_file: CodexAuthFile {
+                kind: Some("codex".to_string()),
+                account_id: Some(account_id.to_string()),
+                chatgpt_account_id: Some(account_id.to_string()),
+                email: Some(format!("{account_id}@example.com")),
+                name: Some(account_id.to_string()),
+                plan_type: Some("plus".to_string()),
+                chatgpt_plan_type: Some("plus".to_string()),
+                access_token: Some(access_token.to_string()),
+                refresh_token: Some(format!("refresh-{account_id}")),
+                expires_at: Some(json!(expires_at)),
+                ..CodexAuthFile::default()
+            },
+        }
+    }
+
+    fn stress_env_usize(name: &str, fallback: usize, min: usize, max: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(min, max))
+            .unwrap_or(fallback)
+    }
+
+    async fn wait_for_completed_redeem_jobs(
+        state: &AppState,
+        job_ids: &[String],
+        timeout: Duration,
+    ) -> Vec<Value> {
+        let started = Instant::now();
+        loop {
+            let mut jobs = Vec::with_capacity(job_ids.len());
+            let mut completed = 0;
+            for job_id in job_ids {
+                let job = redeem_job_json(state, job_id)
+                    .await
+                    .unwrap_or_else(|| panic!("redeem job {job_id} disappeared"));
+                let status = job.get("status").and_then(Value::as_str).unwrap_or("");
+                if status == "failed" {
+                    panic!("redeem job {job_id} failed: {job:?}");
+                }
+                if status == "completed" {
+                    completed += 1;
+                }
+                jobs.push(job);
+            }
+            if completed == job_ids.len() {
+                return jobs;
+            }
+            if started.elapsed() >= timeout {
+                let status_counts = jobs.iter().fold(HashMap::new(), |mut counts, job| {
+                    let status = job
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    *counts.entry(status).or_insert(0_usize) += 1;
+                    counts
+                });
+                panic!(
+                    "timed out waiting for redeem jobs: completed={completed}/{} statuses={status_counts:?}",
+                    job_ids.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -4440,6 +4806,411 @@ mod tests {
         assert_eq!(
             redeem_rate_limit_client_ip(&headers, peer_ip, true),
             "203.0.113.10"
+        );
+    }
+
+    #[test]
+    fn redeem_job_concurrency_defaults_leave_capacity_for_other_clients() {
+        assert_eq!(DEFAULT_MAX_ACTIVE_REDEEM_JOBS, 8);
+        assert_eq!(DEFAULT_MAX_ACTIVE_REDEEM_JOBS_PER_CLIENT, 2);
+        assert_eq!(DEFAULT_MAX_QUEUED_REDEEM_JOBS, 64);
+        assert_eq!(DEFAULT_MAX_QUEUED_REDEEM_JOBS_PER_CLIENT, 4);
+        assert_eq!(DEFAULT_REDEEM_NETWORK_CONCURRENCY, 128);
+    }
+
+    #[test]
+    fn redeem_job_counts_track_queue_and_running_client_slots() {
+        let client_a = redeem_job_client_key("203.0.113.10");
+        let client_b = redeem_job_client_key("198.51.100.20");
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "queued-a".to_string(),
+            test_redeem_job("queued-a", &client_a, "queued"),
+        );
+        jobs.insert(
+            "running-a".to_string(),
+            test_redeem_job("running-a", &client_a, "running"),
+        );
+        jobs.insert(
+            "running-b".to_string(),
+            test_redeem_job("running-b", &client_b, "running"),
+        );
+        jobs.insert(
+            "completed-a".to_string(),
+            test_redeem_job("completed-a", &client_a, "completed"),
+        );
+
+        assert_eq!(
+            redeem_job_counts(&jobs, &client_a),
+            RedeemJobCounts {
+                queued_or_running: 3,
+                queued_or_running_for_client: 2,
+                running: 2,
+                running_for_client: 1,
+            }
+        );
+        assert_eq!(
+            redeem_job_counts(&jobs, &client_b),
+            RedeemJobCounts {
+                queued_or_running: 3,
+                queued_or_running_for_client: 1,
+                running: 2,
+                running_for_client: 1,
+            }
+        );
+        assert_eq!(redeem_job_queue_position(&jobs, "queued-a"), Some(1));
+        assert_eq!(redeem_job_queue_position(&jobs, "running-a"), Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "run with make test-stress-jobs or make test-stress-high"]
+    async fn stress_high_redeem_job_queue_completes_many_async_jobs() {
+        let jobs_per_client_limit = max_queued_redeem_jobs_per_client();
+        let queue_limit = max_queued_redeem_jobs();
+        let jobs_per_client = stress_env_usize(
+            "AETHER_JOB_STRESS_JOBS_PER_CLIENT",
+            jobs_per_client_limit.min(4),
+            1,
+            jobs_per_client_limit,
+        );
+        let max_clients_by_queue = (queue_limit / jobs_per_client).max(1);
+        let client_count = stress_env_usize(
+            "AETHER_JOB_STRESS_CLIENTS",
+            max_clients_by_queue.min(16),
+            1,
+            max_clients_by_queue,
+        );
+        let codes_per_job = stress_env_usize("AETHER_JOB_STRESS_CODES_PER_JOB", 10, 1, 1_000);
+        let timeout_seconds =
+            stress_env_usize("AETHER_JOB_STRESS_TIMEOUT_SECONDS", 30, 1, 600) as u64;
+        let min_jobs_per_sec =
+            stress_env_usize("AETHER_JOB_STRESS_MIN_JOBS_PER_SEC", 5, 1, usize::MAX) as f64;
+        let job_count = client_count * jobs_per_client;
+        let code_count = job_count * codes_per_job;
+
+        let mut state = test_state("http://127.0.0.1:1").await;
+        state.skip_redeem_probe = true;
+        let accounts = (0..code_count)
+            .map(|index| {
+                test_parsed_account(
+                    &format!("job-stress-account-{index:06}"),
+                    &format!("job-stress-access-{index:06}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let import_outcome = state.repo.import_accounts(&accounts).await.unwrap();
+        assert_eq!(import_outcome.imported, code_count);
+        let batch = state
+            .repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "async redeem job queue stress".to_string(),
+                total_count: code_count,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let chunks = batch
+            .codes
+            .chunks(codes_per_job)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|created| created.code.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), job_count);
+
+        let submit_started = Instant::now();
+        let mut submit_handles = Vec::with_capacity(job_count);
+        for (index, codes) in chunks.into_iter().enumerate() {
+            let state = state.clone();
+            submit_handles.push(tokio::spawn(async move {
+                let client_index = index % client_count;
+                let peer_ip = format!("10.0.{}.{}", client_index / 250, client_index % 250 + 1)
+                    .parse::<IpAddr>()
+                    .unwrap();
+                let Json(payload) = start_redeem_job(
+                    state,
+                    HeaderMap::new(),
+                    peer_ip,
+                    codes,
+                    "sub2api".to_string(),
+                    RedeemJobKind::Redeem,
+                )
+                .await
+                .unwrap();
+                let job = payload.get("job").expect("job");
+                let job_id = job
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .expect("job id")
+                    .to_string();
+                let queue_position = job
+                    .get("queue_position")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                (job_id, queue_position)
+            }));
+        }
+        let mut job_ids = Vec::with_capacity(job_count);
+        let mut max_initial_queue_position = 0_u64;
+        for handle in submit_handles {
+            let (job_id, queue_position) = handle.await.unwrap();
+            max_initial_queue_position = max_initial_queue_position.max(queue_position);
+            job_ids.push(job_id);
+        }
+        let submit_elapsed = submit_started.elapsed();
+
+        let run_started = Instant::now();
+        let jobs =
+            wait_for_completed_redeem_jobs(&state, &job_ids, Duration::from_secs(timeout_seconds))
+                .await;
+        let run_elapsed = run_started.elapsed();
+        let total_elapsed = submit_started.elapsed();
+        let jobs_per_sec = job_count as f64 / total_elapsed.as_secs_f64();
+
+        let mut success_count = 0_u64;
+        let mut failure_count = 0_u64;
+        for job in &jobs {
+            success_count += job
+                .get("success_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            failure_count += job
+                .get("failure_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+        }
+        assert_eq!(success_count, code_count as u64);
+        assert_eq!(failure_count, 0);
+
+        let redeemed_accounts: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM accounts WHERE redeemed_at IS NOT NULL",
+        )
+        .fetch_one(state.repo.pool())
+        .await
+        .unwrap()
+        .0;
+        let redemptions: i64 =
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM redeem_redemptions")
+                .fetch_one(state.repo.pool())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(redeemed_accounts, code_count as i64);
+        assert_eq!(redemptions, code_count as i64);
+        assert!(
+            jobs_per_sec >= min_jobs_per_sec,
+            "async job throughput {jobs_per_sec:.1} jobs/s is below required {min_jobs_per_sec:.1} jobs/s"
+        );
+        eprintln!(
+            "async-job-stress: clients={client_count} jobs_per_client={jobs_per_client} jobs={job_count} codes_per_job={codes_per_job} codes={code_count} submit={:.3}s run={:.3}s total={:.3}s throughput={jobs_per_sec:.1} jobs/s max_initial_queue_position={max_initial_queue_position}",
+            submit_elapsed.as_secs_f64(),
+            run_elapsed.as_secs_f64(),
+            total_elapsed.as_secs_f64(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "run with make test-stress-redeem-chain"]
+    async fn stress_high_redeem_chain_with_mocked_network() {
+        let jobs_per_client_limit = max_queued_redeem_jobs_per_client();
+        let queue_limit = max_queued_redeem_jobs();
+        let jobs_per_client = stress_env_usize(
+            "AETHER_CHAIN_STRESS_JOBS_PER_CLIENT",
+            jobs_per_client_limit.min(4),
+            1,
+            jobs_per_client_limit,
+        );
+        let max_clients_by_queue = (queue_limit / jobs_per_client).max(1);
+        let client_count = stress_env_usize(
+            "AETHER_CHAIN_STRESS_CLIENTS",
+            max_clients_by_queue.min(16),
+            1,
+            max_clients_by_queue,
+        );
+        let codes_per_job = stress_env_usize("AETHER_CHAIN_STRESS_CODES_PER_JOB", 10, 1, 500);
+        let mock_delay_ms =
+            stress_env_usize("AETHER_CHAIN_STRESS_MOCK_DELAY_MS", 5, 0, 10_000) as u64;
+        let timeout_seconds =
+            stress_env_usize("AETHER_CHAIN_STRESS_TIMEOUT_SECONDS", 120, 1, 900) as u64;
+        let min_jobs_per_sec =
+            stress_env_usize("AETHER_CHAIN_STRESS_MIN_JOBS_PER_SEC", 2, 1, usize::MAX) as f64;
+        let expired_percent = stress_env_usize("AETHER_CHAIN_STRESS_EXPIRED_PERCENT", 100, 0, 100);
+        let job_count = client_count * jobs_per_client;
+        let code_count = job_count * codes_per_job;
+        let expected_probe_requests = code_count * 2;
+        let expired_account_count = (expected_probe_requests * expired_percent) / 100;
+        let max_mock_requests = expected_probe_requests + expired_account_count;
+
+        let (base_url, records) =
+            spawn_redeem_chain_mock_http(max_mock_requests, mock_delay_ms).await;
+        let mut state = test_state(&base_url).await;
+        state.skip_redeem_probe = false;
+        let accounts = (0..expected_probe_requests)
+            .map(|index| {
+                if index < expired_account_count {
+                    test_expired_parsed_account(
+                        &format!("chain-stress-account-{index:06}"),
+                        &format!("chain-stress-access-{index:06}"),
+                    )
+                } else {
+                    test_parsed_account(
+                        &format!("chain-stress-account-{index:06}"),
+                        &format!("chain-stress-access-{index:06}"),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let import_outcome = state.repo.import_accounts(&accounts).await.unwrap();
+        assert_eq!(import_outcome.imported, expected_probe_requests);
+        let batch = state
+            .repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "mocked full redeem chain stress".to_string(),
+                total_count: code_count,
+                accounts_per_code: 1,
+                after_sale_limit: None,
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let chunks = batch
+            .codes
+            .chunks(codes_per_job)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|created| created.code.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), job_count);
+
+        let submit_started = Instant::now();
+        let mut submit_handles = Vec::with_capacity(job_count);
+        for (index, codes) in chunks.into_iter().enumerate() {
+            let state = state.clone();
+            submit_handles.push(tokio::spawn(async move {
+                let client_index = index % client_count;
+                let peer_ip = format!("10.1.{}.{}", client_index / 250, client_index % 250 + 1)
+                    .parse::<IpAddr>()
+                    .unwrap();
+                let Json(payload) = start_redeem_job(
+                    state,
+                    HeaderMap::new(),
+                    peer_ip,
+                    codes,
+                    "sub2api".to_string(),
+                    RedeemJobKind::Redeem,
+                )
+                .await
+                .unwrap();
+                let job = payload.get("job").expect("job");
+                job.get("id")
+                    .and_then(Value::as_str)
+                    .expect("job id")
+                    .to_string()
+            }));
+        }
+        let mut job_ids = Vec::with_capacity(job_count);
+        for handle in submit_handles {
+            job_ids.push(handle.await.unwrap());
+        }
+        let submit_elapsed = submit_started.elapsed();
+
+        let run_started = Instant::now();
+        let jobs =
+            wait_for_completed_redeem_jobs(&state, &job_ids, Duration::from_secs(timeout_seconds))
+                .await;
+        let run_elapsed = run_started.elapsed();
+        let total_elapsed = submit_started.elapsed();
+        let jobs_per_sec = job_count as f64 / total_elapsed.as_secs_f64();
+
+        let mut success_count = 0_u64;
+        let mut failure_count = 0_u64;
+        let mut network_total = 0_u64;
+        let mut network_done = 0_u64;
+        for job in &jobs {
+            success_count += job
+                .get("success_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            failure_count += job
+                .get("failure_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            network_total += job
+                .get("network_total")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            network_done += job
+                .get("network_done")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+        }
+        assert_eq!(success_count, code_count as u64);
+        assert_eq!(failure_count, 0);
+
+        let redeemed_accounts: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM accounts WHERE redeemed_at IS NOT NULL",
+        )
+        .fetch_one(state.repo.pool())
+        .await
+        .unwrap()
+        .0;
+        let redemptions: i64 =
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM redeem_redemptions")
+                .fetch_one(state.repo.pool())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(redeemed_accounts, code_count as i64);
+        assert_eq!(redemptions, code_count as i64);
+        let records = records.lock().await;
+        let refresh_requests = records
+            .iter()
+            .filter(|request| request.path == "/oauth/token")
+            .count();
+        let probe_requests = records
+            .iter()
+            .filter(|request| request.path == "/backend-api/wham/usage")
+            .count();
+        assert_eq!(probe_requests, expected_probe_requests);
+        if expired_percent == 0 {
+            assert_eq!(refresh_requests, 0);
+        } else {
+            assert!(refresh_requests > 0, "expected refresh requests");
+            assert!(
+                refresh_requests <= expired_account_count,
+                "refresh requests {refresh_requests} exceeded expired account count {expired_account_count}"
+            );
+        }
+        let actual_network_requests = (refresh_requests + probe_requests) as u64;
+        assert_eq!(network_total, actual_network_requests);
+        assert_eq!(network_done, actual_network_requests);
+        assert!(records.iter().all(|request| {
+            (request.method == "POST" && request.path == "/oauth/token")
+                || (request.method == "GET" && request.path == "/backend-api/wham/usage")
+        }));
+        assert!(records
+            .iter()
+            .filter(|request| request.path == "/oauth/token")
+            .all(|request| request.body.contains("grant_type=refresh_token")));
+        assert!(
+            jobs_per_sec >= min_jobs_per_sec,
+            "full chain throughput {jobs_per_sec:.1} jobs/s is below required {min_jobs_per_sec:.1} jobs/s"
+        );
+        eprintln!(
+            "redeem-chain-stress: clients={client_count} jobs_per_client={jobs_per_client} jobs={job_count} codes_per_job={codes_per_job} codes={code_count} refresh_requests={refresh_requests} probe_requests={probe_requests} expired_percent={expired_percent} mock_delay_ms={mock_delay_ms} submit={:.3}s run={:.3}s total={:.3}s throughput={jobs_per_sec:.1} jobs/s",
+            submit_elapsed.as_secs_f64(),
+            run_elapsed.as_secs_f64(),
+            total_elapsed.as_secs_f64(),
         );
     }
 
