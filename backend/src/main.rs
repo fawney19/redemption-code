@@ -18,7 +18,7 @@ use crate::domain::{
 use crate::repository::{
     AccountListQuery, AccountPoolRepository, AccountPoolUpsertInput, AccountSummary,
     AutoProbeSettings, CreateRedeemBatchInput, DataError, RedeemExportOutcome, RedeemFailure,
-    RedeemRateLimitSettings, RedeemSuccess, UpdateRedeemBatchInput,
+    RedeemRateLimitSettings, RedeemSuccess, UpdateRedeemBatchInput, UpdateRedeemCodeInput,
 };
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -334,6 +334,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/alalalateam/redeem-code-batches/{batch_id}/codes",
             get(list_redeem_codes),
+        )
+        .route(
+            "/api/alalalateam/redeem-code-batches/{batch_id}/codes/{code_id}",
+            post(update_redeem_code),
         )
         .route("/api/redeem/export", post(redeem_export))
         .route("/api/redeem/after-sale", post(redeem_after_sale_export))
@@ -1136,6 +1140,30 @@ async fn list_redeem_codes(
     require_admin(&state, &headers)?;
     let items = state.repo.list_redeem_codes(&batch_id).await?;
     Ok(Json(json!({ "items": items })))
+}
+
+async fn update_redeem_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((batch_id, code_id)): Path<(String, String)>,
+    Json(payload): Json<UpdateRedeemCodeInput>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let code = match state
+        .repo
+        .update_redeem_code_status(&batch_id, &code_id, payload)
+        .await
+    {
+        Ok(code) => code,
+        Err(DataError::NotFound) => {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "兑换码不存在"));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Json(json!({
+        "success": true,
+        "code": code,
+    })))
 }
 
 #[derive(Debug, Deserialize)]

@@ -93,6 +93,10 @@ export interface RedeemBatchUpdatePayload {
   expires_at?: number | null
 }
 
+export interface RedeemCodeUpdatePayload {
+  status: string
+}
+
 export interface RedeemCodeAccount {
   id: string
   pool_id: string
@@ -460,6 +464,13 @@ export const api = {
   },
   listCodes(state: ApiState, batchId: string) {
     return request<{ items: RedeemCode[] }>(`${MANAGEMENT_API_PREFIX}/redeem-code-batches/${batchId}/codes`, state)
+  },
+  updateCode(state: ApiState, batchId: string, codeId: string, payload: RedeemCodeUpdatePayload) {
+    return request<{ success: boolean; code: RedeemCode }>(
+      `${MANAGEMENT_API_PREFIX}/redeem-code-batches/${encodeURIComponent(batchId)}/codes/${encodeURIComponent(codeId)}`,
+      state,
+      { method: 'POST', body: JSON.stringify(payload) },
+    )
   },
   deleteBatch(state: ApiState, batchId: string) {
     return request<DeleteRedeemBatchResponse>(

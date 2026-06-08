@@ -1429,10 +1429,89 @@ ORDER BY codes.created_at ASC
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
-        let mut codes = rows
+        let codes = rows
             .into_iter()
             .map(|row| code_summary_from_row(row, &self.secrets))
             .collect::<Result<Vec<_>, DataError>>()?;
+        self.hydrate_redeem_codes(codes).await
+    }
+
+    pub async fn update_redeem_code_status(
+        &self,
+        batch_id: &str,
+        code_id: &str,
+        input: UpdateRedeemCodeInput,
+    ) -> Result<RedeemCodeSummary, DataError> {
+        let batch_id = batch_id.trim();
+        let code_id = code_id.trim();
+        if batch_id.is_empty() {
+            return Err(DataError::InvalidInput("batch_id is required".to_string()));
+        }
+        if code_id.is_empty() {
+            return Err(DataError::InvalidInput("code_id is required".to_string()));
+        }
+        let input = input.normalized()?;
+        let now = unix_now_secs() as i64;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let Some(existing) = sqlx::query(
+            "SELECT status, redemption_id FROM redeem_codes WHERE id = ? AND batch_id = ?",
+        )
+        .bind(code_id)
+        .bind(batch_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Err(DataError::NotFound);
+        };
+
+        let current_status: String = existing.try_get("status")?;
+        let redemption_id: Option<String> = existing.try_get("redemption_id")?;
+        if !matches!(current_status.as_str(), "active" | "disabled") || redemption_id.is_some() {
+            tx.rollback().await?;
+            return Err(DataError::InvalidInput(
+                "已兑换兑换码不能修改启停状态".to_string(),
+            ));
+        }
+
+        sqlx::query("UPDATE redeem_codes SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(&input.status)
+            .bind(now)
+            .bind(code_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.load_redeem_code(code_id).await
+    }
+
+    async fn load_redeem_code(&self, code_id: &str) -> Result<RedeemCodeSummary, DataError> {
+        let row = sqlx::query(
+            r#"
+SELECT codes.id, codes.batch_id, codes.masked_code, codes.code_ciphertext, codes.status,
+       codes.redemption_id, codes.redeemed_at, codes.created_at, codes.updated_at,
+       redemptions.account_ids_json
+FROM redeem_codes AS codes
+LEFT JOIN redeem_redemptions AS redemptions ON redemptions.id = codes.redemption_id
+WHERE codes.id = ?
+"#,
+        )
+        .bind(code_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(DataError::NotFound)?;
+        let codes = vec![code_summary_from_row(row, &self.secrets)?];
+        self.hydrate_redeem_codes(codes)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(DataError::NotFound)
+    }
+
+    async fn hydrate_redeem_codes(
+        &self,
+        mut codes: Vec<RedeemCodeWithAccountIds>,
+    ) -> Result<Vec<RedeemCodeSummary>, DataError> {
         let code_ids = codes
             .iter()
             .map(|code| code.summary.id.clone())
@@ -4871,6 +4950,23 @@ impl UpdateRedeemBatchInput {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateRedeemCodeInput {
+    pub status: String,
+}
+
+impl UpdateRedeemCodeInput {
+    fn normalized(self) -> Result<Self, DataError> {
+        let status = self.status.trim().to_ascii_lowercase();
+        if !matches!(status.as_str(), "active" | "disabled") {
+            return Err(DataError::InvalidInput(
+                "status must be active or disabled".to_string(),
+            ));
+        }
+        Ok(Self { status })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateRedeemBatchOutcome {
     pub batch_id: String,
@@ -6314,6 +6410,50 @@ CREATE TABLE redeem_code_batches (
         assert_eq!(updated.accounts_per_code, 2);
         assert_eq!(updated.after_sale_limit, 0);
         assert_eq!(updated.expires_at, Some(expires_at));
+    }
+
+    #[tokio::test]
+    async fn update_redeem_code_status_toggles_active_disabled() {
+        let repo = temp_repo().await;
+        let batch = repo
+            .create_redeem_batch(CreateRedeemBatchInput {
+                name: "code status".to_string(),
+                total_count: 1,
+                accounts_per_code: 1,
+                after_sale_limit: Some(1),
+                expires_at: None,
+                plan_filter: None,
+            })
+            .await
+            .unwrap();
+        let code_id = batch.codes[0].id.clone();
+
+        let disabled = repo
+            .update_redeem_code_status(
+                &batch.batch_id,
+                &code_id,
+                UpdateRedeemCodeInput {
+                    status: "disabled".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status, "disabled");
+
+        let listed = repo.list_redeem_codes(&batch.batch_id).await.unwrap();
+        assert_eq!(listed[0].status, "disabled");
+
+        let active = repo
+            .update_redeem_code_status(
+                &batch.batch_id,
+                &code_id,
+                UpdateRedeemCodeInput {
+                    status: "active".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.status, "active");
     }
 
     #[tokio::test]

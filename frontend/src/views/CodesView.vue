@@ -247,6 +247,10 @@
                         <button class="button ghost tiny" @click="copyBatchCodes(batch)">复制</button>
                         <button class="button ghost tiny" @click="exportBatchCodes(batch)">导出 CSV</button>
                         <button class="button ghost tiny" @click="exportBatchCodesTxt(batch)">导出 TXT</button>
+                        <button class="button tiny" :class="batch.status === 'disabled' ? 'ghost' : 'danger'" :disabled="busy" @click="toggleBatchStatus(batch)">
+                          <RefreshCw v-if="batch.status === 'disabled'" :size="14" />
+                          <Settings v-else :size="14" />{{ batch.status === 'disabled' ? '启用' : '禁用' }}
+                        </button>
                         <button class="button ghost tiny" :disabled="busy" @click="openEditBatch(batch)">
                           <Settings :size="14" />编辑
                         </button>
@@ -295,7 +299,32 @@
                             <thead>
                               <tr>
                                 <th>兑换码</th>
-                                <th>状态</th>
+                                <th>
+                                  <div class="table-filter-heading">
+                                    <div class="table-filter-control">
+                                      <button
+                                        class="table-filter-button"
+                                        :class="{ active: codeStatusFilters.length }"
+                                        type="button"
+                                        title="筛选兑换码状态"
+                                        aria-label="筛选兑换码状态"
+                                        :aria-expanded="batchHeaderFilterMenu === 'code-status'"
+                                        @click="toggleBatchHeaderFilterMenu('code-status')"
+                                      >
+                                        <ListFilter :size="15" />
+                                      </button>
+                                      <div v-if="batchHeaderFilterMenu === 'code-status'" class="table-filter-menu state-filter-menu">
+                                        <div class="filter-menu-title">兑换码状态</div>
+                                        <label v-for="option in codeStatusFilterOptions" :key="option.value" class="filter-option">
+                                          <input type="checkbox" :checked="codeStatusFilters.includes(option.value)" @change="toggleCodeStatusFilter(option.value)" />
+                                          <span>{{ option.label }}</span>
+                                        </label>
+                                        <button v-if="codeStatusFilters.length" class="filter-clear-button" type="button" @click="clearCodeStatusFilter">清除状态筛选</button>
+                                      </div>
+                                    </div>
+                                    <span>状态</span>
+                                  </div>
+                                </th>
                                 <th>绑定账号</th>
                                 <th>兑换时间</th>
                                 <th>兑换记录</th>
@@ -339,19 +368,31 @@
                                   </div>
                                 </td>
                                 <td>
-                                  <button
-                                    class="button ghost tiny"
-                                    :disabled="busy || probingCodeId === code.id || !boundAccountIds(code).length"
-                                    @click="probeCodeAccounts(code)"
-                                  >
-                                    <Activity :size="14" />测活
-                                  </button>
+                                  <div class="row-actions">
+                                    <button
+                                      v-if="canToggleCodeStatus(code)"
+                                      class="button tiny"
+                                      :class="code.status === 'disabled' ? 'ghost' : 'danger'"
+                                      :disabled="busy"
+                                      @click="toggleCodeStatus(code)"
+                                    >
+                                      <RefreshCw v-if="code.status === 'disabled'" :size="14" />
+                                      <Settings v-else :size="14" />{{ code.status === 'disabled' ? '启用' : '禁用' }}
+                                    </button>
+                                    <button
+                                      class="button ghost tiny"
+                                      :disabled="busy || probingCodeId === code.id || !boundAccountIds(code).length"
+                                      @click="probeCodeAccounts(code)"
+                                    >
+                                      <Activity :size="14" />测活
+                                    </button>
+                                  </div>
                                 </td>
                               </tr>
-                              <tr v-if="!batchCodes.length">
+                              <tr v-if="!filteredBatchCodes.length">
                                 <td colspan="7" class="empty-row">
                                   <Ticket :size="20" />
-                                  <span>暂无兑换码明细</span>
+                                  <span>{{ batchCodes.length ? '暂无匹配兑换码' : '暂无兑换码明细' }}</span>
                                 </td>
                               </tr>
                             </tbody>
@@ -498,9 +539,10 @@ const codeGeneratorOpen = ref(true)
 const expiryQuickDays = ref('')
 const detailPageSize = ref(10)
 const detailPage = ref(1)
-const batchHeaderFilterMenu = ref<'pool' | 'status' | ''>('')
+const batchHeaderFilterMenu = ref<'pool' | 'status' | 'code-status' | ''>('')
 const batchPoolFilters = ref<string[]>([])
 const batchStatusFilters = ref<string[]>([])
+const codeStatusFilters = ref<string[]>([])
 const editingBatch = ref<RedeemBatch | null>(null)
 const editExpiryQuickDays = ref('')
 const editBatchForm = reactive({
@@ -537,18 +579,29 @@ const batchStatusFilterOptions = computed(() => {
   }
   return [...options].map(([value, label]) => ({ value, label }))
 })
+const codeStatusFilterOptions = computed(() => {
+  const options = new Map<string, string>()
+  for (const code of batchCodes.value) {
+    options.set(code.status, statusLabel(code.status))
+  }
+  return [...options].map(([value, label]) => ({ value, label }))
+})
 const filteredBatches = computed(() => batches.value.filter((batch) => {
   if (batchPoolFilters.value.length && !batchPoolFilters.value.includes(batch.pool_id)) return false
   if (batchStatusFilters.value.length && !batchStatusFilters.value.includes(batchStatusFilterValue(batch))) return false
   return true
 }))
-const detailTotalCodes = computed(() => batchCodes.value.length)
+const filteredBatchCodes = computed(() => batchCodes.value.filter((code) => {
+  if (codeStatusFilters.value.length && !codeStatusFilters.value.includes(code.status)) return false
+  return true
+}))
+const detailTotalCodes = computed(() => filteredBatchCodes.value.length)
 const detailTotalPages = computed(() => Math.max(1, Math.ceil(detailTotalCodes.value / detailPageSize.value)))
 const detailCurrentPage = computed(() => Math.min(detailPage.value, detailTotalPages.value))
 const detailPageStartIndex = computed(() => (detailCurrentPage.value - 1) * detailPageSize.value)
 const detailPageStart = computed(() => detailTotalCodes.value ? detailPageStartIndex.value + 1 : 0)
 const detailPageEnd = computed(() => Math.min(detailPageStartIndex.value + detailPageSize.value, detailTotalCodes.value))
-const pagedBatchCodes = computed(() => batchCodes.value.slice(detailPageStartIndex.value, detailPageEnd.value))
+const pagedBatchCodes = computed(() => filteredBatchCodes.value.slice(detailPageStartIndex.value, detailPageEnd.value))
 const canPrevDetailPage = computed(() => detailCurrentPage.value > 1)
 const canNextDetailPage = computed(() => detailCurrentPage.value < detailTotalPages.value)
 
@@ -580,7 +633,7 @@ function batchStatusLabel(batch: RedeemBatch) {
   return statusLabel(batch.status)
 }
 
-function toggleBatchHeaderFilterMenu(menu: 'pool' | 'status') {
+function toggleBatchHeaderFilterMenu(menu: 'pool' | 'status' | 'code-status') {
   batchHeaderFilterMenu.value = batchHeaderFilterMenu.value === menu ? '' : menu
 }
 
@@ -617,22 +670,38 @@ function clearBatchStatusFilter() {
   collapseHiddenBatch()
 }
 
+function toggleCodeStatusFilter(status: string) {
+  toggleArrayValue(codeStatusFilters.value, status)
+  detailPage.value = 1
+}
+
+function clearCodeStatusFilter() {
+  codeStatusFilters.value = []
+  detailPage.value = 1
+}
+
+function resetCodeDetailState() {
+  codeStatusFilters.value = []
+  detailPage.value = 1
+  if (batchHeaderFilterMenu.value === 'code-status') batchHeaderFilterMenu.value = ''
+}
+
 function collapseHiddenBatch() {
   if (!selectedBatchId.value) return
   if (filteredBatches.value.some((batch) => batch.id === selectedBatchId.value)) return
   selectedBatchId.value = ''
   batchCodes.value = []
-  detailPage.value = 1
+  resetCodeDetailState()
 }
 
 async function toggleBatchExpansion(batch: RedeemBatch) {
   if (selectedBatchId.value === batch.id) {
     selectedBatchId.value = ''
     batchCodes.value = []
-    detailPage.value = 1
+    resetCodeDetailState()
     return
   }
-  detailPage.value = 1
+  resetCodeDetailState()
   await loadCodes(batch.id)
 }
 
@@ -754,6 +823,57 @@ async function submitEditBatch() {
   }
 }
 
+async function toggleBatchStatus(batch: RedeemBatch) {
+  if (busy.value) return
+  const nextStatus = batch.status === 'disabled' ? 'active' : 'disabled'
+  busy.value = true
+  try {
+    const result = await api.updateBatch(apiState.value, batch.id, {
+      name: batch.name,
+      status: nextStatus,
+      accounts_per_code: Number(batch.accounts_per_code || 1),
+      after_sale_limit: Number(batch.after_sale_limit ?? 1),
+      expires_at: batch.expires_at ?? null,
+    })
+    replaceBatch(result.batch)
+    collapseHiddenBatch()
+    toast.success(`已${nextStatus === 'active' ? '启用' : '禁用'}批次：${result.batch.name}`)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    busy.value = false
+  }
+}
+
+function canToggleCodeStatus(code: RedeemCode) {
+  return (code.status === 'active' || code.status === 'disabled') && !code.redemption_id && !code.redeemed_at
+}
+
+async function toggleCodeStatus(code: RedeemCode) {
+  if (busy.value || !canToggleCodeStatus(code)) return
+  const nextStatus = code.status === 'disabled' ? 'active' : 'disabled'
+  busy.value = true
+  try {
+    const result = await api.updateCode(apiState.value, code.batch_id, code.id, { status: nextStatus })
+    replaceBatchCode(result.code)
+    toast.success(`已${nextStatus === 'active' ? '启用' : '禁用'}兑换码`)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    busy.value = false
+  }
+}
+
+function replaceBatch(updated: RedeemBatch) {
+  const index = batches.value.findIndex((batch) => batch.id === updated.id)
+  if (index >= 0) batches.value.splice(index, 1, updated)
+}
+
+function replaceBatchCode(updated: RedeemCode) {
+  const index = batchCodes.value.findIndex((code) => code.id === updated.id)
+  if (index >= 0) batchCodes.value.splice(index, 1, updated)
+}
+
 async function handleCreateBatch() {
   await createBatch()
   codeGeneratorOpen.value = true
@@ -800,18 +920,18 @@ async function exportSelectedBatchCodesTxt() {
 }
 
 async function copyBatchCodes(batch: RedeemBatch) {
-  await loadCodes(batch.id)
-  await copySelectedBatchCodes()
+  const codes = await fetchBatchCodesSnapshot(batch.id)
+  await copyText(codes.map(displayCode).join('\n'), '已复制该批次兑换码')
 }
 
 async function exportBatchCodes(batch: RedeemBatch) {
-  await loadCodes(batch.id)
-  exportBatchSnapshot(batch)
+  const codes = await fetchBatchCodesSnapshot(batch.id)
+  exportBatchSnapshot(batch, codes)
 }
 
 async function exportBatchCodesTxt(batch: RedeemBatch) {
-  await loadCodes(batch.id)
-  exportBatchPlainText(batch)
+  const codes = await fetchBatchCodesSnapshot(batch.id)
+  exportBatchPlainText(batch, codes)
 }
 
 async function ensureSelectedBatchCodesLoaded() {
@@ -820,20 +940,32 @@ async function ensureSelectedBatchCodesLoaded() {
   }
 }
 
-function exportBatchSnapshot(batch: RedeemBatch) {
+async function fetchBatchCodesSnapshot(batchId: string) {
+  if (selectedBatchId.value === batchId && batchCodes.value.length) return batchCodes.value
+  const wasBusy = busy.value
+  if (!wasBusy) busy.value = true
+  try {
+    const result = await api.listCodes(apiState.value, batchId)
+    return result.items
+  } finally {
+    if (!wasBusy) busy.value = false
+  }
+}
+
+function exportBatchSnapshot(batch: RedeemBatch, codes = batchCodes.value) {
   downloadText(
     `account-pool-redeem-codes-${safeFileName(batch.name)}-${timestamp()}.csv`,
-    buildBatchCsv(batch),
+    buildBatchCsv(batch, codes),
     'text/csv;charset=utf-8',
   )
   toast.success('已导出批次兑换状态 CSV')
 }
 
-function exportBatchPlainText(batch: RedeemBatch) {
-  const codes = batchCodes.value
+function exportBatchPlainText(batch: RedeemBatch, batchCodeItems = batchCodes.value) {
+  const codes = batchCodeItems
     .map((code) => code.code?.trim())
     .filter((code): code is string => Boolean(code))
-  const skipped = batchCodes.value.length - codes.length
+  const skipped = batchCodeItems.length - codes.length
   if (!codes.length) {
     toast.info('该批次没有可导出的未脱敏兑换码')
     return
@@ -847,10 +979,10 @@ function exportBatchPlainText(batch: RedeemBatch) {
     : `已导出 ${codes.length} 个未脱敏兑换码`)
 }
 
-function buildBatchCsv(batch: RedeemBatch) {
+function buildBatchCsv(batch: RedeemBatch, codes = batchCodes.value) {
   const exportedAt = new Date().toISOString()
-  const rows = batchCodes.value.length
-    ? batchCodes.value.map((code) => [
+  const rows = codes.length
+    ? codes.map((code) => [
       exportedAt,
       batch.id,
       batch.name,
